@@ -1,6 +1,6 @@
 mod support;
 use std::{fs, io::Write, process::Stdio};
-use support::{Harness, Response, Server};
+use support::{Harness, Response, Server, config_home, data_home};
 
 #[test]
 fn login_encrypts_and_following_process_authenticates_then_logout_removes() {
@@ -49,7 +49,7 @@ fn login_encrypts_and_following_process_authenticates_then_logout_removes() {
 fn default_key_directory_and_explicit_migration_work_without_registry_config() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
-    let auth = root.path().join("config/quayside/auth.json");
+    let auth = config_home(root.path()).join("quayside/auth.json");
     fs::create_dir_all(auth.parent().unwrap()).unwrap();
     fs::set_permissions(auth.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
@@ -62,10 +62,10 @@ fn default_key_directory_and_explicit_migration_work_without_registry_config() {
         .args(["--json", "auth", "migrate"])
         .env_remove("QUAYSIDE_AUTHFILE")
         .env_remove("QUAYSIDE_KEYFILE")
-        .env("QUAYSIDE_CONFIG", "/does/not/exist/config.toml")
+        .env("QUAYSIDE_CONFIG", root.path().join("missing/config.toml"))
         .env("HOME", root.path())
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CONFIG_HOME", config_home(root.path()))
+        .env("XDG_DATA_HOME", data_home(root.path()))
         .output()
         .unwrap();
     assert!(
@@ -73,9 +73,11 @@ fn default_key_directory_and_explicit_migration_work_without_registry_config() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    let key = root.path().join("data/quayside/master.key");
+    let key = data_home(root.path()).join("quayside/master.key");
     assert!(key.is_file());
-    assert!(!auth.parent().unwrap().join("master.key").exists());
+    if config_home(root.path()) != data_home(root.path()) {
+        assert!(!auth.parent().unwrap().join("master.key").exists());
+    }
     assert_eq!(
         quayside::auth::AuthFile::load(&auth, &key)
             .unwrap()

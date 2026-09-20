@@ -20,6 +20,23 @@ use std::{
     time::Duration,
 };
 
+// Match dirs' platform defaults without changing the test process environment.
+pub fn config_home(root: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        root.join("Library/Application Support")
+    } else {
+        root.join("xdg")
+    }
+}
+
+pub fn data_home(root: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        root.join("Library/Application Support")
+    } else {
+        root.join("data")
+    }
+}
+
 pub struct Harness {
     pub root: tempfile::TempDir,
     pub config: Config,
@@ -44,9 +61,12 @@ impl Harness {
         let root = tempfile::tempdir().unwrap();
         quayside::storage::restrict(root.path(), true).unwrap();
         fs::create_dir(root.path().join("tmp")).unwrap();
-        fs::create_dir_all(root.path().join("xdg/docker")).unwrap();
-        fs::write(root.path().join("xdg/docker/daemon.json"), b"{}").unwrap();
+        fs::create_dir_all(config_home(root.path()).join("docker")).unwrap();
+        fs::write(config_home(root.path()).join("docker/daemon.json"), b"{}").unwrap();
         Self { root, config }
+    }
+    pub fn daemon_config(&self) -> PathBuf {
+        config_home(self.root.path()).join("docker/daemon.json")
     }
     pub fn command(&self, args: &[&str]) -> Command {
         let config = self.root.path().join("config.toml");
@@ -61,6 +81,8 @@ impl Harness {
             .arg(self.root.path().join("auth.json"))
             .arg("--keyfile")
             .arg(self.root.path().join("keys/master.key"));
+        command.env("HOME", self.root.path());
+        command.env("XDG_DATA_HOME", data_home(self.root.path()));
         command.env("TMPDIR", self.root.path().join("tmp"));
         command.env("XDG_CONFIG_HOME", self.root.path().join("xdg"));
         for name in [

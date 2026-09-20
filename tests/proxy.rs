@@ -26,7 +26,7 @@ fn docker_proxy_is_used_env_overrides_and_no_proxy_bypasses() {
     });
     let local = Server::new(|_| Response::new(200, b"{}".to_vec()));
     let harness = Harness::new(&[("registry.invalid", true), (&local.host, true)]);
-    let daemon = harness.root.path().join("xdg/docker/daemon.json");
+    let daemon = harness.daemon_config();
     fs::write(
         &daemon,
         serde_json::to_vec(&json!({"proxies":{
@@ -70,7 +70,7 @@ fn docker_proxy_is_used_env_overrides_and_no_proxy_bypasses() {
 fn unrelated_docker_fields_are_ignored_and_proxy_secrets_are_not_logged() {
     let server = Server::new(|_| Response::new(200, b"{}".to_vec()));
     let mut harness = Harness::new(&[(&server.host, false)]);
-    let daemon = harness.root.path().join("xdg/docker/daemon.json");
+    let daemon = harness.daemon_config();
     fs::write(
         &daemon,
         serde_json::to_vec(&json!({
@@ -122,7 +122,7 @@ fn docker_https_proxy_is_used_for_connect_tunnel() {
     });
     let harness = Harness::new(&[("registry.invalid", false)]);
     fs::write(
-        harness.root.path().join("xdg/docker/daemon.json"),
+        harness.daemon_config(),
         serde_json::to_vec(&json!({
             "proxies":{"https-proxy":format!("http://{}",proxy.host)}
         }))
@@ -139,7 +139,7 @@ fn connection_errors_show_safe_destination_proxy_source_and_typed_reason() {
     let address = listener.local_addr().unwrap().to_string();
     drop(listener);
     let harness = Harness::new(&[(&address, true)]);
-    let daemon = harness.root.path().join("xdg/docker/daemon.json");
+    let daemon = harness.daemon_config();
     fs::write(
         &daemon,
         serde_json::to_vec(&json!({"proxies": {
@@ -198,7 +198,7 @@ fn docker_cidr_rules_bypass_local_ips_and_preserve_proxy_for_other_hosts() {
     });
     let local = Server::new(|_| Response::new(200, b"{}".to_vec()));
     let harness = Harness::new(&[("registry.invalid", true), (&local.host, true)]);
-    let daemon = harness.root.path().join("xdg/docker/daemon.json");
+    let daemon = harness.daemon_config();
     fs::write(&daemon, serde_json::to_vec(&json!({"proxies":{
         "http-proxy":format!("http://{}",proxy.host),
         "no-proxy":"*.example.com,*.example.org,*.region.example.org,*.example.net,192.0.2.0/24,198.51.100.0/24,127.0.0.0/8,::1/128"
@@ -238,7 +238,7 @@ fn native_cidr_routing_does_not_resolve_hostnames_and_reports_invalid_rules() {
     }
     let harness = Harness::new(&hosts);
     fs::write(
-        harness.root.path().join("xdg/docker/daemon.json"),
+        harness.daemon_config(),
         serde_json::to_vec(&json!({"proxies":{
             "http-proxy":format!("http://{}",proxy.host),
             "no-proxy":"127.0.0.42/8,::1/128"
