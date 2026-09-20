@@ -218,6 +218,7 @@ impl crate::observer::BlobProgress for Blob {
         use crate::observer::BlobPhase;
         self.phase(match phase {
             BlobPhase::Downloading => "Downloading",
+            BlobPhase::Verifying => "Verifying",
             BlobPhase::Uploading => "Uploading",
             BlobPhase::Committing => "Committing",
             BlobPhase::Waiting => "Waiting",

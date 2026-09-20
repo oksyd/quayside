@@ -14,9 +14,9 @@ use catalog::next_link;
 use http::header::HeaderMap;
 use http::{Method, StatusCode};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Weak};
+use tokio::sync::{Mutex, Semaphore};
 pub use transport::limited_body;
 use url::Url;
 
@@ -34,6 +34,9 @@ struct Inner {
     policy: RegistryConfig,
     credential: Option<Credential>,
     cache: Mutex<BTreeMap<String, CachedAuth>>,
+    auth_refreshes: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    blobs: Mutex<BTreeMap<(String, crate::digest::Digest), bytes::Bytes>>,
+    downloads: Arc<Semaphore>,
     changed: Arc<AtomicBool>,
 }
 /// Result of starting a blob upload or attempting a cross-repository mount.
@@ -52,6 +55,7 @@ pub enum UploadStart {
 mod authentication;
 mod blobs;
 mod catalog;
+mod download;
 mod manifests;
 mod transport;
 
@@ -83,10 +87,13 @@ impl Registry {
                 public_client: client(&public_base, &config, &RegistryConfig::default())?,
                 name: name.into(),
                 base,
+                downloads: Arc::new(Semaphore::new(config.transfer.concurrency)),
                 config,
                 policy,
                 credential,
                 cache: Mutex::new(BTreeMap::new()),
+                auth_refreshes: Mutex::new(BTreeMap::new()),
+                blobs: Mutex::new(BTreeMap::new()),
                 changed,
             }),
         })

@@ -3,19 +3,24 @@ use crate::{
     config::parse_size,
     digest::Digest,
     graph::Graph,
-    model::{Descriptor, Manifest, ManifestKind, Platform},
+    model::{Descriptor, Manifest},
     options::WriteOptions,
     reference::Reference,
     registry::{Registry, UploadStart},
 };
+mod publish;
+mod resolve;
+
+pub(crate) use publish::publish_children;
+pub use publish::{publish_dependencies, publish_root};
+pub use resolve::{Resolved, image_platform, resolve};
+
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::Serialize;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Semaphore;
 
 /// Whether independently attached signatures and SBOMs were copied with the selected graph.
 #[derive(Debug, Serialize)]
@@ -48,163 +53,6 @@ pub struct CopyResult {
     pub referrers: Referrers,
 }
 
-/// A selected source manifest together with its original digest and platform information.
-pub struct Resolved {
-    /// Digest of the original source manifest before platform selection.
-    pub source_digest: Digest,
-    /// The selected manifest, preserving the source's original bytes.
-    pub manifest: Manifest,
-    /// Platform names discovered in the selected image graph.
-    pub platforms: Vec<String>,
-}
-
-/// Selects content by a pinned digest. No selection ever defaults to the host CPU.
-pub async fn resolve(
-    source: &Registry,
-    reference: &Reference,
-    platform: Option<&str>,
-) -> Result<Resolved> {
-    let root = source.get_manifest(reference).await?;
-    let original = root.digest().clone();
-    if root.kind == ManifestKind::Image && platform.is_none() && !root.is_artifact()? {
-        let p = image_platform(source, &reference.repository, &root).await?;
-        let mut root = root;
-        root.descriptor.platform = Some(p.clone());
-        return Ok(Resolved {
-            source_digest: original,
-            manifest: root,
-            platforms: vec![p.to_string()],
-        });
-    }
-    let Some(wanted) = platform.map(str::parse::<Platform>).transpose()? else {
-        let platforms = root
-            .children()?
-            .iter()
-            .filter_map(|d| d.platform.as_ref().map(ToString::to_string))
-            .collect();
-        return Ok(Resolved {
-            source_digest: original,
-            manifest: root,
-            platforms,
-        });
-    };
-    if root.kind == ManifestKind::Image {
-        let p = image_platform(source, &reference.repository, &root).await?;
-        if !p.matches(&wanted) {
-            return Err(Error::input(format!("requested {wanted}, image is {p}")));
-        }
-        let mut root = root;
-        root.descriptor.platform = Some(p.clone());
-        return Ok(Resolved {
-            source_digest: original,
-            manifest: root,
-            platforms: vec![p.to_string()],
-        });
-    }
-    let mut queue = vec![(root, 0usize)];
-    let mut seen = BTreeSet::new();
-    let mut available = BTreeSet::new();
-    let mut candidates = BTreeMap::new();
-    let mut metadata = 0u64;
-    while let Some((index, depth)) = queue.pop() {
-        if !seen.insert(index.digest().clone()) {
-            continue;
-        }
-        metadata += index.raw.len() as u64;
-        if depth > source.config().transfer.max_depth
-            || seen.len() > source.config().transfer.max_objects
-            || metadata > parse_size(&source.config().transfer.max_metadata_size)?
-        {
-            return Err(Error::input(
-                "platform selection exceeded configured graph limits",
-            ));
-        }
-        for d in index.children()? {
-            if let Some(p) = &d.platform {
-                available.insert(p.to_string());
-            }
-            let is_index = matches!(
-                d.media_type.as_str(),
-                crate::model::OCI_INDEX | crate::model::DOCKER_INDEX
-            );
-            if !is_index && d.platform.as_ref().is_some_and(|p| !p.matches(&wanted)) {
-                continue;
-            }
-            if d.size > parse_size(&source.config().transfer.max_manifest_size)? {
-                return Err(Error::input("child manifest exceeds size limit"));
-            }
-            let mut child = if let Some(raw) = d.embedded()? {
-                Manifest::parse(raw, Some(&d.media_type), Some(&d.digest))?
-            } else {
-                source.get_manifest(&reference.pinned(&d.digest)).await?
-            };
-            child.verify_descriptor(&d)?;
-            metadata = metadata
-                .checked_add(child.raw.len() as u64)
-                .ok_or_else(|| Error::input("selection metadata overflow"))?;
-            if metadata > parse_size(&source.config().transfer.max_metadata_size)? {
-                return Err(Error::input("platform selection metadata limit exceeded"));
-            }
-            if child.kind == ManifestKind::Index {
-                queue.push((child, depth + 1));
-            } else {
-                if child.is_artifact()? {
-                    continue;
-                }
-                let p = match d.platform {
-                    Some(p) => p,
-                    None => image_platform(source, &reference.repository, &child).await?,
-                };
-                available.insert(p.to_string());
-                if p.matches(&wanted) {
-                    child.descriptor.platform = Some(p.clone());
-                    candidates.insert(child.digest().clone(), (child, p));
-                }
-            }
-        }
-        if queue.len() + candidates.len() > source.config().transfer.max_objects {
-            return Err(Error::input("platform selection object limit exceeded"));
-        }
-    }
-    if candidates.len() != 1 {
-        return Err(Error::input(format!(
-            "platform {wanted} matched {} objects; available: {}",
-            candidates.len(),
-            available.into_iter().collect::<Vec<_>>().join(", ")
-        )));
-    }
-    let (manifest, p) = candidates
-        .into_values()
-        .next()
-        .ok_or_else(|| Error::input("no selected platform"))?;
-    Ok(Resolved {
-        source_digest: original,
-        manifest,
-        platforms: vec![p.to_string()],
-    })
-}
-
-/// Read an image configuration to determine its platform; artifacts do not imply a platform.
-pub async fn image_platform(
-    registry: &Registry,
-    repo: &str,
-    manifest: &Manifest,
-) -> Result<Platform> {
-    if manifest.is_artifact()? {
-        return Err(Error::input(
-            "OCI artifacts have no image platform; --platform and index create require container images",
-        ));
-    }
-    let d = manifest.config()?;
-    let raw = registry
-        .get_blob_bytes(
-            repo,
-            &d,
-            parse_size(&registry.config().transfer.max_manifest_size)?,
-        )
-        .await?;
-    Platform::from_config(&serde_json::from_slice(&raw)?)
-}
 /// Fetch and verify a bounded manifest dependency graph from a registry.
 pub async fn remote_graph(
     registry: &Registry,
@@ -271,7 +119,7 @@ impl TransferStats {
 }
 
 /// Buffer-bounded upload. Chunks are immutable Bytes so authentication retries are replayable.
-/// A failed PATCH is reconciled against the server before its body is sent again.
+/// Failed chunks are reconciled against the server before their bodies are sent again.
 pub async fn upload_file(
     target: &Registry,
     repo: &str,
@@ -342,10 +190,10 @@ async fn upload_session(
     let (mut url, minimum_chunk) = session;
     progress.phase(crate::observer::BlobPhase::Uploading);
     let cfg = &target.config().transfer;
-    let chunk_size = parse_size(&cfg.chunk_size)?.max(minimum_chunk);
-    if chunk_size > 64 * 1024 * 1024
-        || chunk_size.saturating_mul(cfg.concurrency as u64) > 128 * 1024 * 1024
-    {
+    let initial_chunk = parse_size(&cfg.chunk_size)?.max(minimum_chunk);
+    let maximum_chunk = (64 * 1024 * 1024).min(128 * 1024 * 1024 / cfg.concurrency as u64);
+    let request_timeout = crate::config::duration(&cfg.idle_timeout)?;
+    if initial_chunk > maximum_chunk {
         return Err(Error::unsupported(
             "registry minimum chunk size exceeds the configured memory safety budget",
         ));
@@ -356,22 +204,47 @@ async fn upload_session(
     }
     let mut offset = 0u64;
     let mut reconciliations = 0usize;
+    let mut chunk_size = initial_chunk;
     while offset < d.size {
         let size = (d.size - offset).min(chunk_size) as usize;
         let mut buffer = vec![0u8; size];
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         file.read_exact(&mut buffer).await?;
         let end = offset + size as u64;
-        match target
-            .patch_upload(repo, url.clone(), offset, Bytes::from(buffer))
-            .await
-        {
+        let started = std::time::Instant::now();
+        // OCI permits the final payload in the commit PUT, saving one round trip per blob.
+        let result = if end == d.size {
+            match target
+                .commit_upload(repo, url.clone(), &d.digest, offset, Bytes::from(buffer))
+                .await
+            {
+                Ok(()) => {
+                    progress.position(end);
+                    progress.phase(crate::observer::BlobPhase::Committing);
+                    return Ok(());
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            target
+                .patch_upload(repo, url.clone(), offset, Bytes::from(buffer))
+                .await
+        };
+        match result {
             Ok(next) => {
                 url = next;
                 offset = end;
+                chunk_size = next_chunk_size(
+                    chunk_size,
+                    initial_chunk,
+                    maximum_chunk,
+                    started.elapsed(),
+                    request_timeout,
+                );
             }
             Err(e) if e.retryable() && reconciliations < cfg.max_retries => {
                 reconciliations += 1;
+                chunk_size = initial_chunk;
                 match target.upload_status(repo, url.clone()).await {
                     Ok((next, server_offset))
                         if server_offset >= offset && server_offset <= end
@@ -392,7 +265,40 @@ async fn upload_session(
     target.finish_upload(repo, url, &d.digest).await
 }
 
-/// Copy or plan unique graph payloads with bounded concurrency, temporary space and observation.
+fn next_chunk_size(
+    current: u64,
+    initial: u64,
+    maximum: u64,
+    elapsed: std::time::Duration,
+    timeout: std::time::Duration,
+) -> u64 {
+    // Amortize request latency while leaving room for variation within the request timeout.
+    if elapsed < (timeout / 4).min(std::time::Duration::from_secs(1)) {
+        (current * 2).min(maximum)
+    } else if elapsed > (timeout / 2).min(std::time::Duration::from_secs(4)) {
+        (current / 2).max(initial)
+    } else {
+        current
+    }
+}
+
+// Drop the file before releasing its quota, including queued and cancelled uploads.
+struct StagedBlob {
+    temporary: tempfile::NamedTempFile,
+    _reservation: crate::temporary::Reservation,
+    descriptor: Descriptor,
+    initial: Option<UploadStart>,
+    progress: Box<dyn crate::observer::BlobProgress>,
+}
+
+pub(crate) fn largest_blobs_first(graph: &Graph) -> Vec<Descriptor> {
+    let mut blobs: Vec<_> = graph.blobs.values().cloned().collect();
+    blobs.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.digest.cmp(&b.digest)));
+    blobs
+}
+
+/// Copy or plan unique payloads, prioritizing large blobs with independent download/upload limits.
+/// Verified files pass through a bounded queue and retain their disk quota until upload completes.
 pub async fn transfer_remote_blobs(
     source: &Registry,
     source_ref: &Reference,
@@ -402,149 +308,206 @@ pub async fn transfer_remote_blobs(
     dry_run: bool,
     observer: &dyn crate::observer::Observer,
 ) -> Result<TransferStats> {
+    transfer_remote_inputs(
+        [(source, source_ref, graph)],
+        target,
+        destination,
+        dry_run,
+        observer,
+    )
+    .await
+}
+
+struct RemoteBlob {
+    source: Registry,
+    repository: String,
+    descriptor: Descriptor,
+}
+
+pub(crate) async fn transfer_remote_inputs<'a>(
+    inputs: impl IntoIterator<Item = (&'a Registry, &'a Reference, &'a Graph)>,
+    target: &Registry,
+    destination: &Reference,
+    dry_run: bool,
+    observer: &dyn crate::observer::Observer,
+) -> Result<TransferStats> {
+    let mut unique = BTreeMap::<Digest, RemoteBlob>::new();
+    for (source, reference, graph) in inputs {
+        for d in graph.blobs.values() {
+            if let Some(previous) = unique.get(&d.digest) {
+                if previous.descriptor.size != d.size {
+                    return Err(Error::integrity(
+                        "inconsistent size for a shared index input blob",
+                    ));
+                }
+                // Prefer a same-registry source so a shared blob can be mounted without download.
+                if previous.source.endpoint().origin() == target.endpoint().origin()
+                    || source.endpoint().origin() != target.endpoint().origin()
+                {
+                    continue;
+                }
+            }
+            unique.insert(
+                d.digest.clone(),
+                RemoteBlob {
+                    source: source.clone(),
+                    repository: reference.repository.clone(),
+                    descriptor: d.clone(),
+                },
+            );
+        }
+    }
+    let mut blobs: Vec<_> = unique.into_values().collect();
+    blobs.sort_by(|a, b| {
+        b.descriptor
+            .size
+            .cmp(&a.descriptor.size)
+            .then_with(|| a.descriptor.digest.cmp(&b.descriptor.digest))
+    });
     let display = observer.begin(
         if dry_run {
             crate::observer::Phase::Planning
         } else {
             crate::observer::Phase::Copying
         },
-        graph.blobs.len(),
+        blobs.len(),
     );
     let temp_limit = parse_size(&target.config().transfer.max_temp_size)?;
     // Cross-registry transfers cannot mount: reject an impossible staging plan before any write.
-    if source.endpoint().origin() != target.endpoint().origin() {
-        for d in graph.blobs.values().filter(|d| d.size > temp_limit) {
-            if !target.blob_exists(&destination.repository, d).await? {
-                return Err(Error::input(
-                    "blob exceeds max_temp_size; increase the temporary storage limit",
-                ));
-            }
+    for blob in &blobs {
+        if blob.source.endpoint().origin() != target.endpoint().origin()
+            && blob.descriptor.size > temp_limit
+            && !target
+                .blob_exists(&destination.repository, &blob.descriptor)
+                .await?
+        {
+            return Err(Error::input(
+                "blob exceeds max_temp_size; increase the temporary storage limit",
+            ));
         }
     }
     let budget = crate::temporary::Budget::new(temp_limit);
-    let outcomes = stream::iter(graph.blobs.values().cloned())
-        .map(|d| {
-            let progress = display.blob(d.digest.to_string(), d.size);
-            let budget = budget.clone();
-            let source = source.clone();
-            let target = target.clone();
-            let from_repo = source_ref.repository.clone();
-            let to_repo = destination.repository.clone();
-            async move {
-                if target.blob_exists(&to_repo, &d).await? {
-                    progress.finish();
-                    return Ok::<_, Error>(TransferStats {
-                        skipped_blobs: 1,
-                        ..Default::default()
-                    });
-                }
-                if dry_run {
-                    progress.finish();
-                    return Ok(TransferStats {
-                        planned_blobs: 1,
-                        ..Default::default()
-                    });
-                }
-                let initial = if source.endpoint().origin() == target.endpoint().origin()
-                    && from_repo != to_repo
-                {
-                    Some(
-                        target
-                            .start_upload(&to_repo, &d.digest, Some(&from_repo))
-                            .await?,
-                    )
-                } else {
-                    None
-                };
-                if matches!(&initial, Some(UploadStart::Mounted)) {
-                    if !target.blob_exists(&to_repo, &d).await? {
-                        return Err(Error::integrity("mounted blob cannot be read back"));
+    let concurrency = target.config().transfer.concurrency;
+    // Every source and every range shares one operation-wide download limit.
+    let slots = Arc::new(Semaphore::new(concurrency));
+    let (sender, receiver) = tokio::sync::mpsc::channel::<StagedBlob>(concurrency);
+    let display_ref = display.as_ref();
+    let downloads = async move {
+        let stats = stream::iter(blobs)
+            .map(|blob| {
+                let d = blob.descriptor;
+                let sender = sender.clone();
+                let progress = display_ref.blob(d.digest.to_string(), d.size);
+                let budget = budget.clone();
+                let source = blob.source;
+                let slots = slots.clone();
+                let target = target.clone();
+                let from_repo = blob.repository;
+                let to_repo = destination.repository.clone();
+                async move {
+                    if target.blob_exists(&to_repo, &d).await? {
+                        progress.finish();
+                        return Ok::<_, Error>(TransferStats {
+                            skipped_blobs: 1,
+                            ..Default::default()
+                        });
                     }
-                    progress.finish();
-                    return Ok(TransferStats {
-                        mounted_blobs: 1,
-                        ..Default::default()
-                    });
+                    if dry_run {
+                        progress.finish();
+                        return Ok(TransferStats {
+                            planned_blobs: 1,
+                            ..Default::default()
+                        });
+                    }
+                    let initial = if source.endpoint().origin() == target.endpoint().origin()
+                        && from_repo != to_repo
+                    {
+                        Some(
+                            target
+                                .start_upload(&to_repo, &d.digest, Some(&from_repo))
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    if matches!(&initial, Some(UploadStart::Mounted)) {
+                        if !target.blob_exists(&to_repo, &d).await? {
+                            return Err(Error::integrity("mounted blob cannot be read back"));
+                        }
+                        progress.finish();
+                        return Ok(TransferStats {
+                            mounted_blobs: 1,
+                            ..Default::default()
+                        });
+                    }
+                    // Reserve all bytes before writing; concurrent workers share this operation's quota.
+                    // The temporary file drops before its reservation on success, error or cancellation.
+                    progress.phase(crate::observer::BlobPhase::Waiting);
+                    let _reservation = budget.reserve(d.size).await?;
+                    // One verified temporary file per active worker, never a whole layer in RAM.
+                    let temporary = tempfile::NamedTempFile::new()?;
+                    source
+                        .download_blob_with_slots(
+                            &from_repo,
+                            &d,
+                            temporary.path(),
+                            progress.as_ref(),
+                            slots,
+                        )
+                        .await?;
+                    progress.phase(crate::observer::BlobPhase::Waiting);
+                    sender
+                        .send(StagedBlob {
+                            temporary,
+                            _reservation,
+                            descriptor: d,
+                            initial,
+                            progress,
+                        })
+                        .await
+                        .map_err(|_| Error::network("upload queue closed"))?;
+                    Ok(TransferStats::default())
                 }
-                // Reserve all bytes before writing; concurrent workers share this operation's quota.
-                // The temporary file drops before its reservation on success, error or cancellation.
-                progress.phase(crate::observer::BlobPhase::Waiting);
-                let _reservation = budget.reserve(d.size).await?;
-                // One verified temporary file per active worker, never a whole layer in RAM.
-                let temporary = tempfile::NamedTempFile::new()?;
-                source
-                    .download_blob_progress(&from_repo, &d, temporary.path(), progress.as_ref())
-                    .await?;
-                upload_file_progress(
-                    &target,
-                    &to_repo,
-                    &d,
-                    temporary.path(),
-                    initial,
-                    progress.as_ref(),
-                )
-                .await?;
-                progress.finish();
-                Ok(TransferStats {
-                    copied_blobs: 1,
-                    bytes_transferred: d.size.saturating_mul(2),
-                    ..Default::default()
-                })
-            }
-        })
-        .buffer_unordered(target.config().transfer.concurrency)
-        .try_collect::<Vec<_>>()
+            })
+            .buffer_unordered(concurrency)
+            .try_fold(TransferStats::default(), |mut total, stats| async move {
+                total.merge(&stats);
+                Ok(total)
+            })
+            .await;
+        drop(sender);
+        stats
+    };
+    let uploads = stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|blob| (blob, receiver))
+    })
+    .map(|blob| async move {
+        let mut blob = blob;
+        upload_file_progress(
+            target,
+            &destination.repository,
+            &blob.descriptor,
+            blob.temporary.path(),
+            blob.initial.take(),
+            blob.progress.as_ref(),
+        )
         .await?;
-    let mut result = TransferStats::default();
-    for o in outcomes {
-        result.merge(&o);
-    }
+        blob.progress.finish();
+        Ok::<_, Error>(TransferStats {
+            copied_blobs: 1,
+            bytes_transferred: blob.descriptor.size.saturating_mul(2),
+            ..Default::default()
+        })
+    })
+    .buffer_unordered(concurrency)
+    .try_fold(TransferStats::default(), |mut total, stats| async move {
+        total.merge(&stats);
+        Ok(total)
+    });
+    // Poll both stages independently. Dropping either on failure cancels the entire pipeline.
+    let (mut result, uploaded) = tokio::try_join!(downloads, uploads)?;
+    result.merge(&uploaded);
     Ok(result)
-}
-
-/// Publish dependency manifests by digest only; no temporary tags and no DELETEs.
-pub async fn publish_dependencies(
-    target: &Registry,
-    destination: &Reference,
-    graph: &Graph,
-) -> Result<()> {
-    for digest in &graph.order {
-        let manifest = graph
-            .manifests
-            .get(digest)
-            .ok_or_else(|| Error::integrity("internal graph order is inconsistent"))?;
-        let pinned = destination.pinned(digest);
-        match target.manifest_optional(&pinned).await? {
-            Some(existing) if existing.raw == manifest.raw => continue,
-            Some(_) => {
-                return Err(Error::integrity(
-                    "registry returned different manifest bytes for a digest",
-                ));
-            }
-            None => target.put_manifest(&pinned, manifest).await?,
-        }
-    }
-    Ok(())
-}
-
-/// Publish the root under overwrite policy and verify that its remote bytes are unchanged.
-pub async fn publish_root(
-    target: &Registry,
-    destination: &Reference,
-    root: &Manifest,
-    overwrite: bool,
-) -> Result<()> {
-    // Recheck immediately before publishing the tag. This still cannot replace server-side CAS.
-    if !check_destination(target, destination, root, overwrite).await? {
-        target.put_manifest(destination, root).await?;
-    }
-    let verified = target.get_manifest(destination).await?;
-    if verified.raw != root.raw {
-        return Err(Error::integrity(
-            "destination root changed or was rewritten during publication",
-        ));
-    }
-    Ok(())
 }
 
 /// Resolve, transfer and publish a selected OCI dependency graph, returning a typed operation result.
@@ -559,12 +522,15 @@ pub async fn copy(
 ) -> Result<CopyResult> {
     let resolving = observer.begin(crate::observer::Phase::Resolving, 0);
     let resolved = resolve(source, source_ref, platform).await?;
-    let graph = remote_graph(source, source_ref, resolved.manifest).await?;
+    resolved.manifest.check_transfer_supported()?;
     drop(resolving);
     let checking = observer.begin(crate::observer::Phase::CheckingDestination, 0);
     let already_present =
-        check_destination(target, destination, &graph.root, write.overwrite).await?;
+        check_destination(target, destination, &resolved.manifest, write.overwrite).await?;
     drop(checking);
+    let resolving = observer.begin(crate::observer::Phase::Resolving, 0);
+    let graph = remote_graph(source, source_ref, resolved.manifest).await?;
+    drop(resolving);
     let stats = transfer_remote_blobs(
         source,
         source_ref,
@@ -577,7 +543,7 @@ pub async fn copy(
     .await?;
     let _publishing = observer.begin(crate::observer::Phase::Publishing, 0);
     if !write.dry_run {
-        publish_dependencies(target, destination, &graph).await?;
+        publish_children(target, destination, &graph).await?;
         publish_root(target, destination, &graph.root, write.overwrite).await?;
     }
     let platforms = if resolved.platforms.is_empty() {
@@ -596,4 +562,48 @@ pub async fn copy(
         stats,
         referrers: Referrers::NotCopied,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_chunk_size;
+    use std::time::Duration;
+
+    #[test]
+    fn adaptive_chunks_respect_memory_minimum_and_timeout() {
+        let mib = 1024 * 1024;
+        let timeout = Duration::from_secs(60);
+        let fast = Duration::from_millis(100);
+        let slow = Duration::from_secs(5);
+        let initial = 8 * mib;
+        let maximum = 32 * mib; // Four upload workers share 128MiB.
+        let next = |current, elapsed| next_chunk_size(current, initial, maximum, elapsed, timeout);
+        assert_eq!(next(initial, fast), 16 * mib);
+        assert_eq!(next(16 * mib, fast), maximum);
+        assert_eq!(next(maximum, fast), maximum);
+        assert_eq!(next(maximum, slow), 16 * mib);
+        assert_eq!(next(initial, slow), initial);
+        assert_eq!(next(16 * mib, Duration::from_secs(2)), 16 * mib);
+        // A shorter request timeout reduces the growth/shrink thresholds.
+        assert_eq!(
+            next_chunk_size(
+                16 * mib,
+                initial,
+                maximum,
+                Duration::from_millis(600),
+                Duration::from_secs(2)
+            ),
+            16 * mib
+        );
+        assert_eq!(
+            next_chunk_size(
+                16 * mib,
+                initial,
+                maximum,
+                Duration::from_millis(1100),
+                Duration::from_secs(2)
+            ),
+            initial
+        );
+    }
 }

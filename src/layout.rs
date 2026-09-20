@@ -23,7 +23,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::io::AsyncReadExt;
 
 /// Typed outcome of exporting a remote graph to a local OCI layout or archive.
 #[derive(Debug, serde::Serialize)]
@@ -86,7 +85,7 @@ struct Cancellable<R> {
 impl<R: Read> Read for Cancellable<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.cancelled.load(Ordering::Relaxed) {
-            return Err(io::Error::other("archive operation cancelled"));
+            return Err(io::Error::other("file operation cancelled"));
         }
         self.reader.read(buf)
     }
@@ -98,7 +97,7 @@ async fn blocking<T: Send + 'static>(
     let guard = CancelGuard(flag.clone());
     let result = tokio::task::spawn_blocking(move || f(flag))
         .await
-        .map_err(|_| Error::new(crate::error::Code::Execution, "archive worker failed"))?;
+        .map_err(|_| Error::new(crate::error::Code::Execution, "file worker failed"))?;
     drop(guard);
     result
 }
@@ -209,7 +208,7 @@ impl LocalLayout {
         Graph::build(root, limits, |d| {
             let root = self.root.clone();
             let limits = limits.clone();
-            async move { read_manifest(&root, &d, &limits) }
+            async move { blocking(move |_| read_manifest(&root, &d, &limits)).await }
         })
         .await
     }
@@ -265,8 +264,23 @@ fn read_manifest(root: &Path, d: &Descriptor, limits: &TransferConfig) -> Result
 }
 /// Verify a local payload's size and digest against its descriptor.
 pub async fn verify_local_blob(path: &Path, d: &Descriptor) -> Result<()> {
-    let mut file = tokio::fs::File::open(path).await?;
-    if file.metadata().await?.len() != d.size {
+    let path = path.to_owned();
+    let descriptor = d.clone();
+    blocking(move |cancelled| verify_local_blob_blocking(&path, &descriptor, cancelled)).await
+}
+
+fn verify_local_blob_blocking(
+    path: &Path,
+    d: &Descriptor,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    // One blocking job per file avoids a thread-pool round trip for every read and keeps hashing
+    // off the async executor. Cancellation is checked between bounded reads.
+    let mut file = Cancellable {
+        reader: File::open(path)?,
+        cancelled,
+    };
+    if file.reader.metadata()?.len() != d.size {
         return Err(Error::integrity(format!(
             "local size mismatch for {}",
             d.digest
@@ -276,7 +290,7 @@ pub async fn verify_local_blob(path: &Path, d: &Descriptor) -> Result<()> {
     let mut h = d.digest.hasher();
     let mut count = 0u64;
     loop {
-        let n = file.read(&mut buf).await?;
+        let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -322,7 +336,7 @@ fn extract_archive(
     let temporary = tempfile::tempdir()?;
     storage::restrict(temporary.path(), true)?;
     let reader = Cancellable {
-        reader: File::open(path)?,
+        reader: io::BufReader::with_capacity(1024 * 1024, File::open(path)?),
         cancelled: flag,
     };
     let mut archive = tar::Archive::new(reader);
@@ -383,11 +397,15 @@ fn extract_archive(
         }
         let dest = temporary.path().join(&relative);
         fs::create_dir_all(storage::parent(&dest))?;
-        let mut file = OpenOptions::new().write(true).create_new(true).open(dest)?;
+        let mut file = io::BufWriter::with_capacity(
+            1024 * 1024,
+            OpenOptions::new().write(true).create_new(true).open(dest)?,
+        );
         let written = io::copy(&mut entry, &mut file)?;
         if written != size {
             return Err(Error::integrity("truncated archive entry"));
         }
+        file.flush()?;
     }
     Ok((temporary, stored))
 }
@@ -458,7 +476,8 @@ fn make_archive(
 ) -> Result<tempfile::NamedTempFile> {
     let mut output = tempfile::NamedTempFile::new_in(parent)?;
     {
-        let mut builder = tar::Builder::new(output.as_file_mut());
+        let mut buffered = io::BufWriter::with_capacity(1024 * 1024, output.as_file_mut());
+        let mut builder = tar::Builder::new(&mut buffered);
         let mut paths = vec![PathBuf::from("oci-layout"), PathBuf::from("index.json")];
         for algorithm in ["sha256", "sha512"] {
             let dir = root.join("blobs").join(algorithm);
@@ -492,6 +511,8 @@ fn make_archive(
             )?;
         }
         builder.finish()?;
+        drop(builder);
+        buffered.flush()?;
     }
     output.flush()?;
     output.as_file().sync_all()?;
@@ -566,12 +587,27 @@ pub async fn pull(
         for m in graph.manifests.values() {
             tokio::fs::write(blob_path(temp.path(), m.digest()), &m.raw).await?;
         }
-        stream::iter(graph.blobs.values().cloned())
+        stream::iter(transfer::largest_blobs_first(&graph))
             .map(|d| {
                 let path = blob_path(temp.path(), &d.digest);
                 let source = source.clone();
                 let repo = reference.repository.clone();
-                async move { source.download_blob(&repo, &d, &path).await }
+                async move {
+                    match format {
+                        ArchiveFormat::OciLayout => source.download_blob(&repo, &d, &path).await,
+                        ArchiveFormat::OciArchive => {
+                            // Only the completed archive is durable; its staging files are disposable.
+                            source
+                                .download_blob_progress(
+                                    &repo,
+                                    &d,
+                                    &path,
+                                    &crate::observer::NoProgress,
+                                )
+                                .await
+                        }
+                    }
+                }
             })
             .buffer_unordered(source.config().transfer.concurrency)
             .try_collect::<Vec<_>>()
@@ -640,7 +676,7 @@ pub async fn push(
         }
     }
     let budget = crate::temporary::Budget::new(available);
-    let outcomes = stream::iter(graph.blobs.values().cloned())
+    let outcomes = stream::iter(transfer::largest_blobs_first(&graph))
         .map(|d| {
             let budget = budget.clone();
             let root = layout.root.clone();
@@ -689,7 +725,7 @@ pub async fn push(
         stats.merge(&outcome);
     }
     if !write.dry_run {
-        transfer::publish_dependencies(target, destination, &graph).await?;
+        transfer::publish_children(target, destination, &graph).await?;
         transfer::publish_root(target, destination, &graph.root, write.overwrite).await?;
     }
     Ok(PushResult {

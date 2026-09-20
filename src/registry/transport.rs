@@ -10,10 +10,20 @@ use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use reqx::prelude::{RedirectPolicy, RetryPolicy, StatusPolicy, TlsRootStore};
 use reqx::{Client, ResponseStream as Response, TransportErrorKind};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncReadExt;
 use url::Url;
+
+struct PendingWrite<'a>(Option<&'a AtomicBool>);
+
+impl Drop for PendingWrite<'_> {
+    fn drop(&mut self) {
+        if let Some(changed) = self.0 {
+            changed.store(true, Ordering::SeqCst);
+        }
+    }
+}
 
 pub(super) fn content_length(response: &Response) -> Option<u64> {
     response
@@ -275,7 +285,12 @@ impl Registry {
             );
             let started = Instant::now();
             let mutation = method != Method::GET && method != Method::HEAD;
-            let response = match request.send_stream().await {
+            // Cancellation before the response arrives leaves a write's outcome uncertain.
+            // Completed requests retain the precise status/connect-error handling below.
+            let mut pending = PendingWrite(mutation.then_some(self.inner.changed.as_ref()));
+            let response = request.send_stream().await;
+            pending.0 = None;
+            let response = match response {
                 Ok(r) => r,
                 Err(e)
                     if crate::error::certificate_code(&e).is_none()
@@ -314,6 +329,23 @@ impl Registry {
                 self.inner.changed.store(true, Ordering::SeqCst);
             }
             if response.status() == StatusCode::UNAUTHORIZED && local && refreshes < 2 {
+                let refresh_lock = self.auth_refresh_lock(scope).await;
+                let _refresh = refresh_lock.lock().await;
+                let recent = self
+                    .inner
+                    .cache
+                    .lock()
+                    .await
+                    .get(scope)
+                    .filter(|a| a.fresh())
+                    .cloned();
+                // Another request may have refreshed the rejected credential while we waited.
+                // Different permission scopes have separate locks and can authenticate concurrently.
+                if recent.is_some() && recent != auth {
+                    auth = recent;
+                    refreshes += 1;
+                    continue;
+                }
                 let mut offers = Vec::new();
                 for h in response.headers().get_all(header::WWW_AUTHENTICATE) {
                     let h = h

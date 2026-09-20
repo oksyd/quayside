@@ -131,6 +131,7 @@ pub struct Response {
     pub body: Vec<u8>,
     pub headers: Vec<(String, String)>,
     pub delay: Duration,
+    pub chunk_delay: Duration,
 }
 impl Response {
     pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
@@ -139,6 +140,7 @@ impl Response {
             body: body.into(),
             headers: vec![],
             delay: Duration::ZERO,
+            chunk_delay: Duration::ZERO,
         }
     }
     pub fn header(mut self, key: &str, value: &str) -> Self {
@@ -202,7 +204,15 @@ fn serve<S: Read + Write>(
     stream.flush()?;
     thread::sleep(response.delay);
     if method != "HEAD" {
-        stream.write_all(&response.body)?;
+        if response.chunk_delay.is_zero() {
+            stream.write_all(&response.body)?;
+        } else {
+            for chunk in response.body.chunks(64 * 1024) {
+                thread::sleep(response.chunk_delay);
+                stream.write_all(chunk)?;
+                stream.flush()?;
+            }
+        }
     }
     stream.flush()
 }

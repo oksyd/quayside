@@ -34,9 +34,9 @@ pub struct RegistryConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransferConfig {
-    /// Maximum number of concurrent blob transfer workers.
+    /// Maximum concurrent requests per stage; blob downloads and their ranges share this limit.
     pub concurrency: usize,
-    /// Upload chunk size, expressed with supported binary byte units.
+    /// Initial upload chunk size; fast transfers grow within the 128MiB aggregate buffer limit.
     pub chunk_size: String,
     /// Maximum retry count for retryable requests or transfer attempts.
     pub max_retries: usize,

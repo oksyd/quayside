@@ -42,6 +42,7 @@ pub struct Context {
     /// Tracks whether remote writes may have occurred, including uncertain responses.
     pub changed: Arc<AtomicBool>,
     auth: AuthFile,
+    registries: Mutex<BTreeMap<String, Registry>>,
     warnings: Mutex<BTreeSet<String>>,
     /// Whether this invocation may display interactive terminal progress.
     pub progress: bool,
@@ -63,6 +64,7 @@ impl Context {
             auth_path,
             key_path,
             auth,
+            registries: Mutex::new(BTreeMap::new()),
             changed: Arc::new(AtomicBool::new(false)),
             warnings: Mutex::new(BTreeSet::new()),
             progress: !cli.json
@@ -92,15 +94,27 @@ impl Context {
             ));
         }
     }
-    /// Construct a registry client using this command's policy and credentials.
+    /// Reuse a registry client, connection pool and authentication cache for this invocation.
     pub fn registry(&self, name: &str) -> Result<Registry> {
         self.connection_warnings(name);
-        Registry::new(
+        let mut registries = self
+            .registries
+            .lock()
+            .map_err(|_| Error::new(Code::Execution, "registry cache lock failed"))?;
+        if let Some(registry) = registries.get(name) {
+            return Ok(registry.clone());
+        }
+        let registry = Registry::new(
             name,
             self.config.clone(),
             self.auth.registries.get(name).cloned(),
             self.changed.clone(),
-        )
+        )?;
+        // Bound retained clients even when many duplicate index inputs use different registries.
+        if registries.len() < self.config.transfer.concurrency * 2 {
+            registries.insert(name.to_owned(), registry.clone());
+        }
+        Ok(registry)
     }
 }
 
@@ -402,12 +416,18 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             platform,
         } => {
             let r: Reference = reference.parse()?;
-            let resolved =
-                transfer::resolve(&ctx.registry(&r.registry)?, &r, platform.as_deref()).await?;
-            let digest = resolved.manifest.digest().to_string();
+            let reg = ctx.registry(&r.registry)?;
+            let (source_digest, digest) = if let Some(platform) = platform {
+                let resolved = transfer::resolve(&reg, &r, Some(platform)).await?;
+                (resolved.source_digest, resolved.manifest.digest().clone())
+            } else {
+                // The verified manifest bytes determine its digest; image configuration is irrelevant.
+                let manifest = reg.get_manifest(&r).await?;
+                (manifest.digest().clone(), manifest.digest().clone())
+            };
             Ok(Output::new(
-                json!({"reference":r.to_string(),"source_digest":resolved.source_digest,"digest":digest}),
-                digest,
+                json!({"reference":r.to_string(),"source_digest":source_digest,"digest":digest}),
+                digest.to_string(),
             ))
         }
         ImageCommand::Inspect {
@@ -516,8 +536,9 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             let reg = ctx.registry(&src.registry)?;
             let manifest = reg.get_manifest(&src).await?;
             manifest.check_transfer_supported()?;
-            transfer::check_destination(&reg, &dst, &manifest, write.overwrite).await?;
-            if !write.dry_run {
+            if write.dry_run {
+                transfer::check_destination(&reg, &dst, &manifest, write.overwrite).await?;
+            } else {
                 transfer::publish_root(&reg, &dst, &manifest, write.overwrite).await?;
             }
             let data = json!({"source":src.to_string(),"destination":dst.to_string(),"target_digest":manifest.digest(),"dry_run":write.dry_run});
@@ -539,8 +560,13 @@ async fn index_create(
     let mut seen_digests = BTreeSet::new();
     let mut metadata_bytes = 0u64;
     let mut object_count = 0usize;
+    let mut seen_sources = BTreeSet::new();
+    let mut blob_sizes = BTreeMap::new();
     for source in sources {
         let r: Reference = source.parse()?;
+        if !seen_sources.insert(r.to_string()) {
+            continue;
+        }
         let reg = ctx.registry(&r.registry)?;
         let mut manifest = reg.get_manifest(&r).await?;
         if manifest.kind != ManifestKind::Image {
@@ -548,10 +574,10 @@ async fn index_create(
                 "index create --from accepts single-platform images only",
             ));
         }
-        let platform = transfer::image_platform(&reg, &r.repository, &manifest).await?;
         if !seen_digests.insert(manifest.digest().clone()) {
             continue;
         }
+        let platform = transfer::image_platform(&reg, &r.repository, &manifest).await?;
         if inputs.contains_key(&platform.to_string()) {
             return Err(Error::conflict(format!(
                 "multiple different images for platform {platform}"
@@ -559,6 +585,16 @@ async fn index_create(
         }
         manifest.descriptor.platform = Some(platform.clone());
         let graph = transfer::remote_graph(&reg, &r, manifest).await?;
+        for blob in graph.blobs.values() {
+            if blob_sizes
+                .insert(blob.digest.clone(), blob.size)
+                .is_some_and(|size| size != blob.size)
+            {
+                return Err(Error::integrity(
+                    "inconsistent size for a shared index input blob",
+                ));
+            }
+        }
         metadata_bytes += graph
             .manifests
             .values()
@@ -583,32 +619,24 @@ async fn index_create(
     )?);
     let index = Manifest::parse(body, Some(OCI_INDEX), None)?;
     transfer::check_destination(&target, &dst, &index, write.overwrite).await?;
-    let mut stats = TransferStats::default();
-    let mut planned = BTreeSet::new();
-    for (source, source_ref, graph) in inputs.values() {
-        let mut unique = graph.clone();
-        if write.dry_run {
-            unique
-                .blobs
-                .retain(|digest, _| planned.insert(digest.clone()));
-        }
-        stats.merge(
-            &transfer::transfer_remote_blobs(
-                source,
-                source_ref,
-                &target,
-                &dst,
-                &unique,
-                write.dry_run,
-                &crate::progress::TerminalObserver(ctx.progress),
-            )
-            .await?,
-        );
-        if !write.dry_run {
-            transfer::publish_dependencies(&target, &dst, graph).await?;
-        }
-    }
+    let stats = transfer::transfer_remote_inputs(
+        inputs
+            .values()
+            .map(|(source, reference, graph)| (source, reference, graph)),
+        &target,
+        &dst,
+        write.dry_run,
+        &crate::progress::TerminalObserver(ctx.progress),
+    )
+    .await?;
     if !write.dry_run {
+        use futures_util::{StreamExt, TryStreamExt, stream};
+        // Each input is a single image. Publish them concurrently, then publish the index last.
+        stream::iter(inputs.values())
+            .map(|(_, _, graph)| transfer::publish_dependencies(&target, &dst, graph))
+            .buffer_unordered(ctx.config.transfer.concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
         transfer::publish_root(&target, &dst, &index, write.overwrite).await?;
     }
     ctx.warn("Independent referrers were not copied. Input images were not deleted.");

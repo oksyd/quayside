@@ -1,7 +1,9 @@
 version = 1
 
 [transfer]
+# Request limit per stage; blobs and download ranges share the download limit.
 concurrency = 4
+# Initial upload chunk; grows on fast links within a 128MiB aggregate buffer budget.
 chunk_size = "8MiB"
 max_retries = 3
 connect_timeout = "10s"

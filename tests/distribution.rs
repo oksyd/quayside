@@ -97,6 +97,52 @@ fn distribution_round_trip_copy_limits_and_mount() {
     harness.json(&["image", "copy", &index, &dst, "--overwrite"], 0);
     let tags = harness.json(&["tag", "ls", &format!("{target}/{run}/target")], 0);
     assert_eq!(tags["data"]["tags"], serde_json::json!(["v1"]));
+
+    // Exercise adaptive PATCH chunks followed by a final PUT containing the remaining bytes.
+    let chunked = image_layout(&harness.root.path().join("chunked"), 2, 1024 * 1024);
+    let src = format!("{source}/{run}/chunked:v1");
+    let dst = format!("{target}/{run}/chunked:v1");
+    harness.config.transfer.max_temp_size = "2MiB".into();
+    harness.json(
+        &["image", "push", chunked.directory.to_str().unwrap(), &src],
+        0,
+    );
+    let copied = harness.json(&["image", "copy", &src, &dst], 0);
+    assert_eq!(copied["data"]["target_digest"], chunked.digest);
+    assert_eq!(copied["data"]["stats"]["copied_blobs"], 3);
+
+    // A large layer exercises Range downloads in both remote copy and persistent layout pull.
+    let large = image_layout(&harness.root.path().join("large"), 1, 32 * 1024 * 1024);
+    let src = format!("{source}/{run}/large:v1");
+    let dst = format!("{target}/{run}/large:v1");
+    harness.config.transfer.max_temp_size = "64MiB".into();
+    harness.config.transfer.chunk_size = "8MiB".into();
+    harness.config.transfer.idle_timeout = "10s".into();
+    harness.json(
+        &["image", "push", large.directory.to_str().unwrap(), &src],
+        0,
+    );
+    let copied = harness.json(&["image", "copy", &src, &dst], 0);
+    assert_eq!(copied["data"]["target_digest"], large.digest);
+    let output = harness.root.path().join("large-pull");
+    harness.json(
+        &[
+            "image",
+            "pull",
+            &dst,
+            "--format",
+            "oci-layout",
+            "-o",
+            output.to_str().unwrap(),
+        ],
+        0,
+    );
+    for (digest, bytes) in large.blobs {
+        let path = output
+            .join("blobs/sha256")
+            .join(digest.split_once(':').unwrap().1);
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
 }
 
 #[test]

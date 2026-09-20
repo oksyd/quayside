@@ -19,6 +19,8 @@ pub enum Phase {
 pub enum BlobPhase {
     /// Receiving payload bytes from the source registry.
     Downloading,
+    /// Verifying the complete digest after a parallel download.
+    Verifying,
     /// Sending payload chunks and tracking registry-acknowledged offsets.
     Uploading,
     /// Committing an upload session to its final content digest.

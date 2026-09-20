@@ -803,3 +803,42 @@ fn accepted_nonblocking_connection_waits_for_request_data() {
         *b"x"
     );
 }
+
+#[test]
+fn copy_conflict_is_reported_before_fetching_child_manifests() {
+    use quayside::model::{Manifest, OCI_INDEX};
+    use std::sync::atomic::AtomicUsize;
+    let data = tempfile::tempdir().unwrap();
+    let image = image_layout(data.path(), 1, 64);
+    let leaf = Manifest::parse(image.manifest.clone().into(), None, None).unwrap();
+    let index = serde_json::to_vec(&json!({
+        "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [leaf.descriptor]
+    }))
+    .unwrap();
+    let children = Arc::new(AtomicUsize::new(0));
+    let count = children.clone();
+    let source = Server::new(move |request| {
+        if request.path.ends_with("/manifests/v1") {
+            Response::new(200, index.clone()).header("Content-Type", OCI_INDEX)
+        } else {
+            count.fetch_add(1, Ordering::SeqCst);
+            Response::new(404, vec![])
+        }
+    });
+    let target = Server::new(move |request| {
+        assert_eq!(request.method, "GET");
+        Response::new(200, image.manifest.clone()).header("Content-Type", OCI_MANIFEST)
+    });
+    let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+    let result = harness.json(
+        &[
+            "image",
+            "copy",
+            &format!("{}/app:v1", source.host),
+            &format!("{}/app:v1", target.host),
+        ],
+        8,
+    );
+    assert_eq!(result["error"]["code"], "CONFLICT");
+    assert_eq!(children.load(Ordering::SeqCst), 0);
+}

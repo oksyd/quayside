@@ -1,6 +1,4 @@
-use super::transport::{
-    content_length, http_error, limited_body, retry_delay, same_origin, valid_url,
-};
+use super::transport::{http_error, limited_body, same_origin, valid_url};
 use super::{Registry, UploadStart};
 use crate::digest::Digest;
 use crate::error::Code;
@@ -10,8 +8,6 @@ use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use reqx::ResponseStream as Response;
-use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use url::Url;
 
 impl Registry {
@@ -62,6 +58,19 @@ impl Registry {
             _ => Err(http_error(&response)),
         }
     }
+    pub(super) async fn cached_blob(&self, repo: &str, d: &Descriptor) -> Result<Option<Bytes>> {
+        let raw = self
+            .inner
+            .blobs
+            .lock()
+            .await
+            .get(&(repo.to_owned(), d.digest.clone()))
+            .cloned();
+        if let Some(raw) = &raw {
+            d.verify(raw)?;
+        }
+        Ok(raw)
+    }
     /// Read and verify a blob into memory, enforcing the caller's size limit.
     pub async fn get_blob_bytes(&self, repo: &str, d: &Descriptor, limit: u64) -> Result<Bytes> {
         if d.size > limit {
@@ -69,7 +78,7 @@ impl Registry {
                 "config blob exceeds configured metadata size limit",
             ));
         }
-        if let Some(data) = d.embedded()? {
+        if let Some(data) = d.embedded()?.or(self.cached_blob(repo, d).await?) {
             return Ok(data);
         }
         let (response, _) = self
@@ -88,93 +97,16 @@ impl Registry {
         }
         let raw = limited_body(response, limit).await?;
         d.verify(&raw)?;
+        let limit = crate::config::parse_size(&self.config().transfer.max_metadata_size)?
+            .min(8 * 1024 * 1024) as usize;
+        let mut cache = self.inner.blobs.lock().await;
+        let used: usize = cache.values().map(Bytes::len).sum();
+        if used.saturating_add(raw.len()) <= limit
+            && cache.len() < self.config().transfer.max_objects
+        {
+            cache.insert((repo.to_owned(), d.digest.clone()), raw.clone());
+        }
         Ok(raw)
-    }
-    /// Stream a blob to a file and verify its length and digest, retrying bounded network failures.
-    pub async fn download_blob(&self, repo: &str, d: &Descriptor, output: &Path) -> Result<()> {
-        self.download_blob_progress(repo, d, output, &crate::observer::NoProgress)
-            .await
-    }
-    pub(crate) async fn download_blob_progress(
-        &self,
-        repo: &str,
-        d: &Descriptor,
-        output: &Path,
-        progress: &dyn crate::observer::BlobProgress,
-    ) -> Result<()> {
-        if let Some(raw) = d.embedded()? {
-            tokio::fs::write(output, &raw).await?;
-            return Ok(());
-        }
-        let mut attempt = 0;
-        loop {
-            progress.phase(crate::observer::BlobPhase::Downloading);
-            match self.download_once(repo, d, output, progress).await {
-                Ok(()) => return Ok(()),
-                Err(e) if e.retryable() && attempt < self.config().transfer.max_retries => {
-                    tokio::time::sleep(retry_delay(None, attempt)).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    async fn download_once(
-        &self,
-        repo: &str,
-        d: &Descriptor,
-        output: &Path,
-        progress: &dyn crate::observer::BlobProgress,
-    ) -> Result<()> {
-        let (mut response, _) = self
-            .request(
-                Method::GET,
-                self.url(&format!("v2/{repo}/blobs/{}", d.digest))?,
-                &Self::scope(repo, "pull"),
-                HeaderMap::new(),
-                None,
-                true,
-                true,
-            )
-            .await?;
-        if response.status() != StatusCode::OK {
-            return Err(http_error(&response));
-        }
-        if content_length(&response).is_some_and(|n| n != d.size) {
-            return Err(Error::integrity(
-                "blob HTTP Content-Length does not match descriptor",
-            ));
-        }
-        let mut file = tokio::fs::File::create(output).await?;
-        let mut hasher = d.digest.hasher();
-        let mut count = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let size = response
-                .read(&mut buffer)
-                .await
-                .map_err(|_| Error::network("HTTP response body read failed"))?;
-            if size == 0 {
-                break;
-            }
-            let chunk = &buffer[..size];
-            count = count
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| Error::integrity("blob size overflow"))?;
-            if count > d.size {
-                return Err(Error::integrity("received blob exceeds descriptor size"));
-            }
-            hasher.update(chunk);
-            file.write_all(chunk).await?;
-            progress.position(count);
-        }
-        if count != d.size {
-            return Err(Error::integrity("received blob is shorter than descriptor"));
-        }
-        hasher.verify(&d.digest)?;
-        file.flush().await?;
-        file.sync_all().await?;
-        Ok(())
     }
     /// Start an upload or request a same-registry mount from an optional source repository.
     pub async fn start_upload(
@@ -340,28 +272,57 @@ impl Registry {
         Ok((self.checked_location(&response)?, range_offset(range)?))
     }
     /// Commit an upload session using its expected payload digest.
-    pub async fn finish_upload(&self, repo: &str, mut url: Url, digest: &Digest) -> Result<()> {
+    pub async fn finish_upload(&self, repo: &str, url: Url, digest: &Digest) -> Result<()> {
+        self.commit_upload(repo, url, digest, 0, Bytes::new()).await
+    }
+    pub(crate) async fn commit_upload(
+        &self,
+        repo: &str,
+        mut url: Url,
+        digest: &Digest,
+        offset: u64,
+        chunk: Bytes,
+    ) -> Result<()> {
         if url.query_pairs().any(|(k, _)| k == "digest") {
             return Err(Error::input(
                 "upload URL unexpectedly already contains a digest parameter",
             ));
         }
         url.query_pairs_mut().append_pair("digest", digest.as_str());
+        let mut headers = HeaderMap::new();
+        let has_body = !chunk.is_empty();
+        if has_body {
+            let end = offset
+                .checked_add(chunk.len() as u64 - 1)
+                .ok_or_else(|| Error::input("upload offset overflow"))?;
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            headers.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("{offset}-{end}"))
+                    .map_err(|_| Error::input("invalid upload range"))?,
+            );
+        }
         let (response, _) = self
             .request(
                 Method::PUT,
                 url,
                 &Self::scope(repo, "pull,push"),
-                HeaderMap::new(),
-                None,
-                false,
+                headers,
+                has_body.then_some(chunk),
+                has_body,
                 false,
             )
             .await?;
-        if response.status() != StatusCode::CREATED {
-            return Err(http_error(&response));
+        match response.status() {
+            StatusCode::CREATED => Ok(()),
+            StatusCode::RANGE_NOT_SATISFIABLE => {
+                Err(Error::network("upload offset needs reconciliation"))
+            }
+            _ => Err(http_error(&response)),
         }
-        Ok(())
     }
 }
 pub(super) fn range_offset(value: &str) -> Result<u64> {

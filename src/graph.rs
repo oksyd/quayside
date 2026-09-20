@@ -4,6 +4,7 @@ use crate::{
     digest::Digest,
     model::{Descriptor, Manifest, ManifestKind},
 };
+use futures_util::{StreamExt, TryStreamExt, stream};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -27,7 +28,8 @@ enum Task {
     Finish(Digest),
 }
 impl Graph {
-    /// Fetch and verify a bounded dependency closure, rejecting cycles and conflicting descriptors.
+    /// Fetch siblings concurrently within transfer limits and verify a dependency closure.
+    /// Reject cycles and conflicting descriptors while preserving children-first publication order.
     pub async fn build<F, Fut>(
         root: Manifest,
         limits: &TransferConfig,
@@ -46,7 +48,9 @@ impl Graph {
         let mut stack = vec![Task::Visit(root, 0)];
         let mut visiting = BTreeSet::new();
         let mut done = BTreeSet::new();
-        let mut metadata_size = 0u64;
+        let mut metadata_size = graph.root.raw.len() as u64;
+        let mut prefetched = BTreeMap::<Digest, Manifest>::new();
+        let concurrency = limits.concurrency.clamp(1, 32);
         let max_metadata = parse_size(&limits.max_metadata_size)?;
         let max_manifest = parse_size(&limits.max_manifest_size)?;
         while let Some(task) = stack.pop() {
@@ -61,14 +65,74 @@ impl Graph {
                             continue;
                         }
                     }
-                    if d.size > max_manifest {
-                        return Err(Error::input("manifest exceeds configured size limit"));
+                    if depth > limits.max_depth {
+                        return Err(Error::input("manifest graph depth limit exceeded"));
                     }
-                    let m = if let Some(raw) = d.embedded()? {
-                        Manifest::parse(raw, Some(&d.media_type), Some(&d.digest))?
-                    } else {
-                        fetch(d.clone()).await?
-                    };
+                    if !prefetched.contains_key(&d.digest) {
+                        // Prefetch a bounded group of siblings while retaining deterministic DFS order.
+                        let mut batch = vec![d.clone()];
+                        let mut scheduled = BTreeSet::from([d.digest.clone()]);
+                        for task in stack.iter().rev() {
+                            let Task::Fetch(sibling, _) = task else { break };
+                            if batch.len() == concurrency {
+                                break;
+                            }
+                            if !graph.manifests.contains_key(&sibling.digest)
+                                && !prefetched.contains_key(&sibling.digest)
+                                && scheduled.insert(sibling.digest.clone())
+                            {
+                                batch.push(sibling.clone());
+                            }
+                        }
+                        if graph.manifests.len()
+                            + graph.blobs.len()
+                            + prefetched.len()
+                            + batch.len()
+                            > limits.max_objects
+                        {
+                            return Err(Error::input("manifest graph object limit exceeded"));
+                        }
+                        // Reserve declared sizes before starting requests, including buffered siblings.
+                        for descriptor in &batch {
+                            if descriptor.size > max_manifest {
+                                return Err(Error::input("manifest exceeds configured size limit"));
+                            }
+                            metadata_size = metadata_size
+                                .checked_add(descriptor.size)
+                                .ok_or_else(|| Error::input("metadata size overflow"))?;
+                            if metadata_size > max_metadata {
+                                return Err(Error::input("manifest graph metadata limit exceeded"));
+                            }
+                        }
+                        let manifests: Vec<Manifest> = stream::iter(batch)
+                            .map(|descriptor| {
+                                let pending =
+                                    descriptor.data.is_none().then(|| fetch(descriptor.clone()));
+                                async move {
+                                    let manifest = match pending {
+                                        Some(pending) => pending.await?,
+                                        None => Manifest::parse(
+                                            descriptor.embedded()?.ok_or_else(|| {
+                                                Error::integrity("missing embedded manifest")
+                                            })?,
+                                            Some(&descriptor.media_type),
+                                            Some(&descriptor.digest),
+                                        )?,
+                                    };
+                                    manifest.verify_descriptor(&descriptor)?;
+                                    Ok::<_, Error>(manifest)
+                                }
+                            })
+                            .buffered(concurrency)
+                            .try_collect()
+                            .await?;
+                        for manifest in manifests {
+                            prefetched.insert(manifest.digest().clone(), manifest);
+                        }
+                    }
+                    let m = prefetched
+                        .remove(&d.digest)
+                        .ok_or_else(|| Error::integrity("missing prefetched manifest"))?;
                     m.verify_descriptor(&d)?;
                     stack.push(Task::Visit(m, depth));
                 }
@@ -83,9 +147,6 @@ impl Graph {
                     if !visiting.insert(digest.clone()) {
                         return Err(Error::integrity("cyclic manifest graph"));
                     }
-                    metadata_size = metadata_size
-                        .checked_add(m.raw.len() as u64)
-                        .ok_or_else(|| Error::input("metadata size overflow"))?;
                     if m.raw.len() as u64 > max_manifest || metadata_size > max_metadata {
                         return Err(Error::input("manifest graph metadata limit exceeded"));
                     }
@@ -102,7 +163,8 @@ impl Graph {
                         }
                     }
                     let children = m.children()?;
-                    if graph.manifests.len() + graph.blobs.len() + 1 > limits.max_objects
+                    if graph.manifests.len() + graph.blobs.len() + prefetched.len() + 1
+                        > limits.max_objects
                         || children.len() > limits.max_objects
                     {
                         return Err(Error::input("manifest graph object limit exceeded"));
@@ -149,6 +211,104 @@ mod tests {
     use crate::model::OCI_INDEX;
     use bytes::Bytes;
     use serde_json::json;
+    fn index(children: &[Descriptor], id: usize) -> Manifest {
+        Manifest::parse(
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": children,
+                    "annotations": {"test.id": id.to_string()}
+                }))
+                .unwrap(),
+            ),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn siblings_fetch_concurrently_with_bounded_dedup_and_stable_order() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let leaves: Vec<_> = (0..4).map(|id| index(&[], id)).collect();
+        let mut children: Vec<_> = leaves.iter().map(|m| m.descriptor.clone()).collect();
+        children.insert(1, children[0].clone());
+        let root = index(&children, 5);
+        let limits = TransferConfig {
+            concurrency: 2,
+            ..Default::default()
+        };
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let graph = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Graph::build(root.clone(), &limits, |d| {
+                let leaf = leaves
+                    .iter()
+                    .find(|m| m.digest() == &d.digest)
+                    .unwrap()
+                    .clone();
+                let (active, maximum, calls, barrier) = (
+                    active.clone(),
+                    maximum.clone(),
+                    calls.clone(),
+                    barrier.clone(),
+                );
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    barrier.wait().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(leaf)
+                }
+            }),
+        )
+        .await
+        .expect("manifest requests must overlap")
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        let mut expected: Vec<_> = leaves.iter().map(|m| m.digest().clone()).collect();
+        expected.push(root.digest().clone());
+        assert_eq!(graph.order, expected);
+    }
+
+    #[tokio::test]
+    async fn prefetch_reserves_metadata_before_starting_requests() {
+        let leaf = index(&[], 0);
+        let root = index(std::slice::from_ref(&leaf.descriptor), 1);
+        let limits = TransferConfig {
+            max_metadata_size: root.raw.len().to_string(),
+            ..Default::default()
+        };
+        let error = Graph::build(root, &limits, |_| async {
+            panic!("over-budget manifest must not be fetched")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("metadata limit"));
+    }
+
+    #[tokio::test]
+    async fn prefetched_manifest_still_checks_every_descriptor() {
+        let leaf = index(&[], 0);
+        let mut conflicting = leaf.descriptor.clone();
+        conflicting.size += 1;
+        let root = index(&[leaf.descriptor.clone(), conflicting], 1);
+        let error = Graph::build(root, &TransferConfig::default(), |_| {
+            let leaf = leaf.clone();
+            async move { Ok(leaf) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, crate::error::Code::Integrity);
+    }
+
     #[tokio::test]
     async fn nested_order_and_dedup() {
         let leaf = Manifest::parse(

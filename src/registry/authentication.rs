@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use url::Url;
 use zeroize::Zeroizing;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum CachedAuth {
     Basic,
     Bearer {
@@ -41,6 +41,21 @@ pub(super) fn basic_auth(credential: &Credential) -> Result<HeaderValue> {
     Ok(value)
 }
 impl Registry {
+    pub(super) async fn auth_refresh_lock(
+        &self,
+        scope: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut pending = self.inner.auth_refreshes.lock().await;
+        // Keep only active refreshes, so commands traversing many repositories do not retain locks.
+        pending.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = pending.get(scope).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        pending.insert(scope.to_owned(), std::sync::Arc::downgrade(&lock));
+        lock
+    }
+
     pub(super) async fn token(
         &self,
         realm: &str,
