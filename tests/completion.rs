@@ -176,3 +176,31 @@ fn failed_profile_update_reports_written_completion_and_preserves_profile() {
     assert!(root.path().join(".zfunc/_quayside").is_file());
     assert!(root.path().join(".zshrc").is_dir());
 }
+
+#[test]
+fn custom_target_under_user_symlink_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let alias = root.path().join("alias");
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let target = alias.join("quayside.bash");
+    let result = run(
+        root.path(),
+        &[
+            "completion",
+            "install",
+            "bash",
+            "--path",
+            target.to_str().unwrap(),
+        ],
+        1,
+    );
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shellcomp.invalid_target_path")
+    );
+    assert!(!real.join("quayside.bash").exists());
+}

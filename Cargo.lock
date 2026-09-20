@@ -1282,9 +1282,12 @@ dependencies = [
 
 [[package]]
 name = "shellcomp"
-version = "0.1.13"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8f59877123f7d75cf96f1aa155684dd0327823501678953f8b1575b0a1dda66"
+checksum = "344028214596dd46e8f80f8cbd6d7d037a46c3fb39290be39c7820b4d1f6c366"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "shlex"
