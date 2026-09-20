@@ -1,0 +1,73 @@
+[package]
+name = "quayside"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Daemonless OCI registry operations, written in Rust"
+license = "Apache-2.0"
+readme = "README.md"
+include = [
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
+keywords = ["oci", "registry", "container", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
+clap_complete = { version = "4.6.11", default-features = false }
+shellcomp = { version = "0.1.13", default-features = false }
+indicatif = { version = "0.18.6", default-features = false }
+rpassword = { version = "7.5.4", default-features = false }
+humantime = { version = "2.4.0", default-features = false }
+regex = { version = "1.13.1", default-features = false, features = ["std"] }
+
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time", "signal"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+
+reqx = { version = "0.2.3", default-features = false, features = ["async-tls-rustls-ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std"] }
+http = { version = "1.5.0", default-features = false, features = ["std"] }
+httpdate = { version = "1.0.3", default-features = false }
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+
+serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std", "preserve_order"] }
+toml = { version = "0.8.23", default-features = false, features = ["parse", "display"] }
+
+dirs = { version = "6.0.0", default-features = false }
+fs2 = { version = "0.4.3", default-features = false }
+tar = { version = "0.4.46", default-features = false }
+tempfile = { version = "3.27.0", default-features = false, features = ["getrandom"] }
+
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+ring = { version = "0.17.14", default-features = false, features = ["std"] }
+sha2 = { version = "0.10.9", default-features = false }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc", "derive"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+
+[package.metadata.release]
+tag-prefix = ""
+tag-name = "{{prefix}}{{version}}"
+pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
+tag-message = "chore: release {{crate_name}} version {{version}}"
+pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]

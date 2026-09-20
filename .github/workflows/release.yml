@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      rust: ${{ steps.package.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate release metadata
+        id: package
+        run: |
+          git ls-files --error-unmatch Cargo.lock
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          package = tomllib.loads(Path("Cargo.toml").read_text())["package"]
+          version = package["version"]
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              if os.environ["GITHUB_REF_NAME"] != version:
+                  raise SystemExit(f"Release tag must match Cargo.toml: {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\nrust={package['rust-version']}\n")
+          PY
+
+  build:
+    needs: metadata
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: linux-x86_64-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: linux-aarch64-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: darwin-aarch64
+    env:
+      RUSTUP_TOOLCHAIN: ${{ needs.metadata.outputs.rust }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy --target "$TARGET"
+      - name: Check source
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          cargo fmt --all --check
+          cargo rustc --locked --lib --all-features -- -D missing-docs
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo doc --locked --no-deps --all-features
+      - name: Test
+        run: cargo test --locked --all-features
+      - name: Build binary
+        run: |
+          flags=()
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export CC=musl-gcc
+            flags+=(--config "target.$TARGET.linker=\"musl-gcc\"")
+          fi
+          cargo build --locked --release --target "$TARGET" "${flags[@]}"
+      - name: Verify binary
+        run: |
+          binary="target/$TARGET/release/quayside"
+          test "$("$binary" --version)" = "quayside $VERSION"
+          "$binary" --help
+      - name: Verify static linking
+        if: runner.os == 'Linux'
+        run: |
+          binary="target/$TARGET/release/quayside"
+          readelf --program-headers "$binary" > /tmp/program-headers.txt
+          readelf --dynamic "$binary" > /tmp/dynamic.txt
+          if grep -q INTERP /tmp/program-headers.txt || grep -q NEEDED /tmp/dynamic.txt; then
+            echo '::error::Release binary must be statically linked.'
+            exit 1
+          fi
+      - name: Package archive
+        run: |
+          name="quayside-$VERSION-$ASSET"
+          mkdir -p "dist/$name"
+          install -m 755 "target/$TARGET/release/quayside" "dist/$name/quayside"
+          install -m 644 LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.asset }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  draft:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify asset set and generate checksums
+        working-directory: dist
+        run: |
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 3
+          sha256sum \
+            "quayside-$VERSION-linux-aarch64-musl.tar.gz" \
+            "quayside-$VERSION-linux-x86_64-musl.tar.gz" \
+            "quayside-$VERSION-darwin-aarch64.tar.gz" > SHA256SUMS
+      - name: Attest release archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create draft release
+        working-directory: dist
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF_NOTES
+          | Platform | Archive |
+          | --- | --- |
+          | linux/amd64 | quayside-$VERSION-linux-x86_64-musl.tar.gz |
+          | linux/arm64 | quayside-$VERSION-linux-aarch64-musl.tar.gz |
+          | darwin/arm64 | quayside-$VERSION-darwin-aarch64.tar.gz |
+
+          Linux binaries use static musl; macOS binaries use system libraries.
+          Each archive contains quayside, LICENSE (Apache-2.0),
+          and README.md inside a directory matching its archive name.
+          Verify downloaded archives with: sha256sum --check --ignore-missing SHA256SUMS
+          EOF_NOTES
+          flags=()
+          if [[ "$VERSION" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          # Create fails if this version already exists; never replace its assets.
+          # Leave the release as a draft for manual review and publication.
+          gh release create "$RELEASE_TAG" --verify-tag --draft \
+            --title "$RELEASE_TAG" --generate-notes \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${flags[@]}" \
+            ./*.tar.gz SHA256SUMS

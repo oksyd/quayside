@@ -1,0 +1,29 @@
+version = 1
+
+[transfer]
+concurrency = 4
+chunk_size = "8MiB"
+max_retries = 3
+connect_timeout = "10s"
+metadata_timeout = "60s"
+idle_timeout = "60s"
+max_manifest_size = "8MiB"
+max_metadata_size = "64MiB"
+max_objects = 10000
+max_depth = 32
+max_archive_size = "1TiB"
+# Aggregate temporary file content per operation, including tar staging.
+max_temp_size = "64GiB"
+
+[registries."harbor.example.com"]
+# ca_file = "/etc/quayside/certs/root-ca.pem"
+plain_http = false
+insecure_skip_tls_verify = false
+# Empty: discover HTTPS token services automatically. Nonempty: restrict cross-origin hosts.
+# Each token host uses its own TLS configuration.
+auth_hosts = []
+
+[registries."target.example.com"]
+plain_http = false
+insecure_skip_tls_verify = false
+auth_hosts = []
