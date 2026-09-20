@@ -761,3 +761,45 @@ fn token_redirects_and_redirected_registry_challenges_never_forward_credentials(
     assert_eq!(foreign.connections.load(Ordering::SeqCst), 1);
     assert_eq!(token.connections.load(Ordering::SeqCst), calls);
 }
+
+#[test]
+fn accepted_nonblocking_connection_waits_for_request_data() {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        thread,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    // Reproduce inherited O_NONBLOCK on macOS, including when this test runs on Linux.
+    stream.set_nonblocking(true).unwrap();
+    support::configure_connection(&stream).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        let mut byte = [0];
+        result_tx
+            .send(stream.read_exact(&mut byte).map(|()| byte))
+            .unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = result_rx.recv_timeout(Duration::from_millis(100));
+    let sent = client.write_all(b"x");
+    worker.join().unwrap();
+    assert!(
+        matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "read returned before request data: {early:?}"
+    );
+    sent.unwrap();
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        *b"x"
+    );
+}

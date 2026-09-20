@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::{
@@ -206,6 +206,14 @@ fn serve<S: Read + Write>(
     }
     stream.flush()
 }
+pub fn configure_connection(stream: &TcpStream) -> std::io::Result<()> {
+    // macOS/BSD accept() can inherit the listener's nonblocking mode.
+    // The HTTP parser and rustls stream below use blocking I/O.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))
+}
+
 pub struct Server {
     pub host: String,
     pub connections: Arc<AtomicUsize>,
@@ -234,23 +242,21 @@ impl Server {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         count.fetch_add(1, Ordering::SeqCst);
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(5)))
-                            .unwrap();
-                        stream
-                            .set_write_timeout(Some(Duration::from_secs(5)))
-                            .unwrap();
+                        configure_connection(&stream).unwrap();
                         let handler = handler.clone();
                         let tls = tls.clone();
                         workers.push(thread::spawn(move || {
-                            if let Some(config) = tls {
+                            let result = if let Some(config) = tls {
                                 let connection = rustls::ServerConnection::new(config).unwrap();
-                                let _ = serve(
+                                serve(
                                     rustls::StreamOwned::new(connection, stream),
                                     handler.as_ref(),
-                                );
+                                )
                             } else {
-                                let _ = serve(stream, handler.as_ref());
+                                serve(stream, handler.as_ref())
+                            };
+                            if let Err(error) = result {
+                                eprintln!("test server request failed: {:?}", error.kind());
                             }
                         }));
                     }
