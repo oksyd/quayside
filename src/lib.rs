@@ -1,4 +1,4 @@
-//! Daemonless OCI registry operations. No subprocess is used by library or CLI.
+//! Daemonless OCI registry operations with optional local Docker image export.
 #[cfg(not(unix))]
 compile_error!("quayside supports Unix platforms only");
 

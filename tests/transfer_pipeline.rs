@@ -279,6 +279,49 @@ fn corrupt_download_is_never_queued_for_upload() {
 }
 
 #[test]
+fn shared_inline_blobs_are_preserved_and_validated_before_transfer() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    for corrupt in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let image = image_layout(root.path(), 1, 8192);
+        let mut manifest: Value = serde_json::from_slice(&image.manifest).unwrap();
+        manifest["artifactType"] = json!("application/example");
+        let config = &image.blobs[manifest["config"]["digest"].as_str().unwrap()];
+        manifest["config"]["data"] = json!(STANDARD.encode(config));
+        let mut inline = manifest["layers"][0].clone();
+        let mut bytes = image.blobs[inline["digest"].as_str().unwrap()].clone();
+        if corrupt {
+            bytes[0] ^= 1;
+        }
+        inline["data"] = json!(STANDARD.encode(bytes));
+        manifest["layers"].as_array_mut().unwrap().push(inline);
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let blob_reads = Arc::new(AtomicUsize::new(0));
+        let reads = blob_reads.clone();
+        let source = Server::new(move |request| {
+            if request.path.contains("/manifests/") {
+                Response::new(200, manifest.clone())
+                    .header("Content-Type", quayside::model::OCI_MANIFEST)
+            } else {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Response::new(404, vec![])
+            }
+        });
+        let target = destination(|_| true);
+        let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+        let result = copy(&harness, &source, &target, if corrupt { 7 } else { 0 });
+        assert_eq!(blob_reads.load(Ordering::SeqCst), 0);
+        if corrupt {
+            assert_eq!(result["error"]["code"], "INTEGRITY");
+            assert_eq!(result["data"]["remote_writes_may_have_occurred"], false);
+            assert_eq!(target.connections.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(result["data"]["stats"]["copied_blobs"], 2);
+        }
+    }
+}
+
+#[test]
 fn uploads_commit_the_final_chunk_and_reuse_verified_config() {
     let root = tempfile::tempdir().unwrap();
     let image = image_layout(root.path(), 1, 1024 * 1024);

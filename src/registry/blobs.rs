@@ -3,6 +3,7 @@ use super::{Registry, UploadStart};
 use crate::digest::Digest;
 use crate::error::Code;
 use crate::model::Descriptor;
+use crate::reference::validate_repository;
 use crate::{Error, Result};
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
@@ -18,16 +19,21 @@ impl Registry {
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Error::input("upload response has no valid Location header"))?;
         let url = Url::parse(response.uri_raw())?.join(location)?;
-        valid_url(&url)?;
-        if !same_origin(&url, &self.inner.base) {
+        self.validate_upload_url(&url)?;
+        Ok(url)
+    }
+    fn validate_upload_url(&self, url: &Url) -> Result<()> {
+        valid_url(url)?;
+        if !same_origin(url, &self.inner.base) {
             return Err(Error::unsupported(
                 "cross-origin upload endpoints are not enabled; refusing to forward registry credentials",
             ));
         }
-        Ok(url)
+        Ok(())
     }
     /// Check whether a blob exists and reject a reported length that conflicts with its descriptor.
     pub async fn blob_exists(&self, repo: &str, d: &Descriptor) -> Result<bool> {
+        validate_repository(repo)?;
         let (response, _) = self
             .request(
                 Method::HEAD,
@@ -73,6 +79,7 @@ impl Registry {
     }
     /// Read and verify a blob into memory, enforcing the caller's size limit.
     pub async fn get_blob_bytes(&self, repo: &str, d: &Descriptor, limit: u64) -> Result<Bytes> {
+        validate_repository(repo)?;
         if d.size > limit {
             return Err(Error::input(
                 "config blob exceeds configured metadata size limit",
@@ -115,6 +122,10 @@ impl Registry {
         digest: &Digest,
         from: Option<&str>,
     ) -> Result<UploadStart> {
+        validate_repository(repo)?;
+        if let Some(from) = from {
+            validate_repository(from)?;
+        }
         let mut url = self.url(&format!("v2/{repo}/blobs/uploads/"))?;
         if let Some(from) = from {
             url.query_pairs_mut()
@@ -203,6 +214,8 @@ impl Registry {
         offset: u64,
         chunk: Bytes,
     ) -> Result<Url> {
+        validate_repository(repo)?;
+        self.validate_upload_url(&url)?;
         if chunk.is_empty() {
             return Err(Error::input("empty PATCH chunk"));
         }
@@ -250,6 +263,8 @@ impl Registry {
     }
     /// Query an upload session and return its continuation URL and acknowledged byte offset.
     pub async fn upload_status(&self, repo: &str, url: Url) -> Result<(Url, u64)> {
+        validate_repository(repo)?;
+        self.validate_upload_url(&url)?;
         let (response, _) = self
             .request(
                 Method::GET,
@@ -283,6 +298,8 @@ impl Registry {
         offset: u64,
         chunk: Bytes,
     ) -> Result<()> {
+        validate_repository(repo)?;
+        self.validate_upload_url(&url)?;
         if url.query_pairs().any(|(k, _)| k == "digest") {
             return Err(Error::input(
                 "upload URL unexpectedly already contains a digest parameter",

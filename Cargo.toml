@@ -26,7 +26,7 @@ rpassword = { version = "7.5.4", default-features = false }
 humantime = { version = "2.4.0", default-features = false }
 regex = { version = "1.13.1", default-features = false, features = ["std"] }
 
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time", "signal", "process"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 reqx = { version = "0.2.3", default-features = false, features = ["async-tls-rustls-ring"] }

@@ -157,7 +157,7 @@ pub async fn limited_body(mut response: Response, limit: u64) -> Result<Bytes> {
         return Err(Error::input("HTTP body exceeds configured size limit"));
     }
     let mut bytes = Vec::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let size = response
             .read(&mut buffer)

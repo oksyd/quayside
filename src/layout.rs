@@ -1,4 +1,4 @@
-//! OCI Image Layout and uncompressed tar transport. Never extracts image root filesystems.
+//! OCI layouts and uncompressed OCI/Docker archive transport. Never extracts image root filesystems.
 use crate::{
     Error, Result,
     config::{TransferConfig, parse_size},
@@ -10,13 +10,15 @@ use crate::{
     storage,
     transfer::{self, TransferStats},
 };
+mod docker;
+
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -51,7 +53,9 @@ pub struct PullResult {
 /// Typed outcome of importing a local OCI graph into a registry.
 #[derive(Debug, serde::Serialize)]
 pub struct PushResult {
-    /// Local OCI layout directory or archive that was imported.
+    /// Whether a legacy Docker archive required generation of a new OCI manifest.
+    pub converted_from_docker_archive: bool,
+    /// Local layout/archive path or Docker image name that was imported.
     pub source: PathBuf,
     /// Fully qualified destination reference with an explicit tag or digest.
     pub destination: String,
@@ -71,6 +75,8 @@ pub struct LocalLayout {
     pub root: PathBuf,
     _temporary: Option<tempfile::TempDir>,
     temporary_bytes: u64,
+    converted_from_docker_archive: bool,
+    docker_archive: bool,
 }
 struct CancelGuard(Arc<AtomicBool>);
 impl Drop for CancelGuard {
@@ -88,6 +94,14 @@ impl<R: Read> Read for Cancellable<R> {
             return Err(io::Error::other("file operation cancelled"));
         }
         self.reader.read(buf)
+    }
+}
+impl<R: io::Seek> io::Seek for Cancellable<R> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::other("file operation cancelled"));
+        }
+        self.reader.seek(position)
     }
 }
 async fn blocking<T: Send + 'static>(
@@ -139,22 +153,55 @@ fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
 impl LocalLayout {
     /// Open a layout directory or safely extract a bounded archive into owned temporary storage.
     pub async fn open(path: &Path, limits: &TransferConfig) -> Result<Self> {
+        Self::open_selected(path, limits, None).await
+    }
+    async fn open_selected(
+        path: &Path,
+        limits: &TransferConfig,
+        reference: Option<&str>,
+    ) -> Result<Self> {
         storage::reject_symlink(path)?;
-        if path.is_dir() {
+        let metadata = fs::metadata(path)?;
+        if metadata.is_dir() {
             return Ok(Self {
                 root: path.to_path_buf(),
                 _temporary: None,
                 temporary_bytes: 0,
+                converted_from_docker_archive: false,
+                docker_archive: false,
             });
+        }
+        if !metadata.is_file() {
+            return Err(Error::input("archive source must be a regular file"));
         }
         let path = path.to_path_buf();
         let limits = limits.clone();
-        let (temporary, temporary_bytes) =
-            blocking(move |flag| extract_archive(&path, &limits, flag)).await?;
+        let reference = reference.map(str::to_owned);
+        let (temporary, temporary_bytes, converted_from_docker_archive) = blocking(move |flag| {
+            let (temporary, mut size) = extract_archive(&path, &limits, flag.clone())?;
+            let converted = if !temporary.path().join("oci-layout").exists()
+                && temporary.path().join("manifest.json").exists()
+            {
+                docker::convert(
+                    temporary.path(),
+                    &limits,
+                    reference.as_deref(),
+                    &mut size,
+                    flag,
+                )?;
+                true
+            } else {
+                false
+            };
+            Ok((temporary, size, converted))
+        })
+        .await?;
         Ok(Self {
+            docker_archive: temporary.path().join("manifest.json").is_file(),
             root: temporary.path().to_path_buf(),
             _temporary: Some(temporary),
             temporary_bytes,
+            converted_from_docker_archive,
         })
     }
     /// Resolve exactly one root from the layout index, optionally by digest or reference annotation.
@@ -167,6 +214,9 @@ impl LocalLayout {
         let layout: Value = serde_json::from_slice(&read_limited(&layout_path, 4096)?)?;
         if layout.get("imageLayoutVersion").and_then(Value::as_str) != Some("1.0.0") {
             return Err(Error::unsupported("unsupported OCI Image Layout version"));
+        }
+        if self.docker_archive && !self.converted_from_docker_archive {
+            return docker::selected_oci_root(&self.root, limits, reference);
         }
         let index = checked_file(&self.root, Path::new("index.json"))?;
         let index = Manifest::parse(
@@ -214,6 +264,9 @@ impl LocalLayout {
     }
     /// Verify graph payloads against their descriptors under the configured concurrency limit.
     pub async fn verify_blobs(&self, graph: &Graph, limits: &TransferConfig) -> Result<()> {
+        if !(1..=32).contains(&limits.concurrency) {
+            return Err(Error::input("concurrency must be between 1 and 32"));
+        }
         let total = graph.blobs.values().try_fold(0u64, |a, d| {
             a.checked_add(d.size)
                 .ok_or_else(|| Error::input("layout size overflow"))
@@ -328,11 +381,94 @@ fn safe_archive_path(path: &Path) -> Result<PathBuf> {
     }
     Ok(clean)
 }
+
+// tar consumes GNU/PAX metadata before yielding a logical entry. Bound those headers first,
+// seeking over payloads, so extension records cannot bypass the normal extraction limits.
+fn validate_archive_headers(
+    path: &Path,
+    limits: &TransferConfig,
+    flag: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut reader = Cancellable {
+        reader: io::BufReader::new(File::open(path)?),
+        cancelled: flag,
+    };
+    let archive_limit = parse_size(&limits.max_archive_size)?;
+    let metadata_limit = parse_size(&limits.max_metadata_size)?;
+    let entry_limit = parse_size(&limits.max_manifest_size)?;
+    let mut offset = 0u64;
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut metadata = 0u64;
+    let mut pax_size = None;
+    loop {
+        reader.seek(io::SeekFrom::Start(offset))?;
+        let mut archive = tar::Archive::new(&mut reader);
+        let Some(entry) = archive.entries()?.raw(true).next() else {
+            return Ok(());
+        };
+        let mut entry = entry?;
+        count = count.saturating_add(1);
+        if count > limits.max_objects.saturating_mul(4).saturating_add(1024) {
+            return Err(Error::input("archive header count exceeds limit"));
+        }
+        let kind = entry.header().entry_type();
+        let extension =
+            kind.is_gnu_longname() || kind.is_gnu_longlink() || kind.is_pax_local_extensions();
+        if !extension && !kind.is_file() && !kind.is_dir() {
+            return Err(Error::input(
+                "links, sparse files and special entries are forbidden in OCI archives",
+            ));
+        }
+        let size = if extension {
+            let size = entry.size();
+            metadata = metadata
+                .checked_add(size)
+                .ok_or_else(|| Error::input("archive metadata size overflow"))?;
+            if size > entry_limit || metadata > metadata_limit {
+                return Err(Error::input("archive extension metadata exceeds limit"));
+            }
+            if kind.is_pax_local_extensions() {
+                let mut raw = Vec::new();
+                entry.read_to_end(&mut raw)?;
+                for field in tar::PaxExtensions::new(&raw) {
+                    let field = field?;
+                    if field.key_bytes() == b"size" {
+                        let value = std::str::from_utf8(field.value_bytes())
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or_else(|| Error::input("invalid archive PAX size"))?;
+                        pax_size = Some(value);
+                        break;
+                    }
+                }
+            }
+            size
+        } else {
+            pax_size.take().unwrap_or(entry.size())
+        };
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| Error::input("archive size overflow"))?;
+        if total > archive_limit {
+            return Err(Error::input("archive expanded size exceeds limit"));
+        }
+        offset = size
+            .checked_add(511)
+            .map(|padded| padded / 512 * 512)
+            .and_then(|padded| padded.checked_add(512))
+            .and_then(|padded| offset.checked_add(padded))
+            .ok_or_else(|| Error::input("archive size overflow"))?;
+    }
+}
+
 fn extract_archive(
     path: &Path,
     limits: &TransferConfig,
     flag: Arc<AtomicBool>,
 ) -> Result<(tempfile::TempDir, u64)> {
+    validate_archive_headers(path, limits, flag.clone())?;
+    let docker_files = docker::archive_files(path, limits, flag.clone())?;
     let temporary = tempfile::tempdir()?;
     storage::restrict(temporary.path(), true)?;
     let reader = Cancellable {
@@ -348,7 +484,7 @@ fn extract_archive(
     for entry in archive.entries()? {
         let mut entry = entry?;
         entries += 1;
-        if entries > limits.max_objects + 1024 {
+        if entries > limits.max_objects.saturating_add(1024) {
             return Err(Error::input("archive entry count exceeds limit"));
         }
         let relative = safe_archive_path(&entry.path()?)?;
@@ -369,7 +505,10 @@ fn extract_archive(
             return Err(Error::input("archive expanded size exceeds limit"));
         }
         let text = relative.to_string_lossy();
-        let relevant = text == "oci-layout" || text == "index.json" || text.starts_with("blobs/");
+        let relevant = text == "oci-layout"
+            || text == "index.json"
+            || text.starts_with("blobs/")
+            || docker_files.contains(&relative);
         if !relevant {
             continue;
         }
@@ -385,8 +524,10 @@ fn extract_archive(
         if text == "oci-layout" && size > 4096 {
             return Err(Error::input("oci-layout metadata too large"));
         }
-        if text == "index.json" && size > parse_size(&limits.max_manifest_size)? {
-            return Err(Error::input("index.json too large"));
+        if (text == "index.json" || text == "manifest.json")
+            && size > parse_size(&limits.max_manifest_size)?
+        {
+            return Err(Error::input("archive manifest metadata too large"));
         }
         if text.starts_with("blobs/") {
             let parts: Vec<_> = text.split('/').collect();
@@ -653,7 +794,18 @@ pub async fn push(
     destination: &Reference,
     write: &WriteOptions,
 ) -> Result<PushResult> {
-    let layout = LocalLayout::open(path, &target.config().transfer).await?;
+    let layout = LocalLayout::open_selected(path, &target.config().transfer, root_ref).await?;
+    push_layout(path, root_ref, layout, target, destination, write).await
+}
+
+async fn push_layout(
+    path: &Path,
+    root_ref: Option<&str>,
+    layout: LocalLayout,
+    target: &Registry,
+    destination: &Reference,
+    write: &WriteOptions,
+) -> Result<PushResult> {
     let root = layout.selected_root(root_ref, &target.config().transfer)?;
     let graph = layout.graph(root, &target.config().transfer).await?;
     // Validate the entire selected closure before the first remote write.
@@ -729,6 +881,7 @@ pub async fn push(
         transfer::publish_root(target, destination, &graph.root, write.overwrite).await?;
     }
     Ok(PushResult {
+        converted_from_docker_archive: layout.converted_from_docker_archive,
         source: path.to_owned(),
         destination: destination.to_string(),
         target_digest: graph.root.digest().clone(),
@@ -745,6 +898,27 @@ async fn check_output_reference(
 ) -> Result<()> {
     transfer::check_destination(target, destination, &graph.root, write.overwrite).await?;
     Ok(())
+}
+
+/// Export a local Docker image through the Docker CLI, then verify and push its selected graph.
+/// Only this explicit operation requires Docker; registry upload uses Quayside credentials.
+pub async fn push_docker(
+    image: &Path,
+    root_ref: Option<&str>,
+    target: &Registry,
+    destination: &Reference,
+    write: &WriteOptions,
+) -> Result<PushResult> {
+    let limits = &target.config().transfer;
+    let archive = docker::export(image, limits).await?;
+    let mut extraction_limits = limits.clone();
+    let available = parse_size(&limits.max_temp_size)?
+        .checked_sub(archive.as_file().metadata()?.len())
+        .ok_or_else(|| Error::input("Docker export exceeds max_temp_size"))?;
+    extraction_limits.max_temp_size = available.to_string();
+    let layout = LocalLayout::open_selected(archive.path(), &extraction_limits, root_ref).await?;
+    drop(archive);
+    push_layout(image, root_ref, layout, target, destination, write).await
 }
 
 #[cfg(test)]
@@ -770,6 +944,19 @@ mod tests {
             export_temporary_bytes(&files, true).unwrap(),
             staged + output.as_file().metadata().unwrap().len()
         );
+        let (extracted, stored) = extract_archive(
+            output.path(),
+            &TransferConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(stored, staged);
+        for (path, size) in files {
+            assert_eq!(
+                fs::metadata(extracted.path().join(path)).unwrap().len(),
+                size
+            );
+        }
         assert!(archive_entry_bytes(Path::new("blob"), u64::MAX).is_err());
     }
     #[test]
@@ -811,6 +998,104 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn extension_headers_are_bounded_before_tar_decodes_them() {
+        for kind in [tar::EntryType::GNULongName, tar::EntryType::XHeader] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(1024 * 1024 * 1024);
+            header.set_cksum();
+            file.write_all(header.as_bytes()).unwrap();
+            let error = extract_archive(
+                file.path(),
+                &TransferConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("extension metadata exceeds limit")
+            );
+        }
+    }
+    #[test]
+    fn bounded_header_scan_honors_pax_size_overrides() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut tar = tar::Builder::new(file.reopen().unwrap());
+        tar.append_pax_extensions([("size", b"513".as_slice())])
+            .unwrap();
+        let mut header = tar::Header::new_ustar();
+        header.set_size(0);
+        header.set_cksum();
+        tar.append_data(&mut header, "index.json", io::empty())
+            .unwrap();
+        tar.get_mut().write_all(&[b' '; 513]).unwrap();
+        tar.get_mut().write_all(&[0; 511]).unwrap();
+        tar.finish().unwrap();
+        drop(tar);
+        let (layout, bytes) = extract_archive(
+            file.path(),
+            &TransferConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(bytes, 513);
+        assert_eq!(
+            fs::read(layout.path().join("index.json")).unwrap(),
+            [b' '; 513]
+        );
+    }
+    #[tokio::test]
+    async fn archive_sources_must_be_regular_files() {
+        let error = LocalLayout::open(Path::new("/dev/null"), &TransferConfig::default())
+            .await
+            .err()
+            .expect("device must not be opened as an archive");
+        assert!(
+            error
+                .to_string()
+                .contains("archive source must be a regular file")
+        );
+    }
+    #[tokio::test]
+    async fn local_verification_rejects_invalid_concurrency_without_hanging() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = LocalLayout::open(root.path(), &TransferConfig::default())
+            .await
+            .unwrap();
+        let manifest = Manifest::parse(
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": []
+                }))
+                .unwrap(),
+            ),
+            None,
+            None,
+        )
+        .unwrap();
+        let graph = Graph::build(manifest, &TransferConfig::default(), |_| async {
+            unreachable!("empty index has no children")
+        })
+        .await
+        .unwrap();
+        for concurrency in [0, 33, usize::MAX] {
+            let limits = TransferConfig {
+                concurrency,
+                ..Default::default()
+            };
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                layout.verify_blobs(&graph, &limits),
+            )
+            .await
+            .expect("invalid concurrency must not hang")
+            .unwrap_err();
+            assert_eq!(error.code, crate::error::Code::InvalidInput);
+        }
     }
     #[tokio::test]
     async fn bad_local_blob_fails() {

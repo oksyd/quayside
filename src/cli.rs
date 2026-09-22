@@ -284,13 +284,16 @@ pub enum ImageCommand {
         #[command(flatten)]
         write: WriteOptions,
     },
-    /// Import a selected local OCI layout graph into a registry.
+    /// Push an OCI layout, Docker save archive, or local Docker image.
     Push {
-        /// Path to the local OCI layout directory or archive.
+        /// Export an image from Docker using its CLI and current context.
+        #[arg(long)]
+        docker: bool,
+        /// Local layout/archive path, or a Docker image name when --docker is set.
         path: PathBuf,
         /// Fully qualified destination reference with an explicit tag or digest.
         destination: String,
-        /// Optional layout root selected by content digest or reference-name annotation.
+        /// Select a layout root or an exact image tag from a multi-image Docker archive.
         #[arg(long = "ref")]
         reference: Option<String>,
         /// Dry-run and overwrite policy for this operation.
@@ -323,12 +326,12 @@ pub enum ManifestCommand {
 /// OCI image-index construction operations.
 #[derive(Debug, Subcommand)]
 pub enum IndexCommand {
-    /// Assemble an index from explicit platform-to-image source mappings.
+    /// Assemble an index from single-platform images, detecting each platform from its config.
     Create {
         /// Fully qualified destination reference with an explicit tag or digest.
         destination: String,
-        /// Source mappings in platform=reference form.
-        #[arg(long = "from", required = true)]
+        /// Fully qualified source image reference; repeat for each platform.
+        #[arg(long = "from", required = true, value_name = "IMAGE")]
         sources: Vec<String>,
         /// Dry-run and overwrite policy for this operation.
         #[command(flatten)]

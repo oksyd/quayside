@@ -326,6 +326,7 @@ impl Manifest {
     }
     /// Compare this manifest's bytes and media type with an expected descriptor.
     pub fn verify_descriptor(&self, expected: &Descriptor) -> Result<()> {
+        expected.embedded()?;
         expected.verify(&self.raw)?;
         if expected.media_type != self.descriptor.media_type {
             return Err(Error::integrity(

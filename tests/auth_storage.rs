@@ -3,6 +3,30 @@ use std::{fs, io::Write, process::Stdio};
 use support::{Harness, Response, Server, config_home, data_home};
 
 #[test]
+fn bearer_authentication_ignores_other_advertised_schemes() {
+    let server = Server::new(|request| {
+        if request.path.starts_with("/token?") {
+            Response::new(200, br#"{"token":"valid-token","expires_in":60}"#.to_vec())
+        } else if request.headers.get("authorization").map(String::as_str)
+            == Some("Bearer valid-token")
+        {
+            Response::new(200, b"{}".to_vec())
+        } else {
+            Response::new(401, vec![]).header(
+                "WWW-Authenticate",
+                &format!(
+                    "Bearer realm=\"http://{}/token\",service=\"fixture\", Digest realm=\"other\",nonce=\"opaque\"",
+                    request.headers["host"]
+                ),
+            )
+        }
+    });
+    let harness = Harness::new(&[(&server.host, true)]);
+    let result = harness.json(&["registry", "ping", &server.host], 0);
+    assert_eq!(result["data"]["authenticated_request"], true);
+}
+
+#[test]
 fn login_encrypts_and_following_process_authenticates_then_logout_removes() {
     let server = Server::new(|request| {
         if request.headers.get("authorization").map(String::as_str)

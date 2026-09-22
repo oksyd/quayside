@@ -334,12 +334,18 @@ pub(crate) async fn transfer_remote_inputs<'a>(
     let mut unique = BTreeMap::<Digest, RemoteBlob>::new();
     for (source, reference, graph) in inputs {
         for d in graph.blobs.values() {
-            if let Some(previous) = unique.get(&d.digest) {
+            let mut descriptor = d.clone();
+            if let Some(previous) = unique.get_mut(&d.digest) {
                 if previous.descriptor.size != d.size {
                     return Err(Error::integrity(
                         "inconsistent size for a shared index input blob",
                     ));
                 }
+                // Any verified inline copy can satisfy this digest, regardless of which source wins.
+                if previous.descriptor.data.is_none() {
+                    previous.descriptor.data.clone_from(&d.data);
+                }
+                descriptor.data.clone_from(&previous.descriptor.data);
                 // Prefer a same-registry source so a shared blob can be mounted without download.
                 if previous.source.endpoint().origin() == target.endpoint().origin()
                     || source.endpoint().origin() != target.endpoint().origin()
@@ -352,7 +358,7 @@ pub(crate) async fn transfer_remote_inputs<'a>(
                 RemoteBlob {
                     source: source.clone(),
                     repository: reference.repository.clone(),
-                    descriptor: d.clone(),
+                    descriptor,
                 },
             );
         }

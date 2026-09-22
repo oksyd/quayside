@@ -41,7 +41,15 @@ quayside image digest registry.example.com/team/nginx:latest
 quayside manifest get registry.example.com/team/nginx:latest --raw
 ```
 
-Use `--json` for machine-readable output.
+Build a multi-platform index from existing single-platform images:
+
+```bash
+quayside index create registry.example.com/team/app:latest \
+  --from registry.example.com/team/app:amd64 \
+  --from registry.example.com/team/app:arm64
+```
+
+Platforms are detected from each source image. Use `--json` for machine-readable output.
 
 ## Transfer offline
 
@@ -54,7 +62,20 @@ quayside image pull docker.io/library/nginx:latest \
 quayside image push nginx.oci.tar registry.example.com/team/nginx:latest
 ```
 
-Docker `docker save` archives are not supported.
+Push an image already stored in Docker (requires the Docker CLI and daemon):
+
+```bash
+quayside image push --docker nginx:latest registry.example.com/team/nginx:latest
+```
+
+Or push an uncompressed `docker save` archive without Docker installed:
+
+```bash
+quayside image push nginx.docker.tar registry.example.com/team/nginx:latest
+```
+
+Only locally stored platforms are pushed. Use `--ref <exact-tag>` to select an image from a multi-image Docker archive.
+Legacy Docker archives are converted to OCI; the original registry manifest digest is not preserved.
 
 ## Configuration
 

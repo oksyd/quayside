@@ -5,7 +5,7 @@ use self::transport::{HttpClient, client, http_error};
 use self::transport::{same_origin, valid_url};
 use crate::auth::Credential;
 use crate::config::{Config, RegistryConfig};
-use crate::reference::validate_repository;
+use crate::reference::{Reference, registry_name, validate_repository, validate_tag};
 use crate::{Error, Result};
 #[cfg(test)]
 use blobs::range_offset;
@@ -60,18 +60,20 @@ mod manifests;
 mod transport;
 
 impl Registry {
-    /// Build a registry client with explicit policy, optional credentials and shared write tracking.
+    /// Validate configuration and build a client for a normalized registry authority.
     pub fn new(
         name: &str,
         config: Arc<Config>,
         credential: Option<Credential>,
         changed: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let policy = config.for_registry(name);
-        let endpoint = if name == "docker.io" {
-            "registry-1.docker.io"
+        config.validate()?;
+        let name = registry_name(name)?;
+        let policy = config.for_registry(&name);
+        let endpoint = if name == "docker.io" || name.starts_with("docker.io:") {
+            name.replacen("docker.io", "registry-1.docker.io", 1)
         } else {
-            name
+            name.clone()
         };
         let base = Url::parse(&format!(
             "{}://{endpoint}/",
@@ -85,7 +87,7 @@ impl Registry {
             inner: Arc::new(Inner {
                 client: client(&base, &config, &policy)?,
                 public_client: client(&public_base, &config, &RegistryConfig::default())?,
-                name: name.into(),
+                name,
                 base,
                 downloads: Arc::new(Semaphore::new(config.transfer.concurrency)),
                 config,
@@ -115,6 +117,18 @@ impl Registry {
     }
     fn scope(repo: &str, actions: &str) -> String {
         format!("repository:{repo}:{actions}")
+    }
+    fn validate_reference(&self, reference: &Reference) -> Result<()> {
+        if registry_name(&reference.registry)? != self.name() {
+            return Err(Error::input(
+                "reference registry does not match this registry client",
+            ));
+        }
+        validate_repository(&reference.repository)?;
+        if reference.digest().is_none() {
+            validate_tag(&reference.selector)?;
+        }
+        Ok(())
     }
     /// Check the Distribution API endpoint and report whether credentials were used successfully.
     pub async fn ping(&self) -> Result<bool> {
@@ -158,6 +172,89 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn constructor_validates_limits_before_allocating_clients() {
+        for concurrency in [0, 33, usize::MAX] {
+            let mut config = Config::default();
+            config.transfer.concurrency = concurrency;
+            let result = Registry::new(
+                "example.com",
+                Arc::new(config),
+                None,
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert!(result.is_err(), "invalid concurrency: {concurrency}");
+        }
+    }
+    #[test]
+    fn constructor_normalizes_names_and_rejects_non_authorities() {
+        for (name, normalized, endpoint) in [
+            ("docker.io", "docker.io", "https://registry-1.docker.io/"),
+            (
+                "INDEX.DOCKER.IO",
+                "docker.io",
+                "https://registry-1.docker.io/",
+            ),
+            (
+                "registry-1.docker.io",
+                "docker.io",
+                "https://registry-1.docker.io/",
+            ),
+            (
+                "registry-1.docker.io:443",
+                "docker.io:443",
+                "https://registry-1.docker.io/",
+            ),
+            (
+                "docker.io:8443",
+                "docker.io:8443",
+                "https://registry-1.docker.io:8443/",
+            ),
+        ] {
+            let registry = Registry::new(
+                name,
+                Arc::new(Config::default()),
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(registry.name(), normalized);
+            assert_eq!(registry.endpoint().as_str(), endpoint);
+        }
+        for name in [
+            "",
+            "https://example.com",
+            "user@example.com",
+            "example.com/path",
+        ] {
+            assert!(
+                Registry::new(
+                    name,
+                    Arc::new(Config::default()),
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .is_err(),
+                "invalid authority: {name}"
+            );
+        }
+        let mut config = Config::default();
+        config.registries.insert(
+            "example.com:443".into(),
+            RegistryConfig {
+                plain_http: true,
+                ..RegistryConfig::default()
+            },
+        );
+        let registry = Registry::new(
+            "EXAMPLE.COM:443",
+            Arc::new(config),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(registry.endpoint().as_str(), "http://example.com:443/");
+    }
     #[test]
     fn link_with_comma_in_uri() {
         assert_eq!(

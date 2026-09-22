@@ -48,6 +48,7 @@ impl Graph {
         let mut stack = vec![Task::Visit(root, 0)];
         let mut visiting = BTreeSet::new();
         let mut done = BTreeSet::new();
+        let mut subtree_depths = BTreeMap::<Digest, usize>::new();
         let mut metadata_size = graph.root.raw.len() as u64;
         let mut prefetched = BTreeMap::<Digest, Manifest>::new();
         let concurrency = limits.concurrency.clamp(1, 32);
@@ -62,6 +63,10 @@ impl Graph {
                             return Err(Error::integrity("cyclic manifest graph"));
                         }
                         if done.contains(&d.digest) {
+                            // A shared subtree can be reached through a deeper path later.
+                            if depth.saturating_add(subtree_depths[&d.digest]) > limits.max_depth {
+                                return Err(Error::input("manifest graph depth limit exceeded"));
+                            }
                             continue;
                         }
                     }
@@ -152,11 +157,16 @@ impl Graph {
                     }
                     m.check_transfer_supported()?;
                     for b in m.blobs()? {
-                        if let Some(previous) = graph.blobs.get(&b.digest) {
+                        // Inline data is part of the graph: reject corrupt bytes before any transfer.
+                        b.embedded()?;
+                        if let Some(previous) = graph.blobs.get_mut(&b.digest) {
                             if previous.size != b.size {
                                 return Err(Error::integrity(
                                     "inconsistent size for a shared blob digest",
                                 ));
+                            }
+                            if previous.data.is_none() {
+                                previous.data = b.data;
                             }
                         } else {
                             graph.blobs.insert(b.digest.clone(), b);
@@ -174,11 +184,18 @@ impl Graph {
                     for child in children.into_iter().rev() {
                         stack.push(Task::Fetch(child, depth + 1));
                     }
-                    if stack.len() > limits.max_objects * 2 {
+                    if stack.len() > limits.max_objects.saturating_mul(2) {
                         return Err(Error::input("manifest graph queue limit exceeded"));
                     }
                 }
                 Task::Finish(digest) => {
+                    let depth = graph.manifests[&digest]
+                        .children()?
+                        .iter()
+                        .map(|child| subtree_depths[&child.digest] + 1)
+                        .max()
+                        .unwrap_or(0);
+                    subtree_depths.insert(digest.clone(), depth);
                     visiting.remove(&digest);
                     done.insert(digest.clone());
                     graph.order.push(digest);
@@ -299,14 +316,18 @@ mod tests {
         let leaf = index(&[], 0);
         let mut conflicting = leaf.descriptor.clone();
         conflicting.size += 1;
-        let root = index(&[leaf.descriptor.clone(), conflicting], 1);
-        let error = Graph::build(root, &TransferConfig::default(), |_| {
-            let leaf = leaf.clone();
-            async move { Ok(leaf) }
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, crate::error::Code::Integrity);
+        let mut corrupt_inline = leaf.descriptor.clone();
+        corrupt_inline.data = Some("YmFk".into());
+        for duplicate in [conflicting, corrupt_inline] {
+            let root = index(&[leaf.descriptor.clone(), duplicate], 1);
+            let error = Graph::build(root, &TransferConfig::default(), |_| {
+                let leaf = leaf.clone();
+                async move { Ok(leaf) }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, crate::error::Code::Integrity);
+        }
     }
 
     #[tokio::test]
@@ -333,6 +354,36 @@ mod tests {
             graph.order,
             vec![leaf.digest().clone(), parent.digest().clone()]
         );
+    }
+    #[tokio::test]
+    async fn shared_subtrees_obey_depth_limit_on_every_path() {
+        let leaf = index(&[], 0);
+        let shared = index(std::slice::from_ref(&leaf.descriptor), 1);
+        let branch = index(std::slice::from_ref(&shared.descriptor), 2);
+        let root = index(&[shared.descriptor.clone(), branch.descriptor.clone()], 3);
+        let manifests: BTreeMap<_, _> = [leaf, shared, branch]
+            .into_iter()
+            .map(|manifest| (manifest.digest().clone(), manifest))
+            .collect();
+        for max_depth in [2, 3] {
+            let limits = TransferConfig {
+                max_depth,
+                ..Default::default()
+            };
+            let mut requests = 0;
+            let result = Graph::build(root.clone(), &limits, |d| {
+                requests += 1;
+                let manifest = manifests[&d.digest].clone();
+                async move { Ok(manifest) }
+            })
+            .await;
+            if max_depth == 2 {
+                assert!(result.unwrap_err().message.contains("depth limit"));
+            } else {
+                assert_eq!(result.unwrap().manifests.len(), 4);
+            }
+            assert_eq!(requests, 3, "shared manifests should still be fetched once");
+        }
     }
     #[tokio::test]
     async fn subject_is_not_silently_dropped() {

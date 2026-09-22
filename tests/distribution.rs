@@ -1,4 +1,4 @@
-//! Opt-in tests against two disposable Distribution registries. No Docker invocation in tests.
+//! Opt-in tests against disposable Distribution registries, with an optional local Docker export.
 mod support;
 use std::{env, fs};
 use support::{Harness, image_layout, image_layout_for};
@@ -290,4 +290,35 @@ fn distribution_artifact_round_trip() {
         );
         harness.json(&["index", "create", &restored, "--from", &src], 2);
     }
+}
+
+#[test]
+#[ignore = "requires Docker, QUAYSIDE_TEST_DOCKER_IMAGE and QUAYSIDE_TEST_TARGET disposable HTTP registry"]
+fn docker_local_image_round_trip() {
+    let image = env::var("QUAYSIDE_TEST_DOCKER_IMAGE").expect("set QUAYSIDE_TEST_DOCKER_IMAGE");
+    let target = env::var("QUAYSIDE_TEST_TARGET").expect("set QUAYSIDE_TEST_TARGET");
+    let mut harness = Harness::new(&[(&target, true)]);
+    harness.config.transfer.chunk_size = "8MiB".into();
+    harness.config.transfer.idle_timeout = "30s".into();
+    let dst = format!("{target}/quayside-{}/docker:v1", std::process::id());
+    let result = harness.json(&["image", "push", "--docker", &image, &dst], 0);
+    let digest = harness.json(&["image", "digest", &dst], 0);
+    assert_eq!(result["data"]["target_digest"], digest["data"]["digest"]);
+    let output = harness.root.path().join("docker.oci.tar");
+    harness.json(&["image", "pull", &dst, "-o", output.to_str().unwrap()], 0);
+    let restored = format!(
+        "{target}/quayside-{}/docker-restored:v1",
+        std::process::id()
+    );
+    let pushed = harness.json(&["image", "push", output.to_str().unwrap(), &restored], 0);
+    assert_eq!(
+        pushed["data"]["target_digest"],
+        result["data"]["target_digest"]
+    );
+    assert_eq!(
+        fs::read_dir(harness.root.path().join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

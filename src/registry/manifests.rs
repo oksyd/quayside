@@ -12,6 +12,7 @@ use http::{Method, StatusCode};
 impl Registry {
     /// Fetch and parse a manifest while preserving its original bytes and checking a pinned digest.
     pub async fn get_manifest(&self, reference: &Reference) -> Result<Manifest> {
+        self.validate_reference(reference)?;
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, HeaderValue::from_static(ACCEPT_MANIFEST));
         let (response, _) = self
@@ -63,6 +64,7 @@ impl Registry {
     }
     /// Publish original manifest bytes at the supplied reference after checking supported content.
     pub async fn put_manifest(&self, reference: &Reference, manifest: &Manifest) -> Result<()> {
+        self.validate_reference(reference)?;
         manifest.check_transfer_supported()?;
         if let Some(expected) = reference.digest() {
             expected.verify(&manifest.raw)?;

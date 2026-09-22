@@ -88,9 +88,6 @@ fn validate_paths(path: &Path, keyfile: &Path) -> Result<()> {
 }
 fn read_private(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     storage::check_private_file(path)?;
-    if !fs::metadata(path)?.is_file() {
-        return Err(Error::input("credential storage requires regular files"));
-    }
     let file = fs::File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(Error::input("credential storage requires regular files"));

@@ -3,6 +3,7 @@ use super::transport::{content_length, http_error, retry_delay};
 use crate::digest::Hasher;
 use crate::model::Descriptor;
 use crate::observer::{BlobPhase, BlobProgress};
+use crate::reference::validate_repository;
 use crate::{Error, Result};
 use futures_util::{StreamExt, stream};
 use http::header::{self, HeaderMap, HeaderValue};
@@ -48,6 +49,7 @@ impl Registry {
         progress: &dyn BlobProgress,
         slots: Arc<Semaphore>,
     ) -> Result<()> {
+        validate_repository(repo)?;
         progress.phase(BlobPhase::Downloading);
         if let Some(raw) = d.embedded()?.or(self.cached_blob(repo, d).await?) {
             tokio::fs::write(output, &raw).await?;
@@ -202,7 +204,7 @@ impl Download<'_> {
                 "blob HTTP Content-Length does not match descriptor",
             ));
         }
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; 64 * 1024];
         loop {
             let size = response
                 .read(&mut buffer)
@@ -260,7 +262,7 @@ impl Download<'_> {
         let mut file = BufReader::with_capacity(1024 * 1024, tokio::fs::File::open(output).await?);
         let mut hasher = self.descriptor.digest.hasher();
         let mut count = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; 64 * 1024];
         loop {
             let size = file.read(&mut buffer).await?;
             if size == 0 {

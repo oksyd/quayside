@@ -31,9 +31,27 @@ pub fn registry_name(input: &str) -> Result<String> {
     if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
         return Err(Error::input("invalid registry hostname"));
     }
-    let mut name = url[url::Position::BeforeHost..url::Position::AfterPort].to_ascii_lowercase();
+    // URL parsing removes scheme-default ports. A registry authority must retain an explicit
+    // port because its configured transport can be plain HTTP, including on port 443.
+    let explicit_port = if input.starts_with('[') {
+        input
+            .split_once(']')
+            .and_then(|(_, suffix)| suffix.strip_prefix(':'))
+    } else {
+        input.rsplit_once(':').map(|(_, port)| port)
+    };
+    let port = explicit_port
+        .map(|port| {
+            port.parse::<u16>()
+                .map_err(|_| Error::input("invalid registry port"))
+        })
+        .transpose()?;
+    let mut name = url[url::Position::BeforeHost..url::Position::AfterHost].to_ascii_lowercase();
     if name == "index.docker.io" || name == "registry-1.docker.io" {
         name = "docker.io".into();
+    }
+    if let Some(port) = port {
+        name.push_str(&format!(":{port}"));
     }
     Ok(name)
 }
@@ -91,7 +109,9 @@ impl FromStr for Reference {
             None => (name_tag, None),
         };
         validate_repository(repository)?;
-        let repository = if registry == "docker.io" && !repository.contains('/') {
+        let repository = if (registry == "docker.io" || registry.starts_with("docker.io:"))
+            && !repository.contains('/')
+        {
             format!("library/{repository}")
         } else {
             repository.to_owned()
@@ -154,6 +174,20 @@ impl fmt::Display for Reference {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_ports_survive_transport_selection_and_docker_aliases() {
+        assert_eq!(registry_name("EXAMPLE.COM:443").unwrap(), "example.com:443");
+        assert_eq!(registry_name("[::1]:443").unwrap(), "[::1]:443");
+        assert_eq!(
+            registry_name("example.com:0443").unwrap(),
+            "example.com:443"
+        );
+        assert!(registry_name("example.com:").is_err());
+        assert!(registry_name("[::1]:").is_err());
+        let r: Reference = "registry-1.docker.io:443/node:v1".parse().unwrap();
+        assert_eq!(r.registry, "docker.io:443");
+        assert_eq!(r.repository, "library/node");
+    }
     #[test]
     fn host_port_and_tag() {
         let r: Reference = "localhost:5000/team/app:v1".parse().unwrap();

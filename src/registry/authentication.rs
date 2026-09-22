@@ -40,6 +40,13 @@ pub(super) fn basic_auth(credential: &Credential) -> Result<HeaderValue> {
     value.set_sensitive(true);
     Ok(value)
 }
+
+fn auth_host_matches(host: &str, realm: &Url) -> bool {
+    // Resolve default ports using the token service's scheme, retaining explicit non-default ports.
+    Url::parse(&format!("{}://{host}/", realm.scheme()))
+        .is_ok_and(|allowed| same_origin(&allowed, realm))
+}
+
 impl Registry {
     pub(super) async fn auth_refresh_lock(
         &self,
@@ -69,7 +76,12 @@ impl Registry {
         // Only the original registry origin may issue this challenge (enforced by request()).
         // A verified HTTPS registry can delegate authentication to an HTTPS token service.
         // A nonempty auth_hosts list remains an optional explicit restriction.
-        let listed = self.inner.policy.auth_hosts.iter().any(|h| h == &host);
+        let listed = self
+            .inner
+            .policy
+            .auth_hosts
+            .iter()
+            .any(|host| auth_host_matches(host, &url));
         if !local && !self.inner.policy.auth_hosts.is_empty() && !listed {
             return Err(Error::new(
                 Code::Unauthorized,
@@ -172,5 +184,50 @@ impl Registry {
             token: Zeroizing::new(token),
             until: Instant::now() + Duration::from_secs(ttl.saturating_sub(margin)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_host_restrictions_compare_normalized_origins() {
+        for (allowed, realm, matches) in [
+            ("AUTH.EXAMPLE.COM", "https://auth.example.com/token", true),
+            (
+                "auth.example.com:443",
+                "https://auth.example.com/token",
+                true,
+            ),
+            (
+                "auth.example.com",
+                "https://auth.example.com:443/token",
+                true,
+            ),
+            (
+                "auth.example.com:8443",
+                "https://auth.example.com/token",
+                false,
+            ),
+            (
+                "auth.example.com",
+                "https://other.auth.example.com/token",
+                false,
+            ),
+            ("auth.example.com:80", "http://auth.example.com/token", true),
+            (
+                "auth.example.com:443",
+                "http://auth.example.com/token",
+                false,
+            ),
+            ("[0:0:0:0:0:0:0:1]:443", "https://[::1]/token", true),
+        ] {
+            assert_eq!(
+                auth_host_matches(allowed, &Url::parse(realm).unwrap()),
+                matches,
+                "{allowed}: {realm}"
+            );
+        }
     }
 }

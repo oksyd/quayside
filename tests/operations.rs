@@ -546,6 +546,45 @@ fn nested_platform_selection_counts_each_manifest_once_against_budget() {
 }
 
 #[test]
+fn platform_selection_checks_deeper_paths_through_shared_indexes() {
+    let temp = tempfile::tempdir().unwrap();
+    let image = image_layout(temp.path(), 0, 0);
+    let leaf = Manifest::parse(image.manifest.clone().into(), Some(OCI_MANIFEST), None).unwrap();
+    let shared = index(&[&leaf], "shared");
+    let branch = index(&[&shared], "branch");
+    let root = index(&[&shared, &branch], "root");
+    let expected = leaf.digest().to_string();
+    let manifests: BTreeMap<_, _> = [leaf, shared, branch]
+        .into_iter()
+        .map(|manifest| (manifest.digest().to_string(), manifest))
+        .collect();
+    let source = Server::new(move |request| {
+        let key = request.path.rsplit('/').next().unwrap();
+        if request.path.contains("/blobs/") {
+            return Response::new(200, image.blobs[key].clone());
+        }
+        let manifest = if key == "v1" { &root } else { &manifests[key] };
+        Response::new(200, manifest.raw.to_vec())
+            .header("Content-Type", &manifest.descriptor.media_type)
+    });
+    let mut harness = Harness::new(&[(&source.host, true)]);
+    let reference = format!("{}/app:v1", source.host);
+    let args = ["image", "digest", &reference, "--platform", "linux/arm64"];
+    harness.config.transfer.max_depth = 2;
+    let rejected = harness.json(&args, 2);
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("depth limit")
+    );
+    harness.config.transfer.max_depth = 3;
+    let accepted = harness.json(&args, 0);
+    assert_eq!(accepted["data"]["digest"], expected);
+    assert_eq!(source.connections.load(Ordering::SeqCst), 10);
+}
+
+#[test]
 #[ignore = "local platform latency benchmark; optionally set QUAYSIDE_TEST_BINARY to compare builds"]
 fn platform_selection_latency_benchmark() {
     let temp = tempfile::tempdir().unwrap();

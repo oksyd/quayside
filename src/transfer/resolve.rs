@@ -68,6 +68,7 @@ pub async fn resolve(
     let max_metadata = parse_size(&limits.max_metadata_size)?;
     let mut metadata = root.raw.len() as u64;
     let mut admitted = BTreeMap::from([(root.digest().clone(), root.descriptor.clone())]);
+    let mut dependencies = BTreeMap::<Digest, Vec<Digest>>::new();
     let mut queue = vec![(root, 0usize)];
     let mut available = BTreeSet::new();
     let mut candidates = BTreeMap::new();
@@ -89,6 +90,10 @@ pub async fn resolve(
             if !is_index && d.platform.as_ref().is_some_and(|p| !p.matches(&wanted)) {
                 continue;
             }
+            dependencies
+                .entry(index.digest().clone())
+                .or_default()
+                .push(d.digest.clone());
             if depth + 1 > limits.max_depth {
                 return Err(Error::input("platform selection depth limit exceeded"));
             }
@@ -130,6 +135,25 @@ pub async fn resolve(
                     candidates.insert(child.digest().clone(), (child, p));
                 }
             }
+        }
+    }
+    // Fetch each digest once, but enforce the limit on every path through the selected DAG.
+    // Its first discovery may be shallower than a later reference to the same subtree.
+    let mut pending = vec![(original.clone(), 0usize)];
+    let mut depths = BTreeMap::<Digest, usize>::new();
+    while let Some((digest, depth)) = pending.pop() {
+        if depth > limits.max_depth {
+            return Err(Error::input("platform selection depth limit exceeded"));
+        }
+        if depths
+            .get(&digest)
+            .is_some_and(|previous| *previous >= depth)
+        {
+            continue;
+        }
+        depths.insert(digest.clone(), depth);
+        if let Some(children) = dependencies.get(&digest) {
+            pending.extend(children.iter().map(|child| (child.clone(), depth + 1)));
         }
     }
     if candidates.len() != 1 {

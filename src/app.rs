@@ -41,14 +41,13 @@ pub struct Context {
     pub key_path: PathBuf,
     /// Tracks whether remote writes may have occurred, including uncertain responses.
     pub changed: Arc<AtomicBool>,
-    auth: AuthFile,
     registries: Mutex<BTreeMap<String, Registry>>,
     warnings: Mutex<BTreeSet<String>>,
     /// Whether this invocation may display interactive terminal progress.
     pub progress: bool,
 }
 impl Context {
-    /// Load command configuration and credentials and determine terminal capabilities.
+    /// Load command configuration and determine terminal capabilities; credentials are read on demand.
     pub fn new(cli: &Cli) -> Result<Self> {
         let config_path = match &cli.config {
             Some(p) => p.clone(),
@@ -57,13 +56,11 @@ impl Context {
         let (auth_path, key_path) =
             crate::auth::paths(cli.authfile.as_deref(), cli.keyfile.as_deref())?;
         let config = Arc::new(Config::load(&config_path)?);
-        let auth = AuthFile::load(&auth_path, &key_path)?;
         Ok(Self {
             config,
             config_path,
             auth_path,
             key_path,
-            auth,
             registries: Mutex::new(BTreeMap::new()),
             changed: Arc::new(AtomicBool::new(false)),
             warnings: Mutex::new(BTreeSet::new()),
@@ -96,25 +93,35 @@ impl Context {
     }
     /// Reuse a registry client, connection pool and authentication cache for this invocation.
     pub fn registry(&self, name: &str) -> Result<Registry> {
-        self.connection_warnings(name);
+        let name = registry_name(name)?;
+        self.connection_warnings(&name);
         let mut registries = self
             .registries
             .lock()
             .map_err(|_| Error::new(Code::Execution, "registry cache lock failed"))?;
-        if let Some(registry) = registries.get(name) {
+        if let Some(registry) = registries.get(&name) {
             return Ok(registry.clone());
         }
+        let auth = AuthFile::load(&self.auth_path, &self.key_path)?;
         let registry = Registry::new(
-            name,
+            &name,
             self.config.clone(),
-            self.auth.registries.get(name).cloned(),
+            auth.registries.get(&name).cloned(),
             self.changed.clone(),
         )?;
         // Bound retained clients even when many duplicate index inputs use different registries.
         if registries.len() < self.config.transfer.concurrency * 2 {
-            registries.insert(name.to_owned(), registry.clone());
+            registries.insert(name, registry.clone());
         }
         Ok(registry)
+    }
+
+    fn forget_registry(&self, name: &str) -> Result<()> {
+        self.registries
+            .lock()
+            .map_err(|_| Error::new(Code::Execution, "registry cache lock failed"))?
+            .remove(name);
+        Ok(())
     }
 }
 
@@ -215,6 +222,7 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
         Command::Logout { registry } => {
             let registry = registry_name(registry)?;
             let removed = AuthFile::remove(&ctx.auth_path, &ctx.key_path, &registry)?;
+            ctx.forget_registry(&registry)?;
             Ok(Output::new(
                 json!({"registry":registry,"removed":removed,"server_token_revoked":false}),
                 "Local credentials removed; server-issued tokens are not revoked.",
@@ -396,6 +404,7 @@ async fn login(ctx: &Context, options: &Login) -> Result<Output> {
         true
     };
     AuthFile::put(&ctx.auth_path, &ctx.key_path, &name, credential)?;
+    ctx.forget_registry(&name)?;
     if !verified {
         ctx.warn("Credentials were stored without remote verification.");
     }
@@ -500,21 +509,24 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
         ImageCommand::Push {
+            docker,
             path,
             destination,
             reference,
             write,
         } => {
             let dst = parse_destination(destination)?;
-            let data = layout::push(
-                path,
-                reference.as_deref(),
-                &ctx.registry(&dst.registry)?,
-                &dst,
-                &write.into(),
-            )
-            .await?;
-            ctx.warn("Only the selected OCI layout dependency graph was pushed; no signature trust verification was performed.");
+            let target = ctx.registry(&dst.registry)?;
+            let data = if *docker {
+                layout::push_docker(path, reference.as_deref(), &target, &dst, &write.into())
+                    .await?
+            } else {
+                layout::push(path, reference.as_deref(), &target, &dst, &write.into()).await?
+            };
+            if data.converted_from_docker_archive {
+                ctx.warn("Docker save archive converted to OCI; the original registry manifest digest is not preserved.");
+            }
+            ctx.warn("Only the selected image dependency graph was pushed; no signature trust verification was performed.");
             let text = transfer_summary(Some(&data.target_digest), Some(&data.stats), data.dry_run);
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
@@ -559,7 +571,6 @@ async fn index_create(
     let mut inputs = BTreeMap::new();
     let mut seen_digests = BTreeSet::new();
     let mut metadata_bytes = 0u64;
-    let mut object_count = 0usize;
     let mut seen_sources = BTreeSet::new();
     let mut blob_sizes = BTreeMap::new();
     for source in sources {
@@ -600,9 +611,8 @@ async fn index_create(
             .values()
             .map(|m| m.raw.len() as u64)
             .sum::<u64>();
-        object_count += graph.manifests.len() + graph.blobs.len();
         if metadata_bytes > parse_size(&ctx.config.transfer.max_metadata_size)?
-            || object_count > ctx.config.transfer.max_objects
+            || seen_digests.len() + blob_sizes.len() > ctx.config.transfer.max_objects
         {
             return Err(Error::input(
                 "combined index input graph exceeds configured resource limits",
@@ -618,7 +628,22 @@ async fn index_create(
         &json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":descriptors}),
     )?);
     let index = Manifest::parse(body, Some(OCI_INDEX), None)?;
-    transfer::check_destination(&target, &dst, &index, write.overwrite).await?;
+    let manifests: BTreeMap<_, _> = inputs
+        .values()
+        .map(|(_, _, graph)| (graph.root.digest().clone(), &graph.root))
+        .collect();
+    // Include the generated root and deduplicate shared payloads before any remote write.
+    let graph = crate::graph::Graph::build(index, &ctx.config.transfer, |descriptor| {
+        std::future::ready(
+            manifests
+                .get(&descriptor.digest)
+                .map(|m| (*m).clone())
+                .ok_or_else(|| Error::integrity("missing index input manifest")),
+        )
+    })
+    .await?;
+    let index = &graph.root;
+    transfer::check_destination(&target, &dst, index, write.overwrite).await?;
     let stats = transfer::transfer_remote_inputs(
         inputs
             .values()
@@ -630,14 +655,8 @@ async fn index_create(
     )
     .await?;
     if !write.dry_run {
-        use futures_util::{StreamExt, TryStreamExt, stream};
-        // Each input is a single image. Publish them concurrently, then publish the index last.
-        stream::iter(inputs.values())
-            .map(|(_, _, graph)| transfer::publish_dependencies(&target, &dst, graph))
-            .buffer_unordered(ctx.config.transfer.concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
-        transfer::publish_root(&target, &dst, &index, write.overwrite).await?;
+        transfer::publish_children(&target, &dst, &graph).await?;
+        transfer::publish_root(&target, &dst, index, write.overwrite).await?;
     }
     ctx.warn("Independent referrers were not copied. Input images were not deleted.");
     let data = json!({"destination":dst.to_string(),"target_digest":index.digest(),"platforms":inputs.keys().collect::<Vec<_>>(),

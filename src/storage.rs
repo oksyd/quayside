@@ -42,6 +42,7 @@ fn prepare_parent(path: &Path) -> Result<()> {
 /// Set owner-only permissions on a file or directory and reject symlink targets.
 pub fn restrict(path: &Path, directory: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    reject_symlink(path)?;
     fs::set_permissions(
         path,
         fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }),
@@ -55,6 +56,9 @@ pub fn check_private_file(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let m = fs::metadata(path)?;
+        if !m.is_file() {
+            return Err(Error::input("credential storage requires regular files"));
+        }
         if m.permissions().mode() & 0o077 != 0 {
             return Err(Error::input(format!(
                 "credential file is accessible to other users; run chmod 600 {}",
@@ -120,5 +124,25 @@ mod tests {
         let p = d.path().join("link");
         std::os::unix::fs::symlink("/dev/null", &p).unwrap();
         assert!(atomic_write(&p, b"x").is_err());
+    }
+    #[test]
+    fn privacy_helpers_reject_symlinks_and_non_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"contents").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(restrict(&link, false).is_err());
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(check_private_file(&link).is_err());
+        restrict(dir.path(), true).unwrap();
+        assert!(check_private_file(dir.path()).is_err());
+        restrict(&file, false).unwrap();
+        check_private_file(&file).unwrap();
     }
 }

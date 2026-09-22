@@ -129,9 +129,11 @@ pub fn challenges(header: &str) -> Result<Vec<Challenge>> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for part in parts {
         let first = part.split_whitespace().next().unwrap_or("");
-        if first.eq_ignore_ascii_case("Bearer") || first.eq_ignore_ascii_case("Basic") {
-            let tail = part[first.len()..].trim().to_owned();
-            groups.push((first.to_ascii_lowercase(), vec![tail]));
+        let tail = part[first.len()..].trim();
+        // Unknown schemes still delimit challenges; their parameters do not belong to Bearer.
+        // Whitespace around '=' is legal in parameters and must not start a new challenge.
+        if !first.is_empty() && !first.contains('=') && !tail.starts_with('=') {
+            groups.push((first.to_ascii_lowercase(), vec![tail.to_owned()]));
         } else if let Some((_, fields)) = groups.last_mut() {
             fields.push(part);
         }
@@ -140,6 +142,9 @@ pub fn challenges(header: &str) -> Result<Vec<Challenge>> {
     for (scheme, fields) in groups {
         if scheme == "basic" {
             result.push(Challenge::Basic);
+            continue;
+        }
+        if scheme != "bearer" {
             continue;
         }
         let mut values = BTreeMap::new();
@@ -184,6 +189,30 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+    #[test]
+    fn unsupported_schemes_do_not_contaminate_bearer_parameters() {
+        let bearer = Challenge::Bearer {
+            realm: "https://auth.example/token".into(),
+            service: Some("registry".into()),
+            scope: None,
+        };
+        for header in [
+            r#"Bearer realm = "https://auth.example/token",service="registry", Digest realm="other",nonce="opaque""#,
+            r#"Digest realm="other",nonce="opaque", Bearer realm="https://auth.example/token",service="registry""#,
+            r#"Negotiate opaque-token, Bearer realm="https://auth.example/token",service="registry", Unknown opaque-token"#,
+        ] {
+            assert_eq!(
+                challenges(header).unwrap().as_slice(),
+                std::slice::from_ref(&bearer),
+                "{header}"
+            );
+        }
+        assert!(
+            challenges(r#"Digest realm="other",nonce="opaque""#)
+                .unwrap()
+                .is_empty()
         );
     }
     #[test]
