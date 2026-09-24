@@ -41,6 +41,10 @@ quayside image digest registry.example.com/team/nginx:latest
 quayside manifest get registry.example.com/team/nginx:latest --raw
 ```
 
+`image copy` automatically reuses matching blobs from Docker's current context when available.
+Missing content is downloaded from the source registry; the original digests and platform selection are preserved.
+Docker stores without original registry blobs fall back to remote downloads.
+
 Build a multi-platform index from existing single-platform images:
 
 ```bash

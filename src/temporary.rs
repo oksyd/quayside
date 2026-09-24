@@ -23,10 +23,14 @@ impl Budget {
         })
     }
 
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit
+    }
+
     pub(crate) async fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation> {
         if bytes > self.limit {
             return Err(Error::input(
-                "blob exceeds available max_temp_size; increase the temporary storage limit",
+                "blob exceeds available temporary storage; free disk space or increase max_temp_size",
             ));
         }
         loop {
@@ -45,6 +49,20 @@ impl Budget {
             }
             notified.await;
         }
+    }
+}
+
+impl Reservation {
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        assert!(bytes <= self.bytes, "a reservation may only shrink");
+        let released = self.bytes - bytes;
+        self.bytes = bytes;
+        *self
+            .budget
+            .used
+            .lock()
+            .expect("temporary budget lock poisoned") -= released;
+        self.budget.released.notify_waiters();
     }
 }
 
@@ -100,5 +118,23 @@ mod tests {
                 .unwrap()
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn shrinking_reservations_releases_only_unused_bytes() {
+        let budget = Budget::new(10);
+        let mut archive = budget.reserve(9).await.unwrap();
+        archive.shrink_to(4);
+        let worker = tokio::time::timeout(Duration::from_secs(1), budget.reserve(6))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.reserve(1))
+                .await
+                .is_err()
+        );
+        drop((archive, worker));
+        assert!(budget.reserve(10).await.is_ok());
     }
 }

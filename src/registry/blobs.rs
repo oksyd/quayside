@@ -64,7 +64,7 @@ impl Registry {
             _ => Err(http_error(&response)),
         }
     }
-    pub(super) async fn cached_blob(&self, repo: &str, d: &Descriptor) -> Result<Option<Bytes>> {
+    pub(crate) async fn cached_blob(&self, repo: &str, d: &Descriptor) -> Result<Option<Bytes>> {
         let raw = self
             .inner
             .blobs

@@ -1,3 +1,5 @@
+#[path = "transfer_pipeline/docker_cache.rs"]
+mod docker_cache;
 mod support;
 
 use quayside::digest::Digest;
@@ -43,8 +45,12 @@ fn destination_with_commit(
                     .manifests
                     .get(&request.path)
                     .map(|body| {
-                        Response::new(200, body.clone())
-                            .header("Content-Type", quayside::model::OCI_MANIFEST)
+                        Response::new(200, body.clone()).header(
+                            "Content-Type",
+                            serde_json::from_slice::<Value>(body).unwrap()["mediaType"]
+                                .as_str()
+                                .unwrap(),
+                        )
                     })
                     .unwrap_or_else(|| Response::new(404, vec![])),
                 "PUT" => {

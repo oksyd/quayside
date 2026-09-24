@@ -10,7 +10,9 @@ use crate::{
     storage,
     transfer::{self, TransferStats},
 };
+mod cache;
 mod docker;
+pub(crate) use cache::DockerCache;
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};

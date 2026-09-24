@@ -96,8 +96,10 @@ pub async fn check_destination(
 /// Completed logical transfer counts, excluding lower-level request attempts.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TransferStats {
-    /// Number of blobs downloaded and uploaded successfully.
+    /// Number of blobs copied successfully, including payloads reused from Docker.
     pub copied_blobs: u64,
+    /// Subset of copied blobs read from Docker instead of downloaded from the source registry.
+    pub reused_blobs: u64,
     /// Number of verified server-side cross-repository blob mounts.
     pub mounted_blobs: u64,
     /// Number of blobs already present at the destination.
@@ -111,6 +113,7 @@ impl TransferStats {
     /// Add the outcomes of another transfer batch to these statistics.
     pub fn merge(&mut self, other: &Self) {
         self.copied_blobs += other.copied_blobs;
+        self.reused_blobs += other.reused_blobs;
         self.mounted_blobs += other.mounted_blobs;
         self.skipped_blobs += other.skipped_blobs;
         self.planned_blobs += other.planned_blobs;
@@ -289,6 +292,7 @@ struct StagedBlob {
     descriptor: Descriptor,
     initial: Option<UploadStart>,
     progress: Box<dyn crate::observer::BlobProgress>,
+    reused: bool,
 }
 
 pub(crate) fn largest_blobs_first(graph: &Graph) -> Vec<Descriptor> {
@@ -308,12 +312,14 @@ pub async fn transfer_remote_blobs(
     dry_run: bool,
     observer: &dyn crate::observer::Observer,
 ) -> Result<TransferStats> {
-    transfer_remote_inputs(
+    let cache = crate::layout::DockerCache::new(source_ref, &target.config().transfer, graph);
+    transfer_inputs(
         [(source, source_ref, graph)],
         target,
         destination,
         dry_run,
         observer,
+        Some(&cache),
     )
     .await
 }
@@ -330,6 +336,17 @@ pub(crate) async fn transfer_remote_inputs<'a>(
     destination: &Reference,
     dry_run: bool,
     observer: &dyn crate::observer::Observer,
+) -> Result<TransferStats> {
+    transfer_inputs(inputs, target, destination, dry_run, observer, None).await
+}
+
+async fn transfer_inputs<'a>(
+    inputs: impl IntoIterator<Item = (&'a Registry, &'a Reference, &'a Graph)>,
+    target: &Registry,
+    destination: &Reference,
+    dry_run: bool,
+    observer: &dyn crate::observer::Observer,
+    cache: Option<&crate::layout::DockerCache<'_>>,
 ) -> Result<TransferStats> {
     let mut unique = BTreeMap::<Digest, RemoteBlob>::new();
     for (source, reference, graph) in inputs {
@@ -392,7 +409,15 @@ pub(crate) async fn transfer_remote_inputs<'a>(
             ));
         }
     }
-    let budget = crate::temporary::Budget::new(temp_limit);
+    // An optional Docker export must not consume disk space needed by the transfer workers.
+    let available = if cache.is_some() {
+        fs2::available_space(std::env::temp_dir())
+            .unwrap_or(temp_limit)
+            .min(temp_limit)
+    } else {
+        temp_limit
+    };
+    let budget = crate::temporary::Budget::new(available);
     let concurrency = target.config().transfer.concurrency;
     // Every source and every range shares one operation-wide download limit.
     let slots = Arc::new(Semaphore::new(concurrency));
@@ -449,18 +474,35 @@ pub(crate) async fn transfer_remote_inputs<'a>(
                     // Reserve all bytes before writing; concurrent workers share this operation's quota.
                     // The temporary file drops before its reservation on success, error or cancellation.
                     progress.phase(crate::observer::BlobPhase::Waiting);
+                    let local = if d.data.is_none()
+                        && source.cached_blob(&from_repo, &d).await?.is_none()
+                    {
+                        cache
+                    } else {
+                        None
+                    };
+                    if let Some(local) = local {
+                        // Initialize the archive before workers hold staging reservations.
+                        local.prepare(&budget).await;
+                    }
                     let _reservation = budget.reserve(d.size).await?;
                     // One verified temporary file per active worker, never a whole layer in RAM.
                     let temporary = tempfile::NamedTempFile::new()?;
-                    source
-                        .download_blob_with_slots(
-                            &from_repo,
-                            &d,
-                            temporary.path(),
-                            progress.as_ref(),
-                            slots,
-                        )
-                        .await?;
+                    let reused = match local {
+                        Some(local) => local.stage(&d, temporary.path(), progress.as_ref()).await,
+                        None => false,
+                    };
+                    if !reused {
+                        source
+                            .download_blob_with_slots(
+                                &from_repo,
+                                &d,
+                                temporary.path(),
+                                progress.as_ref(),
+                                slots,
+                            )
+                            .await?;
+                    }
                     progress.phase(crate::observer::BlobPhase::Waiting);
                     sender
                         .send(StagedBlob {
@@ -469,6 +511,7 @@ pub(crate) async fn transfer_remote_inputs<'a>(
                             descriptor: d,
                             initial,
                             progress,
+                            reused,
                         })
                         .await
                         .map_err(|_| Error::network("upload queue closed"))?;
@@ -501,7 +544,11 @@ pub(crate) async fn transfer_remote_inputs<'a>(
         blob.progress.finish();
         Ok::<_, Error>(TransferStats {
             copied_blobs: 1,
-            bytes_transferred: blob.descriptor.size.saturating_mul(2),
+            reused_blobs: u64::from(blob.reused),
+            bytes_transferred: blob
+                .descriptor
+                .size
+                .saturating_mul(if blob.reused { 1 } else { 2 }),
             ..Default::default()
         })
     })

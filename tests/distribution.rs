@@ -298,6 +298,7 @@ fn docker_local_image_round_trip() {
     let image = env::var("QUAYSIDE_TEST_DOCKER_IMAGE").expect("set QUAYSIDE_TEST_DOCKER_IMAGE");
     let target = env::var("QUAYSIDE_TEST_TARGET").expect("set QUAYSIDE_TEST_TARGET");
     let mut harness = Harness::new(&[(&target, true)]);
+    harness.use_docker = true;
     harness.config.transfer.chunk_size = "8MiB".into();
     harness.config.transfer.idle_timeout = "30s".into();
     let dst = format!("{target}/quayside-{}/docker:v1", std::process::id());
@@ -315,6 +316,58 @@ fn docker_local_image_round_trip() {
         pushed["data"]["target_digest"],
         result["data"]["target_digest"]
     );
+    assert_eq!(
+        fs::read_dir(harness.root.path().join("tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+#[ignore = "requires Docker, QUAYSIDE_TEST_DOCKER_IMAGE and two disposable HTTP registries"]
+fn docker_local_cache_copy() {
+    use std::process::{Command, Stdio};
+    let image = env::var("QUAYSIDE_TEST_DOCKER_IMAGE").expect("set QUAYSIDE_TEST_DOCKER_IMAGE");
+    let source = env::var("QUAYSIDE_TEST_SOURCE").expect("set QUAYSIDE_TEST_SOURCE");
+    let target = env::var("QUAYSIDE_TEST_TARGET").expect("set QUAYSIDE_TEST_TARGET");
+    assert_ne!(source, target);
+    let mut harness = Harness::new(&[(&source, true), (&target, true)]);
+    harness.use_docker = true;
+    harness.config.transfer.idle_timeout = "30s".into();
+    let src = format!("{source}/quayside-{}/cache:v1", std::process::id());
+    let dst = format!("{target}/quayside-{}/cache:v1", std::process::id());
+    let pushed = harness.json(&["image", "push", "--docker", &image, &src], 0);
+    assert!(
+        Command::new("docker")
+            .args(["image", "tag", &image, &src])
+            .status()
+            .unwrap()
+            .success()
+    );
+    struct LocalTag(String);
+    impl Drop for LocalTag {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .args(["image", "rm", "--", &self.0])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _tag = LocalTag(src.clone());
+    let copied = harness.json(&["image", "copy", &src, &dst], 0);
+    assert_eq!(
+        copied["data"]["target_digest"],
+        pushed["data"]["target_digest"]
+    );
+    assert!(
+        copied["data"]["stats"]["reused_blobs"].as_u64().unwrap() > 0,
+        "{copied}"
+    );
+    println!("Docker cache copy: {}", copied["data"]["stats"]);
+    let repeated = harness.json(&["image", "copy", &src, &dst], 0);
+    assert_eq!(repeated["data"]["stats"]["copied_blobs"], 0);
     assert_eq!(
         fs::read_dir(harness.root.path().join("tmp"))
             .unwrap()

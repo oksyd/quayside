@@ -40,6 +40,7 @@ pub fn data_home(root: &Path) -> PathBuf {
 pub struct Harness {
     pub root: tempfile::TempDir,
     pub config: Config,
+    pub use_docker: bool,
 }
 impl Harness {
     pub fn new(hosts: &[(&str, bool)]) -> Self {
@@ -63,7 +64,16 @@ impl Harness {
         fs::create_dir(root.path().join("tmp")).unwrap();
         fs::create_dir_all(config_home(root.path()).join("docker")).unwrap();
         fs::write(config_home(root.path()).join("docker/daemon.json"), b"{}").unwrap();
-        Self { root, config }
+        let bin = root.path().join("no-docker");
+        fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("docker"), b"#!/bin/sh\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("docker"), fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            root,
+            config,
+            use_docker: false,
+        }
     }
     pub fn daemon_config(&self) -> PathBuf {
         config_home(self.root.path()).join("docker/daemon.json")
@@ -85,6 +95,17 @@ impl Harness {
         command.env("XDG_DATA_HOME", data_home(self.root.path()));
         command.env("TMPDIR", self.root.path().join("tmp"));
         command.env("XDG_CONFIG_HOME", self.root.path().join("xdg"));
+        if !self.use_docker {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            command.env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(self.root.path().join("no-docker"))
+                        .chain(std::env::split_paths(&path)),
+                )
+                .unwrap(),
+            );
+        }
         for name in [
             "http_proxy",
             "https_proxy",

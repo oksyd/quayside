@@ -210,6 +210,9 @@ fn transfer_summary(
         if stats.mounted_blobs > 0 {
             summary.push_str(&format!(", mounted: {}", stats.mounted_blobs));
         }
+        if stats.reused_blobs > 0 {
+            summary.push_str(&format!(", reused: {}", stats.reused_blobs));
+        }
         summary
     };
     format!("{summary}\n{result}")
