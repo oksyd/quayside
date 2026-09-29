@@ -1,8 +1,17 @@
+## [0.1.10] - 2026-09-29
+
+### 🚀 Features
+
+- Support OCI referrers and resumable image transfers
 ## [0.1.9] - 2026-09-29
 
 ### 🚀 Features
 
 - Add Compose-style progress with per-blob outcomes and elapsed time
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.9
 ## [0.1.8] - 2026-09-24
 
 ### 🚀 Features
