@@ -1,8 +1,17 @@
+## [0.1.9] - 2026-09-29
+
+### 🚀 Features
+
+- Add Compose-style progress with per-blob outcomes and elapsed time
 ## [0.1.8] - 2026-09-24
 
 ### 🚀 Features
 
 - Reuse local Docker blobs during image copy
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.8
 ## [0.1.7] - 2026-09-22
 
 ### 🚀 Features
