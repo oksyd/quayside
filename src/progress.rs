@@ -1,13 +1,16 @@
 //! Terminal-only progress; upload positions are registry-acknowledged offsets.
+use crate::observer::BlobOutcome;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::IsTerminal,
     sync::{Arc, Mutex, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 static ACTIVE: Mutex<Weak<Display>> = Mutex::new(Weak::new());
+const RECENT_LIMIT: usize = 3;
+const RECENT_LIFETIME: Duration = Duration::from_secs(2);
 
 pub(crate) fn suspend(write: impl FnOnce()) {
     let display = ACTIVE.lock().ok().and_then(|active| active.upgrade());
@@ -22,18 +25,19 @@ fn style(template: &str) -> ProgressStyle {
     ProgressStyle::with_template(template)
         .expect("valid static progress template")
         .progress_chars("=> ")
-        .tick_strings(&["|", "/", "-", "\\", " "])
+        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"])
 }
 fn activity_style() -> ProgressStyle {
-    style("{prefix} {wide_msg}")
+    style(" {spinner} {prefix} {wide_msg}")
 }
 fn transfer_style() -> ProgressStyle {
-    style("{prefix} {msg:11} [{wide_bar}] {bytes}/{total_bytes}")
+    style(" {spinner} {prefix} {msg:11} [{wide_bar}] {bytes}/{total_bytes}")
 }
 
 #[derive(Default)]
 struct Counts {
     active: BTreeMap<String, ProgressBar>,
+    recent: VecDeque<(Instant, ProgressBar)>,
     completed: u64,
     stopped: bool,
 }
@@ -41,6 +45,17 @@ struct Display {
     multi: MultiProgress,
     summary: ProgressBar,
     counts: Mutex<Counts>,
+}
+impl Display {
+    fn prune_recent(&self, counts: &mut Counts, now: Instant) {
+        while counts.recent.front().is_some_and(|(finished, _)| {
+            counts.recent.len() > RECENT_LIMIT || now.duration_since(*finished) >= RECENT_LIFETIME
+        }) {
+            let (_, bar) = counts.recent.pop_front().expect("nonempty recent rows");
+            bar.finish_and_clear();
+            self.multi.remove(&bar);
+        }
+    }
 }
 pub(crate) struct Progress {
     display: Option<Arc<Display>>,
@@ -78,10 +93,11 @@ impl Progress {
                 let Some(display) = weak.upgrade() else {
                     break;
                 };
-                if let Ok(counts) = display.counts.lock() {
+                if let Ok(mut counts) = display.counts.lock() {
                     if counts.stopped {
                         break;
                     }
+                    display.prune_recent(&mut counts, Instant::now());
                     display.summary.tick();
                     for bar in counts.active.values() {
                         bar.tick();
@@ -95,10 +111,12 @@ impl Progress {
         let multi = MultiProgress::with_draw_target(target);
         let summary = multi.add(ProgressBar::new(total as u64));
         if total == 0 {
-            summary.set_style(style("{spinner} {wide_msg}"));
+            summary.set_style(style("[{spinner}] {wide_msg} {elapsed_precise}"));
             summary.set_message(phase);
         } else {
-            summary.set_style(style("{prefix} {pos}/{len} blobs"));
+            summary.set_style(style(
+                "[+] {prefix} {pos}/{len} blobs{wide_msg} {elapsed_precise}",
+            ));
             summary.set_prefix(phase);
         }
         Self {
@@ -114,7 +132,14 @@ impl Progress {
         let Some(display) = &self.display else {
             return Blob::default();
         };
-        let bar = display.multi.add(ProgressBar::new(size));
+        let Ok(mut counts) = display.counts.lock() else {
+            return Blob::default();
+        };
+        display.prune_recent(&mut counts, Instant::now());
+        // Keep active workers above the small, expiring completion history.
+        let bar = display
+            .multi
+            .insert(1 + counts.active.len(), ProgressBar::new(size));
         bar.set_style(activity_style());
         bar.set_prefix(
             key.split(':')
@@ -125,9 +150,7 @@ impl Progress {
                 .collect::<String>(),
         );
         bar.set_message("Checking");
-        if let Ok(mut counts) = display.counts.lock() {
-            counts.active.insert(key.clone(), bar.clone());
-        }
+        counts.active.insert(key.clone(), bar.clone());
         Blob {
             display: Some(display.clone()),
             bar: Some(bar),
@@ -149,6 +172,10 @@ impl Drop for Progress {
                 bar.finish_and_clear();
             }
             counts.active.clear();
+            for (_, bar) in counts.recent.drain(..) {
+                bar.finish_and_clear();
+                display.multi.remove(&bar);
+            }
             display.summary.finish_and_clear();
             let _ = display.multi.clear();
         }
@@ -176,21 +203,44 @@ impl Blob {
             bar.set_position(position.min(self.size));
         }
     }
-    pub(crate) fn finish(&self) {
+    pub(crate) fn finish(&self, outcome: BlobOutcome) {
         if let Some(display) = &self.display
             && let Ok(mut counts) = display.counts.lock()
             && let Some(bar) = counts.active.remove(&self.key)
         {
             counts.completed += 1;
-            bar.finish_and_clear();
+            // Moving completed rows below active workers keeps long transfers visible.
             display.multi.remove(&bar);
+            let bar = display.multi.add(bar);
+            bar.set_style(activity_style());
+            bar.finish_with_message(match outcome {
+                BlobOutcome::Copied => "Copied",
+                BlobOutcome::Reused => "Copied (local)",
+                BlobOutcome::AlreadyExists => "Already exists",
+                BlobOutcome::Mounted => "Mounted",
+                BlobOutcome::Planned => "Would copy",
+            });
+            let now = Instant::now();
+            counts.recent.push_back((now, bar));
+            display.prune_recent(&mut counts, now);
             display.summary.set_position(counts.completed);
         }
     }
 }
 
 /// CLI adapter; core transfer code only depends on observer traits.
-pub(crate) struct TerminalObserver(pub bool);
+pub(crate) struct TerminalObserver {
+    enabled: bool,
+    started: Instant,
+}
+impl TerminalObserver {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            started: Instant::now(),
+        }
+    }
+}
 impl crate::observer::Observer for TerminalObserver {
     fn begin(
         &self,
@@ -205,7 +255,11 @@ impl crate::observer::Observer for TerminalObserver {
             Phase::Planning => "Planning",
             Phase::Publishing => "Publishing manifests",
         };
-        Box::new(Progress::new(self.0, label, total))
+        let progress = Progress::new(self.enabled, label, total);
+        if let Some(display) = &progress.display {
+            display.summary.set_elapsed(self.started.elapsed());
+        }
+        Box::new(progress)
     }
 }
 impl crate::observer::Operation for Progress {
@@ -228,7 +282,10 @@ impl crate::observer::BlobProgress for Blob {
         self.position(position);
     }
     fn finish(&self) {
-        self.finish();
+        self.finish(BlobOutcome::Copied);
+    }
+    fn finish_with(&self, outcome: BlobOutcome) {
+        self.finish(outcome);
     }
 }
 
@@ -253,9 +310,14 @@ mod tests {
         assert_eq!(bar.position(), 100);
         blob.phase("Committing");
         assert_eq!(bar.position(), 100);
-        blob.finish();
-        blob.finish();
+        blob.finish(BlobOutcome::Copied);
+        blob.finish(BlobOutcome::AlreadyExists);
         assert!(bar.is_finished());
+        assert_eq!(bar.message(), "Copied");
+        blob.phase("Downloading");
+        blob.position(0);
+        assert_eq!(bar.message(), "Copied");
+        assert_eq!(bar.position(), 100);
         let pending = progress.blob("sha256:pending".into(), 100);
         let display = progress.display.as_ref().unwrap().clone();
         assert_eq!(display.counts.lock().unwrap().completed, 1);
@@ -263,6 +325,7 @@ mod tests {
         assert!(pending.bar.as_ref().unwrap().is_finished());
         assert!(display.counts.lock().unwrap().stopped);
         assert!(display.counts.lock().unwrap().active.is_empty());
+        assert!(display.counts.lock().unwrap().recent.is_empty());
     }
     #[derive(Clone, Debug)]
     struct Terminal {
@@ -309,7 +372,7 @@ mod tests {
             writes: Arc::new(Mutex::new(String::new())),
         };
         let progress = Progress::with_target(
-            "Checking",
+            "Copying",
             88,
             ProgressDrawTarget::term_like(Box::new(terminal.clone())),
         );
@@ -334,23 +397,49 @@ mod tests {
                 .unwrap()
                 .push_str("Diagnostic preserved\n");
         });
-        first.finish();
+        first.finish(BlobOutcome::Copied);
         for index in 1..88 {
-            progress.blob(format!("sha256:{index:012}"), 0).finish();
+            progress
+                .blob(format!("sha256:{index:012}"), 0)
+                .finish(BlobOutcome::AlreadyExists);
         }
         assert_eq!(display.summary.position(), 88);
         assert!(display.counts.lock().unwrap().active.is_empty());
         {
             let text = terminal.writes.lock().unwrap();
-            for expected in ["Downloading", "Uploading", "Diagnostic preserved"] {
+            for expected in [
+                "[+] Copying",
+                "00:00:00",
+                "Downloading",
+                "Uploading",
+                "Copied",
+                "Already exists",
+                "Diagnostic preserved",
+            ] {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }
-            assert!(!text.contains("Already exists"));
-            assert!(!text.contains("Copied"));
         }
+        assert_eq!(display.counts.lock().unwrap().recent.len(), RECENT_LIMIT);
+        let active = progress.blob("sha256:active".into(), 1024);
+        active.phase("Uploading");
         terminal.writes.lock().unwrap().clear();
         display.summary.force_draw();
+        {
+            let text = terminal.writes.lock().unwrap();
+            assert!(text.contains("000000000087"));
+            assert!(!text.contains("000000000084"));
+            assert!(text.find("active").unwrap() < text.find("000000000085").unwrap());
+        }
+        // Advance the history's clock without sleeping; active transfers must survive expiry.
+        display.prune_recent(
+            &mut display.counts.lock().unwrap(),
+            Instant::now() + RECENT_LIFETIME,
+        );
+        terminal.writes.lock().unwrap().clear();
+        display.summary.force_draw();
+        assert!(terminal.writes.lock().unwrap().contains("active"));
         assert!(!terminal.writes.lock().unwrap().contains("000000000087"));
+        assert!(display.counts.lock().unwrap().recent.is_empty());
         drop(progress);
     }
     #[test]
@@ -359,7 +448,7 @@ mod tests {
         let blob = progress.blob("sha256:abc".into(), 0);
         blob.phase("Uploading");
         blob.position(1);
-        blob.finish();
+        blob.finish(BlobOutcome::Copied);
         assert!(progress.display.is_none());
     }
 }

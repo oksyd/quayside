@@ -437,14 +437,14 @@ async fn transfer_inputs<'a>(
                 let to_repo = destination.repository.clone();
                 async move {
                     if target.blob_exists(&to_repo, &d).await? {
-                        progress.finish();
+                        progress.finish_with(crate::observer::BlobOutcome::AlreadyExists);
                         return Ok::<_, Error>(TransferStats {
                             skipped_blobs: 1,
                             ..Default::default()
                         });
                     }
                     if dry_run {
-                        progress.finish();
+                        progress.finish_with(crate::observer::BlobOutcome::Planned);
                         return Ok(TransferStats {
                             planned_blobs: 1,
                             ..Default::default()
@@ -465,7 +465,7 @@ async fn transfer_inputs<'a>(
                         if !target.blob_exists(&to_repo, &d).await? {
                             return Err(Error::integrity("mounted blob cannot be read back"));
                         }
-                        progress.finish();
+                        progress.finish_with(crate::observer::BlobOutcome::Mounted);
                         return Ok(TransferStats {
                             mounted_blobs: 1,
                             ..Default::default()
@@ -541,7 +541,11 @@ async fn transfer_inputs<'a>(
             blob.progress.as_ref(),
         )
         .await?;
-        blob.progress.finish();
+        blob.progress.finish_with(if blob.reused {
+            crate::observer::BlobOutcome::Reused
+        } else {
+            crate::observer::BlobOutcome::Copied
+        });
         Ok::<_, Error>(TransferStats {
             copied_blobs: 1,
             reused_blobs: u64::from(blob.reused),

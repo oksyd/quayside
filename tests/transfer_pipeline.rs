@@ -1,5 +1,7 @@
 #[path = "transfer_pipeline/docker_cache.rs"]
 mod docker_cache;
+#[path = "transfer_pipeline/progress.rs"]
+mod progress;
 mod support;
 
 use quayside::digest::Digest;

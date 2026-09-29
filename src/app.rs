@@ -483,7 +483,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                 &dst,
                 selection.platform.as_deref(),
                 &write.into(),
-                &crate::progress::TerminalObserver(ctx.progress),
+                &crate::progress::TerminalObserver::new(ctx.progress),
             )
             .await?;
             ctx.warn("Independent referrers (signatures/SBOMs) were not copied.");
@@ -654,7 +654,7 @@ async fn index_create(
         &target,
         &dst,
         write.dry_run,
-        &crate::progress::TerminalObserver(ctx.progress),
+        &crate::progress::TerminalObserver::new(ctx.progress),
     )
     .await?;
     if !write.dry_run {

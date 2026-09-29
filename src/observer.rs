@@ -29,6 +29,21 @@ pub enum BlobPhase {
     Waiting,
 }
 
+/// Successful outcome of processing a blob, independent of terminal presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobOutcome {
+    /// Uploaded and verified at the destination.
+    Copied,
+    /// Uploaded using verified payload bytes from the local Docker cache.
+    Reused,
+    /// Verified as already present at the destination.
+    AlreadyExists,
+    /// Mounted from another repository and verified at the destination.
+    Mounted,
+    /// Would be transferred during a real run; no content was written.
+    Planned,
+}
+
 /// Receives operation stages without imposing a terminal or logging backend.
 pub trait Observer: Send + Sync {
     /// Begin observing an operation stage; total is the known blob count, or zero for metadata work.
@@ -47,6 +62,10 @@ pub trait BlobProgress: Send + Sync {
     fn position(&self, position: u64);
     /// Marks successful processing, including a verified existing or mounted blob.
     fn finish(&self);
+    /// Report a successful outcome. Observers without outcome support still receive `finish`.
+    fn finish_with(&self, _outcome: BlobOutcome) {
+        self.finish();
+    }
 }
 /// No-op observer for callers that do not need progress reporting.
 #[derive(Default)]
