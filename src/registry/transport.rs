@@ -197,6 +197,36 @@ pub(super) fn retry_delay(response: Option<&Response>, attempt: usize) -> Durati
 }
 
 impl Registry {
+    pub(super) fn validate_content_url(&self, url: &Url) -> Result<()> {
+        valid_url(url)?;
+        if same_origin(url, &self.inner.base) || url.scheme() == "https" {
+            return Ok(());
+        }
+        if self.inner.base.scheme() == "http"
+            && self.config().for_registry(&authority(url)).plain_http
+        {
+            return Ok(());
+        }
+        Err(Error::unsupported(
+            "untrusted HTTP content endpoint; use HTTPS or explicitly configure plain_http for this host",
+        ))
+    }
+
+    async fn content_client(&self, url: &Url) -> Result<std::sync::Arc<HttpClient>> {
+        let key = url.origin().ascii_serialization();
+        let mut clients = self.inner.content_clients.lock().await;
+        if let Some(client) = clients.get(&key) {
+            return Ok(client.clone());
+        }
+        let policy = self.config().for_registry(&authority(url));
+        let base = Url::parse(&format!("{key}/"))?;
+        let http = std::sync::Arc::new(client(&base, self.config(), &policy)?);
+        if clients.len() < 32 {
+            clients.insert(key, http.clone());
+        }
+        Ok(http)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn request(
         &self,
@@ -208,7 +238,7 @@ impl Registry {
         streaming: bool,
         retry_safe: bool,
     ) -> Result<(Response, bool)> {
-        valid_url(&url)?;
+        self.validate_content_url(&url)?;
         let mut auth = self
             .inner
             .cache
@@ -222,10 +252,15 @@ impl Registry {
         let mut redirects = 0usize;
         loop {
             let local = same_origin(&url, &self.inner.base);
+            let external = if local {
+                None
+            } else {
+                Some(self.content_client(&url).await?)
+            };
             let http = if local {
                 &self.inner.client
             } else {
-                &self.inner.public_client
+                external.as_deref().expect("external client")
             };
             let mut request = http.inner.request(method.clone(), url.as_str()).header(
                 header::ACCEPT_ENCODING,
@@ -391,9 +426,15 @@ impl Registry {
                 continue;
             }
             if response.status().is_redirection() && response.status() != StatusCode::NOT_MODIFIED {
-                if method != Method::GET && method != Method::HEAD {
+                if method != Method::GET
+                    && method != Method::HEAD
+                    && !matches!(
+                        response.status(),
+                        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+                    )
+                {
                     return Err(Error::unsupported(
-                        "redirected write request refused; configure the canonical registry endpoint",
+                        "write redirects must preserve the method and body (HTTP 307 or 308)",
                     ));
                 }
                 if redirects >= 8 {
@@ -405,15 +446,13 @@ impl Registry {
                     .and_then(|v| v.to_str().ok())
                     .ok_or_else(|| Error::input("redirect has no valid Location"))?;
                 let next = url.join(location)?;
-                valid_url(&next)?;
-                if next.scheme() == "http"
-                    && (!same_origin(&next, &self.inner.base) || url.scheme() == "https")
-                {
+                if next.scheme() == "http" && url.scheme() == "https" {
                     return Err(Error::new(
                         Code::Unauthorized,
                         "refusing insecure cross-origin redirect or HTTPS downgrade",
                     ));
                 }
+                self.validate_content_url(&next)?;
                 // `headers` never contains Authorization. Only the local-origin branch adds it.
                 url = next;
                 redirects += 1;

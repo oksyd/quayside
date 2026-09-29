@@ -19,18 +19,27 @@ Enter your password or token when prompted. For automation, use `--password-stdi
 ## Copy images
 
 ```bash
-quayside image copy docker.io/library/nginx:latest \
+quayside image copy nginx:latest \
   registry.example.com/team/nginx:latest
 ```
+
+Source names default to Docker Hub: `nginx:latest` resolves to `docker.io/library/nginx:latest`, and `apache/skywalking-banyandb:0.11.0` to `docker.io/apache/skywalking-banyandb:0.11.0`.
 
 All image platforms are copied by default. Optional flags:
 
 - `--platform linux/amd64`: copy one platform.
+- `--include-attestations`: retain that platform's indexed attestations in a new OCI index.
+- `--referrers all`: discover and recursively copy associated signatures and SBOMs.
+- `--resume`: retain partial downloads and upload sessions for the next run.
 - `--dry-run`: preview changes.
 - `--overwrite`: replace a different destination manifest.
 - `--no-progress`: hide progress bars.
 
-OCI artifacts such as Trivy databases can also be copied. Associated signatures and SBOMs are not copied automatically.
+OCI artifacts such as Trivy databases can also be copied. Attestations included in the selected image index are preserved, with subject associations registered at the destination. Independent referrers are discovered only with `--referrers all`; signatures are not verified. Filtering platforms with `--include-attestations` creates a new index digest; child manifests remain unchanged.
+
+`image copy` automatically reuses matching blobs from Docker's current context when available.
+Missing content is downloaded from the source registry; the original digests and platform selection are preserved.
+Cache preparation has a two-second budget before falling back to downloads. Set `transfer.docker_cache_timeout` to adjust it, or `"0s"` to disable reuse.
 
 ## Inspect images
 
@@ -41,10 +50,6 @@ quayside image digest registry.example.com/team/nginx:latest
 quayside manifest get registry.example.com/team/nginx:latest --raw
 ```
 
-`image copy` automatically reuses matching blobs from Docker's current context when available.
-Missing content is downloaded from the source registry; the original digests and platform selection are preserved.
-Docker stores without original registry blobs fall back to remote downloads.
-
 Build a multi-platform index from existing single-platform images:
 
 ```bash
@@ -53,7 +58,7 @@ quayside index create registry.example.com/team/app:latest \
   --from registry.example.com/team/app:arm64
 ```
 
-Platforms are detected from each source image. Use `--json` for machine-readable output.
+Platforms are detected from each source image; source images are kept. Use `--json` for machine-readable output, including referrer transfer status (`not-copied`, `planned`, or `copied`).
 
 ## Transfer offline
 
@@ -81,6 +86,12 @@ quayside image push nginx.docker.tar registry.example.com/team/nginx:latest
 Only locally stored platforms are pushed. Use `--ref <exact-tag>` to select an image from a multi-image Docker archive.
 Legacy Docker archives are converted to OCI; the original registry manifest digest is not preserved.
 
+`image pull` also accepts `--referrers all`, `--include-attestations`, and `--resume`. Associated artifacts exported with `--referrers all` are preserved by `image push`.
+
+Repeat the same `copy` or `pull` command with `--resume` after an interruption. Cached bytes are verified; expired upload sessions restart automatically. Resume data is private to your user, stored under the system cache directory in `quayside/transfers`, and removed after success. Set `transfer.resume_dir` to choose another directory. Interrupted caches can be deleted when no transfer is running. `transfer.max_temp_size` bounds each operation's payload storage, including resume data; resumable exports require room for both cached blobs and the output staging. Resume mode uses its own cache instead of exporting Docker's local cache.
+
+Copy, pull, and push show interactive progress. Use `--no-progress` to hide it.
+
 ## Configuration
 
 No configuration file is required. See [config.example.toml](config.example.toml) for optional settings; use `--config <path>` to select a file.
@@ -99,6 +110,8 @@ export NO_PROXY=localhost,127.0.0.1,.example.com
 ```
 
 Docker `daemon.json` proxy settings are used as defaults when environment variables are absent.
+
+Delegated uploads and missing blobs advertised through descriptor URLs support HTTPS content hosts. Registry credentials stay on the registry origin. Private content hosts can use their own `ca_file`; HTTP delegation requires both the registry and the content host to be explicitly configured with `plain_http`. HTTPS transfers never downgrade to HTTP.
 
 ## Shell completion
 

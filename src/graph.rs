@@ -21,6 +21,8 @@ pub struct Graph {
     pub blobs: BTreeMap<Digest, Descriptor>,
     /// Manifest publication order with dependencies before their parents.
     pub order: Vec<Digest>,
+    /// Independently discovered roots exported alongside the selected root.
+    pub referrers: BTreeSet<Digest>,
 }
 enum Task {
     Visit(Manifest, usize),
@@ -28,6 +30,56 @@ enum Task {
     Finish(Digest),
 }
 impl Graph {
+    pub(crate) fn merge_referrer(&mut self, other: Self, limits: &TransferConfig) -> Result<()> {
+        let root = other.root.digest().clone();
+        for digest in other.order {
+            let manifest = other.manifests[&digest].clone();
+            if let Some(existing) = self.manifests.get(&digest) {
+                if existing.raw != manifest.raw
+                    || existing.descriptor.media_type != manifest.descriptor.media_type
+                {
+                    return Err(Error::integrity("conflicting associated manifest"));
+                }
+            } else {
+                self.order.push(digest.clone());
+                self.manifests.insert(digest, manifest);
+            }
+        }
+        for (digest, descriptor) in other.blobs {
+            if let Some(existing) = self.blobs.get_mut(&digest) {
+                if existing.size != descriptor.size {
+                    return Err(Error::integrity("conflicting associated blob size"));
+                }
+                if existing.data.is_none() {
+                    existing.data = descriptor.data;
+                }
+                for url in descriptor.urls {
+                    if !existing.urls.contains(&url) {
+                        existing.urls.push(url);
+                    }
+                }
+            } else {
+                self.blobs.insert(digest, descriptor);
+            }
+        }
+        if self.manifests.len() + self.blobs.len() > limits.max_objects
+            || self
+                .manifests
+                .values()
+                .map(|m| m.raw.len() as u64)
+                .sum::<u64>()
+                > parse_size(&limits.max_metadata_size)?
+        {
+            return Err(Error::input(
+                "associated graph exceeds configured resource limits",
+            ));
+        }
+        if &root != self.root.digest() {
+            self.referrers.insert(root);
+        }
+        Ok(())
+    }
+
     /// Fetch siblings concurrently within transfer limits and verify a dependency closure.
     /// Reject cycles and conflicting descriptors while preserving children-first publication order.
     pub async fn build<F, Fut>(
@@ -44,6 +96,7 @@ impl Graph {
             manifests: BTreeMap::new(),
             blobs: BTreeMap::new(),
             order: vec![],
+            referrers: BTreeSet::new(),
         };
         let mut stack = vec![Task::Visit(root, 0)];
         let mut visiting = BTreeSet::new();
@@ -168,6 +221,11 @@ impl Graph {
                             if previous.data.is_none() {
                                 previous.data = b.data;
                             }
+                            for url in b.urls {
+                                if !previous.urls.contains(&url) {
+                                    previous.urls.push(url);
+                                }
+                            }
                         } else {
                             graph.blobs.insert(b.digest.clone(), b);
                         }
@@ -213,7 +271,10 @@ impl Graph {
             .filter(|m| m.kind == ManifestKind::Index)
         {
             for d in m.children()? {
-                if let Some(p) = d.platform {
+                if let Some(p) = d.platform
+                    && p.os != "unknown"
+                    && p.architecture != "unknown"
+                {
                     result.insert(p.to_string());
                 }
             }
@@ -386,14 +447,26 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn subject_is_not_silently_dropped() {
-        let m = Manifest::parse(Bytes::from(serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":[],"subject":{"digest":Digest::sha256(b"x")}})).unwrap()), None, None).unwrap();
-        assert!(
-            Graph::build(m, &TransferConfig::default(), |_| async {
-                Err(Error::input("not called"))
-            })
-            .await
-            .is_err()
+    async fn subject_is_preserved_as_a_weak_association() {
+        let subject = index(&[], 0);
+        let raw = Bytes::from(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [],
+                "subject": subject.descriptor
+            }))
+            .unwrap(),
         );
+        let manifest = Manifest::parse(raw.clone(), None, None).unwrap();
+        let graph = Graph::build(manifest, &TransferConfig::default(), |_| async {
+            panic!("a subject is not a dependency to fetch")
+        })
+        .await
+        .unwrap();
+        assert_eq!(graph.root.raw, raw);
+        assert_eq!(
+            graph.root.subject().unwrap().unwrap().digest,
+            *subject.digest()
+        );
+        assert_eq!(graph.manifests.len(), 1);
     }
 }

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          git ls-files --error-unmatch Cargo.lock
+          rust=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          rustup toolchain install "$rust" --profile minimal --component rustfmt,clippy
+          echo "RUSTUP_TOOLCHAIN=$rust" >> "$GITHUB_ENV"
+      - name: Check source and package contents
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          cargo fmt --all --check
+          cargo rustc --locked --lib --all-features -- -D missing-docs
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+          cargo doc --locked --no-deps --all-features
+          cargo package --locked --list > "$RUNNER_TEMP/package-files.txt"
+          grep -Fx config.example.toml "$RUNNER_TEMP/package-files.txt"
+      - name: Test
+        run: |
+          cargo test --locked --all-features
+          cargo test --locked --no-default-features
+
+  registry:
+    name: Registry integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      source:
+        image: registry:3
+        ports: [5000/tcp]
+      target:
+        image: registry:3
+        ports: [5000/tcp]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rust=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          rustup toolchain install "$rust" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$rust" >> "$GITHUB_ENV"
+      - name: Wait for registries
+        env:
+          QUAYSIDE_TEST_SOURCE: 127.0.0.1:${{ job.services.source.ports['5000'] }}
+          QUAYSIDE_TEST_TARGET: 127.0.0.1:${{ job.services.target.ports['5000'] }}
+        run: |
+          for registry in "$QUAYSIDE_TEST_SOURCE" "$QUAYSIDE_TEST_TARGET"; do
+            curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://$registry/v2/"
+          done
+          echo "QUAYSIDE_TEST_SOURCE=$QUAYSIDE_TEST_SOURCE" >> "$GITHUB_ENV"
+          echo "QUAYSIDE_TEST_TARGET=$QUAYSIDE_TEST_TARGET" >> "$GITHUB_ENV"
+      - name: Test real registry transfers
+        run: cargo test --locked --test distribution distribution_ -- --ignored

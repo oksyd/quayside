@@ -315,12 +315,50 @@ impl Manifest {
         blobs.extend(serde_json::from_value::<Vec<Descriptor>>(layers.clone())?);
         Ok(blobs)
     }
-    /// Reject manifest formats or payload features this transfer implementation cannot preserve.
+    /// Return the optional subject association without treating it as a content dependency.
+    pub fn subject(&self) -> Result<Option<Descriptor>> {
+        self.value
+            .get("subject")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(crate) fn referrer_descriptor(&self) -> Result<Descriptor> {
+        let mut descriptor = self.descriptor.clone();
+        descriptor.platform = None;
+        descriptor.annotations = self
+            .value
+            .get("annotations")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let artifact_type = self
+            .value
+            .get("artifactType")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| Error::input("manifest artifactType must be a string"))
+            })
+            .transpose()?
+            .filter(|value| !value.is_empty());
+        let artifact_type = match artifact_type {
+            Some(value) => Some(value.to_owned()),
+            None if self.kind == ManifestKind::Image => Some(self.config()?.media_type),
+            None => None,
+        };
+        if let Some(value) = artifact_type {
+            descriptor.extra.insert("artifactType".into(), value.into());
+        }
+        Ok(descriptor)
+    }
+
+    /// Validate optional subject and registration metadata before transferring content.
     pub fn check_transfer_supported(&self) -> Result<()> {
-        if self.value.get("subject").is_some_and(|v| !v.is_null()) {
-            return Err(Error::unsupported(
-                "manifest has subject: v0.1 does not implement referrer registration; refusing an incomplete transfer",
-            ));
+        if let Some(subject) = self.subject()? {
+            subject.embedded()?;
+            self.referrer_descriptor()?;
         }
         Ok(())
     }
@@ -340,6 +378,42 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subject_registration_validates_metadata_and_preserves_bytes() {
+        let subject = Descriptor::new(OCI_MANIFEST, Digest::sha256(b"subject"), 7);
+        let value = serde_json::json!({
+            "schemaVersion": 2, "mediaType": OCI_MANIFEST, "subject": subject,
+            "config": Descriptor::new("application/example", Digest::sha256(b"{}"), 2),
+            "layers": [], "annotations": {"example.title": "proof"}
+        });
+        let raw = serde_json::to_vec(&value).unwrap();
+        let manifest = Manifest::parse(raw.clone().into(), None, None).unwrap();
+        manifest.check_transfer_supported().unwrap();
+        let descriptor = manifest.referrer_descriptor().unwrap();
+        assert_eq!(descriptor.extra["artifactType"], "application/example");
+        assert_eq!(descriptor.annotations["example.title"], "proof");
+        assert_eq!(manifest.raw, raw);
+        for (field, invalid) in [
+            ("subject", serde_json::json!({"digest": subject.digest})),
+            ("subject", serde_json::json!("not a descriptor")),
+            (
+                "subject",
+                serde_json::json!({"mediaType": OCI_MANIFEST, "size": 7, "digest": "sha256:invalid"}),
+            ),
+            ("artifactType", serde_json::json!(true)),
+            ("annotations", serde_json::json!({"example.title": 1})),
+        ] {
+            let mut invalid_value = value.clone();
+            invalid_value[field] = invalid;
+            let manifest = Manifest::parse(
+                serde_json::to_vec(&invalid_value).unwrap().into(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(manifest.check_transfer_supported().is_err(), "{field}");
+        }
+    }
     #[test]
     fn preserves_raw_bytes() {
         let raw = Bytes::from_static(b"{\n  \"schemaVersion\": 2, \"mediaType\": \"application/vnd.oci.image.index.v1+json\", \"manifests\": [], \"future\": true\n}");

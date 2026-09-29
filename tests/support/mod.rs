@@ -93,6 +93,7 @@ impl Harness {
             .arg(self.root.path().join("keys/master.key"));
         command.env("HOME", self.root.path());
         command.env("XDG_DATA_HOME", data_home(self.root.path()));
+        command.env("XDG_CACHE_HOME", self.root.path().join("cache"));
         command.env("TMPDIR", self.root.path().join("tmp"));
         command.env("XDG_CONFIG_HOME", self.root.path().join("xdg"));
         if !self.use_docker {
@@ -393,6 +394,67 @@ pub fn artifact_layout(root: &Path, java: bool, opaque: bool) -> Image {
     write_layout(root, serde_json::to_vec(&value).unwrap(), blobs)
 }
 
+pub fn attested_layout(root: &Path) -> Image {
+    let mut blobs = BTreeMap::new();
+    let mut manifests = Vec::new();
+    for architecture in ["amd64", "arm64"] {
+        let image = image_layout_for(&root.join(architecture), 1, 32, architecture);
+        let subject = Descriptor::new(
+            OCI_MANIFEST,
+            image.digest.parse().unwrap(),
+            image.manifest.len() as u64,
+        );
+        blobs.extend(image.blobs);
+        blobs.insert(image.digest, image.manifest);
+        for number in 0..if architecture == "amd64" { 2 } else { 1 } {
+            let config = b"{}".to_vec();
+            let config_descriptor = Descriptor::new(
+                "application/vnd.oci.empty.v1+json",
+                Digest::sha256(&config),
+                2,
+            );
+            let payload =
+                serde_json::to_vec(&json!({"architecture": architecture, "proof": number}))
+                    .unwrap();
+            let layer = Descriptor::new(
+                "application/vnd.in-toto+json",
+                Digest::sha256(&payload),
+                payload.len() as u64,
+            );
+            blobs.insert(config_descriptor.digest.to_string(), config);
+            blobs.insert(layer.digest.to_string(), payload);
+            let raw = serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+                "artifactType": "application/vnd.docker.attestation.manifest.v1+json",
+                "config": config_descriptor, "layers": [layer], "subject": subject,
+                "annotations": {"test.proof": number.to_string()}
+            }))
+            .unwrap();
+            let mut descriptor =
+                Descriptor::new(OCI_MANIFEST, Digest::sha256(&raw), raw.len() as u64);
+            descriptor.platform = Some("unknown/unknown".parse().unwrap());
+            descriptor.annotations.insert(
+                "vnd.docker.reference.type".into(),
+                "attestation-manifest".into(),
+            );
+            descriptor.annotations.insert(
+                "vnd.docker.reference.digest".into(),
+                subject.digest.to_string(),
+            );
+            blobs.insert(descriptor.digest.to_string(), raw);
+            manifests.push(descriptor);
+        }
+        let mut descriptor = subject;
+        descriptor.platform = Some(format!("linux/{architecture}").parse().unwrap());
+        manifests.push(descriptor);
+    }
+    let raw = serde_json::to_vec(
+        &json!({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": manifests}),
+    )
+    .unwrap();
+    write_layout(root, raw, blobs)
+}
+
 fn write_layout(root: &Path, manifest: Vec<u8>, blobs: BTreeMap<String, Vec<u8>>) -> Image {
     let digest = Digest::sha256(&manifest);
     let directory = root.join("layout");
@@ -416,7 +478,11 @@ fn write_layout(root: &Path, manifest: Vec<u8>, blobs: BTreeMap<String, Vec<u8>>
         br#"{"imageLayoutVersion":"1.0.0"}"#,
     )
     .unwrap();
-    fs::write(directory.join("index.json"),serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":[Descriptor::new(OCI_MANIFEST,digest.clone(),manifest.len() as u64)]})).unwrap()).unwrap();
+    let media_type = serde_json::from_slice::<Value>(&manifest).unwrap()["mediaType"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(directory.join("index.json"),serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":[Descriptor::new(media_type,digest.clone(),manifest.len() as u64)]})).unwrap()).unwrap();
     Image {
         manifest,
         digest: digest.to_string(),

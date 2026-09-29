@@ -9,6 +9,8 @@ max_retries = 3
 connect_timeout = "10s"
 metadata_timeout = "60s"
 idle_timeout = "60s"
+# Total budget for optional Docker cache preparation; 0s disables reuse.
+docker_cache_timeout = "2s"
 max_manifest_size = "8MiB"
 max_metadata_size = "64MiB"
 max_objects = 10000
@@ -16,6 +18,8 @@ max_depth = 32
 max_archive_size = "1TiB"
 # Aggregate temporary file content per operation, including tar staging.
 max_temp_size = "64GiB"
+# Private checkpoints for image copy/pull --resume; defaults to the system cache directory.
+# resume_dir = "/path/to/quayside/transfers"
 
 [registries."harbor.example.com"]
 # ca_file = "/etc/quayside/certs/root-ca.pem"

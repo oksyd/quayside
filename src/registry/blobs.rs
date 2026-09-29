@@ -1,4 +1,4 @@
-use super::transport::{http_error, limited_body, same_origin, valid_url};
+use super::transport::{http_error, limited_body};
 use super::{Registry, UploadStart};
 use crate::digest::Digest;
 use crate::error::Code;
@@ -18,18 +18,16 @@ impl Registry {
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| Error::input("upload response has no valid Location header"))?;
-        let url = Url::parse(response.uri_raw())?.join(location)?;
+        let response_url = Url::parse(response.uri_raw())?;
+        let url = response_url.join(location)?;
+        if response_url.scheme() == "https" && url.scheme() != "https" {
+            return Err(Error::input("refusing HTTPS upload endpoint downgrade"));
+        }
         self.validate_upload_url(&url)?;
         Ok(url)
     }
     fn validate_upload_url(&self, url: &Url) -> Result<()> {
-        valid_url(url)?;
-        if !same_origin(url, &self.inner.base) {
-            return Err(Error::unsupported(
-                "cross-origin upload endpoints are not enabled; refusing to forward registry credentials",
-            ));
-        }
-        Ok(())
+        self.validate_content_url(url)
     }
     /// Check whether a blob exists and reject a reported length that conflicts with its descriptor.
     pub async fn blob_exists(&self, repo: &str, d: &Descriptor) -> Result<bool> {
@@ -88,17 +86,7 @@ impl Registry {
         if let Some(data) = d.embedded()?.or(self.cached_blob(repo, d).await?) {
             return Ok(data);
         }
-        let (response, _) = self
-            .request(
-                Method::GET,
-                self.url(&format!("v2/{repo}/blobs/{}", d.digest))?,
-                &Self::scope(repo, "pull"),
-                HeaderMap::new(),
-                None,
-                false,
-                true,
-            )
-            .await?;
+        let response = self.blob_response(repo, d, HeaderMap::new(), false).await?;
         if response.status() != StatusCode::OK {
             return Err(http_error(&response));
         }
@@ -114,6 +102,77 @@ impl Registry {
             cache.insert((repo.to_owned(), d.digest.clone()), raw.clone());
         }
         Ok(raw)
+    }
+
+    pub(super) async fn blob_response(
+        &self,
+        repo: &str,
+        descriptor: &Descriptor,
+        headers: HeaderMap,
+        streaming: bool,
+    ) -> Result<Response> {
+        let primary = self.url(&format!("v2/{repo}/blobs/{}", descriptor.digest))?;
+        let scope = Self::scope(repo, "pull");
+        let (response, _) = self
+            .request(
+                Method::GET,
+                primary,
+                &scope,
+                headers.clone(),
+                None,
+                streaming,
+                true,
+            )
+            .await?;
+        if !matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE)
+            || descriptor.urls.is_empty()
+        {
+            return Ok(response);
+        }
+        let mut last = http_error(&response);
+        drop(response);
+        for advertised in descriptor.urls.iter().take(8) {
+            let url = match Url::parse(advertised).map_err(Error::from).and_then(|url| {
+                self.validate_content_url(&url)?;
+                Ok(url)
+            }) {
+                Ok(url) => url,
+                Err(error) => {
+                    last = error;
+                    continue;
+                }
+            };
+            // External requests never receive the registry's Authorization or token challenges.
+            match self
+                .request(
+                    Method::GET,
+                    url,
+                    &scope,
+                    headers.clone(),
+                    None,
+                    streaming,
+                    true,
+                )
+                .await
+            {
+                Ok((response, _))
+                    if response.status().is_success()
+                        || (headers.contains_key(header::RANGE)
+                            && matches!(response.status().as_u16(), 400 | 405 | 416 | 501)) =>
+                {
+                    return Ok(response);
+                }
+                Ok((response, _)) => last = http_error(&response),
+                Err(error) => last = error,
+            }
+        }
+        Err(Error::new(
+            last.code,
+            format!(
+                "blob unavailable in registry and advertised locations: {}",
+                last.message
+            ),
+        ))
     }
     /// Start an upload or request a same-registry mount from an optional source repository.
     pub async fn start_upload(

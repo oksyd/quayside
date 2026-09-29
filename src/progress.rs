@@ -215,10 +215,12 @@ impl Blob {
             bar.set_style(activity_style());
             bar.finish_with_message(match outcome {
                 BlobOutcome::Copied => "Copied",
+                BlobOutcome::Downloaded => "Downloaded",
+                BlobOutcome::Uploaded => "Uploaded",
                 BlobOutcome::Reused => "Copied (local)",
                 BlobOutcome::AlreadyExists => "Already exists",
                 BlobOutcome::Mounted => "Mounted",
-                BlobOutcome::Planned => "Would copy",
+                BlobOutcome::Planned => "Would transfer",
             });
             let now = Instant::now();
             counts.recent.push_back((now, bar));
@@ -252,6 +254,12 @@ impl crate::observer::Observer for TerminalObserver {
             Phase::Resolving => "Resolving manifests",
             Phase::CheckingDestination => "Checking destination",
             Phase::Copying => "Copying",
+            Phase::Pulling => "Pulling",
+            Phase::Pushing => "Pushing",
+            Phase::ReadingLocal => "Reading local image",
+            Phase::VerifyingLocal => "Verifying local content",
+            Phase::ExportingDocker => "Exporting Docker image",
+            Phase::Saving => "Saving local image",
             Phase::Planning => "Planning",
             Phase::Publishing => "Publishing manifests",
         };

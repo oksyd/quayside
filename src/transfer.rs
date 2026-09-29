@@ -8,6 +8,7 @@ use crate::{
     reference::Reference,
     registry::{Registry, UploadStart},
 };
+pub(crate) mod associated;
 mod publish;
 mod resolve;
 
@@ -28,6 +29,20 @@ use tokio::sync::Semaphore;
 pub enum Referrers {
     /// Independent referrers were not included in this operation.
     NotCopied,
+    /// Independent referrers were discovered and transferred.
+    Copied,
+    /// Independent referrers were discovered during a read-only plan.
+    Planned,
+}
+
+impl Referrers {
+    pub(crate) fn outcome(included: bool, dry_run: bool) -> Self {
+        match (included, dry_run) {
+            (false, _) => Self::NotCopied,
+            (true, true) => Self::Planned,
+            (true, false) => Self::Copied,
+        }
+    }
 }
 
 /// Typed result of copying a selected remote OCI dependency graph.
@@ -132,7 +147,7 @@ pub async fn upload_file(
 ) -> Result<bool> {
     upload_file_progress(target, repo, d, path, initial, &crate::observer::NoProgress).await
 }
-async fn upload_file_progress(
+pub(crate) async fn upload_file_progress(
     target: &Registry,
     repo: &str,
     d: &Descriptor,
@@ -140,9 +155,54 @@ async fn upload_file_progress(
     initial: Option<UploadStart>,
     progress: &dyn crate::observer::BlobProgress,
 ) -> Result<bool> {
+    upload_resumable(target, repo, d, path, initial, progress, None).await
+}
+async fn upload_resumable(
+    target: &Registry,
+    repo: &str,
+    d: &Descriptor,
+    path: &Path,
+    initial: Option<UploadStart>,
+    progress: &dyn crate::observer::BlobProgress,
+    resume: Option<&crate::resume::Blob>,
+) -> Result<bool> {
     let mut initial = initial;
     for attempt in 0..=target.config().transfer.max_retries {
-        let start = match initial.take() {
+        let mut offset = 0;
+        let previous = if let Some(saved) = resume.and_then(|r| r.session()) {
+            match target.upload_status(repo, saved.url.parse()?).await {
+                Ok((url, position)) if position <= d.size && position != 1 => {
+                    offset = position;
+                    Some(UploadStart::Session {
+                        url,
+                        minimum_chunk: saved.minimum_chunk,
+                    })
+                }
+                Ok(_) => {
+                    if let Some(r) = resume {
+                        r.set_session(None)?;
+                    }
+                    None
+                }
+                Err(e)
+                    if matches!(
+                        e.code,
+                        crate::error::Code::NotFound
+                            | crate::error::Code::Unsupported
+                            | crate::error::Code::Forbidden
+                    ) =>
+                {
+                    if let Some(r) = resume {
+                        r.set_session(None)?;
+                    }
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
+        let start = match previous.or_else(|| initial.take()) {
             Some(s) => Ok(s),
             None => target.start_upload(repo, &d.digest, None).await,
         };
@@ -156,7 +216,22 @@ async fn upload_file_progress(
                 return Ok(true);
             }
             Ok(UploadStart::Session { url, minimum_chunk }) => {
-                upload_session(target, repo, d, path, (url, minimum_chunk), progress).await
+                if let Some(r) = resume {
+                    r.set_session(Some(crate::resume::Session {
+                        url: url.to_string(),
+                        minimum_chunk,
+                    }))?;
+                }
+                upload_session(
+                    target,
+                    repo,
+                    d,
+                    path,
+                    (url, minimum_chunk, offset),
+                    progress,
+                    resume,
+                )
+                .await
             }
             Err(e) => Err(e),
         };
@@ -187,10 +262,11 @@ async fn upload_session(
     repo: &str,
     d: &Descriptor,
     path: &Path,
-    session: (url::Url, u64),
+    session: (url::Url, u64, u64),
     progress: &dyn crate::observer::BlobProgress,
+    resume: Option<&crate::resume::Blob>,
 ) -> Result<()> {
-    let (mut url, minimum_chunk) = session;
+    let (mut url, minimum_chunk, mut offset) = session;
     progress.phase(crate::observer::BlobPhase::Uploading);
     let cfg = &target.config().transfer;
     let initial_chunk = parse_size(&cfg.chunk_size)?.max(minimum_chunk);
@@ -205,7 +281,7 @@ async fn upload_session(
     if file.metadata().await?.len() != d.size {
         return Err(Error::integrity("local blob size changed before upload"));
     }
-    let mut offset = 0u64;
+    progress.position(offset);
     let mut reconciliations = 0usize;
     let mut chunk_size = initial_chunk;
     while offset < d.size {
@@ -263,6 +339,12 @@ async fn upload_session(
             Err(e) => return Err(e),
         }
         progress.position(offset);
+        if let Some(r) = resume {
+            r.set_session(Some(crate::resume::Session {
+                url: url.to_string(),
+                minimum_chunk,
+            }))?;
+        }
     }
     progress.phase(crate::observer::BlobPhase::Committing);
     target.finish_upload(repo, url, &d.digest).await
@@ -287,7 +369,7 @@ fn next_chunk_size(
 
 // Drop the file before releasing its quota, including queued and cancelled uploads.
 struct StagedBlob {
-    temporary: tempfile::NamedTempFile,
+    temporary: crate::resume::Staging,
     _reservation: crate::temporary::Reservation,
     descriptor: Descriptor,
     initial: Option<UploadStart>,
@@ -320,6 +402,7 @@ pub async fn transfer_remote_blobs(
         dry_run,
         observer,
         Some(&cache),
+        None,
     )
     .await
 }
@@ -337,7 +420,7 @@ pub(crate) async fn transfer_remote_inputs<'a>(
     dry_run: bool,
     observer: &dyn crate::observer::Observer,
 ) -> Result<TransferStats> {
-    transfer_inputs(inputs, target, destination, dry_run, observer, None).await
+    transfer_inputs(inputs, target, destination, dry_run, observer, None, None).await
 }
 
 async fn transfer_inputs<'a>(
@@ -347,6 +430,7 @@ async fn transfer_inputs<'a>(
     dry_run: bool,
     observer: &dyn crate::observer::Observer,
     cache: Option<&crate::layout::DockerCache<'_>>,
+    resume: Option<&Arc<crate::resume::Store>>,
 ) -> Result<TransferStats> {
     let mut unique = BTreeMap::<Digest, RemoteBlob>::new();
     for (source, reference, graph) in inputs {
@@ -363,6 +447,12 @@ async fn transfer_inputs<'a>(
                     previous.descriptor.data.clone_from(&d.data);
                 }
                 descriptor.data.clone_from(&previous.descriptor.data);
+                for url in &d.urls {
+                    if !previous.descriptor.urls.contains(url) {
+                        previous.descriptor.urls.push(url.clone());
+                    }
+                }
+                descriptor.urls.clone_from(&previous.descriptor.urls);
                 // Prefer a same-registry source so a shared blob can be mounted without download.
                 if previous.source.endpoint().origin() == target.endpoint().origin()
                     || source.endpoint().origin() != target.endpoint().origin()
@@ -474,7 +564,8 @@ async fn transfer_inputs<'a>(
                     // Reserve all bytes before writing; concurrent workers share this operation's quota.
                     // The temporary file drops before its reservation on success, error or cancellation.
                     progress.phase(crate::observer::BlobPhase::Waiting);
-                    let local = if d.data.is_none()
+                    let local = if resume.is_none()
+                        && d.data.is_none()
                         && source.cached_blob(&from_repo, &d).await?.is_none()
                     {
                         cache
@@ -487,19 +578,20 @@ async fn transfer_inputs<'a>(
                     }
                     let _reservation = budget.reserve(d.size).await?;
                     // One verified temporary file per active worker, never a whole layer in RAM.
-                    let temporary = tempfile::NamedTempFile::new()?;
+                    let temporary = crate::resume::Staging::new(resume, &d)?;
                     let reused = match local {
                         Some(local) => local.stage(&d, temporary.path(), progress.as_ref()).await,
                         None => false,
                     };
                     if !reused {
                         source
-                            .download_blob_with_slots(
+                            .download_resumable(
                                 &from_repo,
                                 &d,
                                 temporary.path(),
                                 progress.as_ref(),
                                 slots,
+                                temporary.resume(),
                             )
                             .await?;
                     }
@@ -532,15 +624,17 @@ async fn transfer_inputs<'a>(
     })
     .map(|blob| async move {
         let mut blob = blob;
-        upload_file_progress(
+        upload_resumable(
             target,
             &destination.repository,
             &blob.descriptor,
             blob.temporary.path(),
             blob.initial.take(),
             blob.progress.as_ref(),
+            blob.temporary.resume(),
         )
         .await?;
+        blob.temporary.complete()?;
         blob.progress.finish_with(if blob.reused {
             crate::observer::BlobOutcome::Reused
         } else {
@@ -577,8 +671,33 @@ pub async fn copy(
     write: &WriteOptions,
     observer: &dyn crate::observer::Observer,
 ) -> Result<CopyResult> {
+    copy_with_options(
+        source,
+        source_ref,
+        target,
+        destination,
+        platform,
+        write,
+        &crate::options::TransferOptions::default(),
+        observer,
+    )
+    .await
+}
+
+/// Copy a graph with optional referrer discovery, attestation retention and durable recovery.
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_with_options(
+    source: &Registry,
+    source_ref: &Reference,
+    target: &Registry,
+    destination: &Reference,
+    platform: Option<&str>,
+    write: &WriteOptions,
+    options: &crate::options::TransferOptions,
+    observer: &dyn crate::observer::Observer,
+) -> Result<CopyResult> {
     let resolving = observer.begin(crate::observer::Phase::Resolving, 0);
-    let resolved = resolve(source, source_ref, platform).await?;
+    let resolved = associated::selected(source, source_ref, platform, options).await?;
     resolved.manifest.check_transfer_supported()?;
     drop(resolving);
     let checking = observer.begin(crate::observer::Phase::CheckingDestination, 0);
@@ -586,22 +705,37 @@ pub async fn copy(
         check_destination(target, destination, &resolved.manifest, write.overwrite).await?;
     drop(checking);
     let resolving = observer.begin(crate::observer::Phase::Resolving, 0);
-    let graph = remote_graph(source, source_ref, resolved.manifest).await?;
+    let mut graph = remote_graph(source, source_ref, resolved.manifest).await?;
+    if options.referrers {
+        associated::expand(source, source_ref, &mut graph).await?;
+    }
     drop(resolving);
-    let stats = transfer_remote_blobs(
-        source,
-        source_ref,
+    let resume = if options.resume && !write.dry_run {
+        Some(crate::resume::Store::open(
+            &format!("copy\n{source_ref}\n{destination}"),
+            &target.config().transfer,
+        )?)
+    } else {
+        None
+    };
+    let cache = crate::layout::DockerCache::new(source_ref, &target.config().transfer, &graph);
+    let stats = transfer_inputs(
+        [(source, source_ref, &graph)],
         target,
         destination,
-        &graph,
         write.dry_run,
         observer,
+        Some(&cache),
+        resume.as_ref(),
     )
     .await?;
     let _publishing = observer.begin(crate::observer::Phase::Publishing, 0);
     if !write.dry_run {
         publish_children(target, destination, &graph).await?;
         publish_root(target, destination, &graph.root, write.overwrite).await?;
+        if let Some(store) = resume {
+            store.clear()?;
+        }
     }
     let platforms = if resolved.platforms.is_empty() {
         graph.platforms()?
@@ -617,7 +751,7 @@ pub async fn copy(
         already_present,
         dry_run: write.dry_run,
         stats,
-        referrers: Referrers::NotCopied,
+        referrers: Referrers::outcome(options.referrers, write.dry_run),
     })
 }
 

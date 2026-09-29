@@ -1,4 +1,14 @@
 //! Operation options independent of command-line parsing.
+/// Optional graph expansion and durable transfer behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferOptions {
+    /// Discover and transfer independent referrers recursively.
+    pub referrers: bool,
+    /// Keep indexed attestations when selecting a platform, producing a filtered OCI index.
+    pub include_attestations: bool,
+    /// Persist verified download progress and upload sessions across invocations.
+    pub resume: bool,
+}
 /// Core write policy shared by copying, publication and local import/export.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WriteOptions {

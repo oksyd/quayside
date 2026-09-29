@@ -4,6 +4,7 @@ use crate::{
     config::{TransferConfig, parse_size},
     graph::Graph,
     model::{Descriptor, Manifest, ManifestKind, OCI_INDEX},
+    observer::{BlobOutcome, BlobPhase, NoProgress, Observer, Phase},
     options::{ArchiveFormat, WriteOptions},
     reference::Reference,
     registry::Registry,
@@ -12,6 +13,7 @@ use crate::{
 };
 mod cache;
 mod docker;
+const REFERRER_ANNOTATION: &str = "io.quayside.referrer";
 pub(crate) use cache::DockerCache;
 
 use bytes::Bytes;
@@ -236,6 +238,13 @@ impl LocalLayout {
             .children()?
             .into_iter()
             .filter(|d| {
+                if reference.is_none()
+                    && d.annotations
+                        .get(REFERRER_ANNOTATION)
+                        .is_some_and(|v| v == "true")
+                {
+                    return false;
+                }
                 reference.is_none_or(|r| {
                     d.digest.as_str() == r
                         || d.annotations
@@ -257,12 +266,63 @@ impl LocalLayout {
     }
     /// Build and verify the selected manifest dependency graph from local files.
     pub async fn graph(&self, root: Manifest, limits: &TransferConfig) -> Result<Graph> {
-        Graph::build(root, limits, |d| {
+        let mut graph = Graph::build(root, limits, |d| {
             let root = self.root.clone();
             let limits = limits.clone();
             async move { blocking(move |_| read_manifest(&root, &d, &limits)).await }
         })
-        .await
+        .await?;
+        let path = checked_file(&self.root, Path::new("index.json"))?;
+        let index = Manifest::parse(
+            read_limited(&path, parse_size(&limits.max_manifest_size)?)?.into(),
+            Some(OCI_INDEX),
+            None,
+        )?;
+        let mut pending: Vec<_> = index
+            .children()?
+            .into_iter()
+            .filter(|d| {
+                d.annotations
+                    .get(REFERRER_ANNOTATION)
+                    .is_some_and(|v| v == "true")
+            })
+            .collect();
+        for depth in 0..=limits.max_depth {
+            if pending.is_empty() {
+                break;
+            }
+            let subjects: BTreeSet<_> = graph.manifests.keys().cloned().collect();
+            let mut next = vec![];
+            let mut added = false;
+            for descriptor in pending {
+                let manifest = read_manifest(&self.root, &descriptor, limits)?;
+                let subject = manifest
+                    .subject()?
+                    .ok_or_else(|| Error::integrity("exported referrer has no subject"))?;
+                if graph.manifests.contains_key(&descriptor.digest) {
+                    continue;
+                }
+                if !subjects.contains(&subject.digest) {
+                    next.push(descriptor);
+                    continue;
+                }
+                if depth == limits.max_depth {
+                    return Err(Error::input("local referrers exceed depth limit"));
+                }
+                let associated = Graph::build(manifest, limits, |d| {
+                    std::future::ready(read_manifest(&self.root, &d, limits))
+                })
+                .await?;
+                graph.merge_referrer(associated, limits)?;
+                added = true;
+            }
+            if !added {
+                // Other roots in a multi-image layout can have their own associated artifacts.
+                break;
+            }
+            pending = next;
+        }
+        Ok(graph)
     }
     /// Verify graph payloads against their descriptors under the configured concurrency limit.
     pub async fn verify_blobs(&self, graph: &Graph, limits: &TransferConfig) -> Result<()> {
@@ -672,9 +732,61 @@ pub async fn pull(
     platform: Option<&str>,
     write: &WriteOptions,
 ) -> Result<PullResult> {
+    pull_with_observer(
+        source,
+        reference,
+        output,
+        format,
+        platform,
+        write,
+        &NoProgress,
+    )
+    .await
+}
+
+/// Export a verified graph with optional progress through resolution, download and local commit.
+pub async fn pull_with_observer(
+    source: &Registry,
+    reference: &Reference,
+    output: &Path,
+    format: ArchiveFormat,
+    platform: Option<&str>,
+    write: &WriteOptions,
+    observer: &dyn Observer,
+) -> Result<PullResult> {
+    pull_with_options(
+        source,
+        reference,
+        output,
+        format,
+        platform,
+        write,
+        &crate::options::TransferOptions::default(),
+        observer,
+    )
+    .await
+}
+
+/// Export selected content and optional independent referrers to an OCI layout or archive.
+#[allow(clippy::too_many_arguments)]
+pub async fn pull_with_options(
+    source: &Registry,
+    reference: &Reference,
+    output: &Path,
+    format: ArchiveFormat,
+    platform: Option<&str>,
+    write: &WriteOptions,
+    options: &crate::options::TransferOptions,
+    observer: &dyn Observer,
+) -> Result<PullResult> {
     check_output(output, write.overwrite)?;
-    let resolved = transfer::resolve(source, reference, platform).await?;
-    let graph = transfer::remote_graph(source, reference, resolved.manifest).await?;
+    let resolving = observer.begin(Phase::Resolving, 0);
+    let resolved = transfer::associated::selected(source, reference, platform, options).await?;
+    let mut graph = transfer::remote_graph(source, reference, resolved.manifest).await?;
+    if options.referrers {
+        transfer::associated::expand(source, reference, &mut graph).await?;
+    }
+    drop(resolving);
     let blob_bytes = graph.blobs.values().try_fold(0u64, |n, d| {
         n.checked_add(d.size)
             .ok_or_else(|| Error::input("image size overflow"))
@@ -694,9 +806,20 @@ pub async fn pull(
         "org.opencontainers.image.ref.name".into(),
         reference.selector.clone(),
     );
+    let mut roots = vec![root_descriptor];
+    for digest in &graph.referrers {
+        let mut descriptor = graph.manifests[digest].referrer_descriptor()?;
+        descriptor
+            .annotations
+            .insert(REFERRER_ANNOTATION.into(), "true".into());
+        roots.push(descriptor);
+    }
     let index_bytes = serde_json::to_vec_pretty(
-        &json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":[root_descriptor]}),
+        &json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":roots}),
     )?;
+    if index_bytes.len() as u64 > parse_size(&source.config().transfer.max_manifest_size)? {
+        return Err(Error::input("exported index exceeds manifest size limit"));
+    }
     let layout_bytes = b"{\"imageLayoutVersion\":\"1.0.0\"}\n";
     let mut staged = vec![
         (PathBuf::from("index.json"), index_bytes.len() as u64),
@@ -714,13 +837,37 @@ pub async fn pull(
             .values()
             .map(|d| (blob_path(Path::new(""), &d.digest), d.size)),
     );
-    let required = export_temporary_bytes(&staged, matches!(format, ArchiveFormat::OciArchive))?;
+    let required = export_temporary_bytes(&staged, matches!(format, ArchiveFormat::OciArchive))?
+        .checked_add(if options.resume { blob_bytes } else { 0 })
+        .ok_or_else(|| Error::input("resume storage size overflow"))?;
     if required > parse_size(&source.config().transfer.max_temp_size)? {
         return Err(Error::input(
             "export staging and archive exceed max_temp_size",
         ));
     }
-    if !write.dry_run {
+    if write.dry_run {
+        let display = observer.begin(Phase::Planning, graph.blobs.len());
+        for d in graph.blobs.values() {
+            display
+                .blob(d.digest.to_string(), d.size)
+                .finish_with(BlobOutcome::Planned);
+        }
+    } else {
+        let resume = if options.resume {
+            let mut limits = source.config().transfer.clone();
+            limits.max_temp_size = blob_bytes.to_string();
+            let absolute = std::path::absolute(output)?;
+            Some(crate::resume::Store::open(
+                &format!("pull\n{reference}\n{}", absolute.display()),
+                &limits,
+            )?)
+        } else {
+            None
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(
+            source.config().transfer.concurrency,
+        ));
+        let display = observer.begin(Phase::Pulling, graph.blobs.len());
         fs::create_dir_all(storage::parent(output))?;
         let temp = tempfile::tempdir_in(storage::parent(output))?;
         storage::restrict(temp.path(), true)?;
@@ -735,26 +882,46 @@ pub async fn pull(
                 let path = blob_path(temp.path(), &d.digest);
                 let source = source.clone();
                 let repo = reference.repository.clone();
+                let progress = display.blob(d.digest.to_string(), d.size);
+                let resume = resume.clone();
+                let slots = slots.clone();
                 async move {
-                    match format {
-                        ArchiveFormat::OciLayout => source.download_blob(&repo, &d, &path).await,
-                        ArchiveFormat::OciArchive => {
-                            // Only the completed archive is durable; its staging files are disposable.
-                            source
-                                .download_blob_progress(
-                                    &repo,
-                                    &d,
-                                    &path,
-                                    &crate::observer::NoProgress,
-                                )
-                                .await
-                        }
+                    if let Some(store) = resume {
+                        let blob = store.blob(&d)?;
+                        source
+                            .download_resumable(
+                                &repo,
+                                &d,
+                                &blob.path,
+                                progress.as_ref(),
+                                slots,
+                                Some(&blob),
+                            )
+                            .await?;
+                        tokio::fs::copy(&blob.path, &path).await?;
+                    } else {
+                        source
+                            .download_blob_progress(&repo, &d, &path, progress.as_ref())
+                            .await?;
                     }
+                    if matches!(format, ArchiveFormat::OciLayout) {
+                        // Layout files become durable; archive staging files remain disposable.
+                        tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .await?
+                            .sync_all()
+                            .await?;
+                    }
+                    progress.finish_with(BlobOutcome::Downloaded);
+                    Ok::<_, Error>(())
                 }
             })
             .buffer_unordered(source.config().transfer.concurrency)
             .try_collect::<Vec<_>>()
             .await?;
+        drop(display);
+        let _saving = observer.begin(Phase::Saving, 0);
         tokio::fs::write(temp.path().join("oci-layout"), layout_bytes).await?;
         tokio::fs::write(temp.path().join("index.json"), &index_bytes).await?;
         match format {
@@ -773,6 +940,9 @@ pub async fn pull(
                 }
             }
         }
+        if let Some(store) = resume {
+            store.clear()?;
+        }
     }
     Ok(PullResult {
         source: reference.to_string(),
@@ -784,7 +954,7 @@ pub async fn pull(
         blobs: graph.blobs.len(),
         manifests: graph.manifests.len(),
         dry_run: write.dry_run,
-        referrers: transfer::Referrers::NotCopied,
+        referrers: transfer::Referrers::outcome(options.referrers, write.dry_run),
     })
 }
 
@@ -796,8 +966,22 @@ pub async fn push(
     destination: &Reference,
     write: &WriteOptions,
 ) -> Result<PushResult> {
+    push_with_observer(path, root_ref, target, destination, write, &NoProgress).await
+}
+
+/// Verify and publish local content with optional preparation and transfer progress.
+pub async fn push_with_observer(
+    path: &Path,
+    root_ref: Option<&str>,
+    target: &Registry,
+    destination: &Reference,
+    write: &WriteOptions,
+    observer: &dyn Observer,
+) -> Result<PushResult> {
+    let reading = observer.begin(Phase::ReadingLocal, 0);
     let layout = LocalLayout::open_selected(path, &target.config().transfer, root_ref).await?;
-    push_layout(path, root_ref, layout, target, destination, write).await
+    drop(reading);
+    push_layout(path, root_ref, layout, target, destination, write, observer).await
 }
 
 async fn push_layout(
@@ -807,14 +991,19 @@ async fn push_layout(
     target: &Registry,
     destination: &Reference,
     write: &WriteOptions,
+    observer: &dyn Observer,
 ) -> Result<PushResult> {
+    let verifying = observer.begin(Phase::VerifyingLocal, 0);
     let root = layout.selected_root(root_ref, &target.config().transfer)?;
     let graph = layout.graph(root, &target.config().transfer).await?;
     // Validate the entire selected closure before the first remote write.
     layout
         .verify_blobs(&graph, &target.config().transfer)
         .await?;
+    drop(verifying);
+    let checking = observer.begin(Phase::CheckingDestination, 0);
     check_output_reference(target, destination, &graph, write).await?;
+    drop(checking);
     let available = parse_size(&target.config().transfer.max_temp_size)?
         .checked_sub(layout.temporary_bytes)
         .ok_or_else(|| Error::input("archive extraction exceeds max_temp_size"))?;
@@ -830,30 +1019,50 @@ async fn push_layout(
         }
     }
     let budget = crate::temporary::Budget::new(available);
+    let display = observer.begin(
+        if write.dry_run {
+            Phase::Planning
+        } else {
+            Phase::Pushing
+        },
+        graph.blobs.len(),
+    );
     let outcomes = stream::iter(transfer::largest_blobs_first(&graph))
         .map(|d| {
             let budget = budget.clone();
             let root = layout.root.clone();
             let target = target.clone();
             let repo = destination.repository.clone();
+            let progress = display.blob(d.digest.to_string(), d.size);
             async move {
                 if target.blob_exists(&repo, &d).await? {
+                    progress.finish_with(BlobOutcome::AlreadyExists);
                     return Ok::<_, Error>(TransferStats {
                         skipped_blobs: 1,
                         ..Default::default()
                     });
                 }
                 if write.dry_run {
+                    progress.finish_with(BlobOutcome::Planned);
                     return Ok(TransferStats {
                         planned_blobs: 1,
                         ..Default::default()
                     });
                 }
                 if let Some(raw) = d.embedded()? {
+                    progress.phase(BlobPhase::Waiting);
                     let _reservation = budget.reserve(d.size).await?;
                     let temp = tempfile::NamedTempFile::new()?;
                     tokio::fs::write(temp.path(), &raw).await?;
-                    transfer::upload_file(&target, &repo, &d, temp.path(), None).await?;
+                    transfer::upload_file_progress(
+                        &target,
+                        &repo,
+                        &d,
+                        temp.path(),
+                        None,
+                        progress.as_ref(),
+                    )
+                    .await?;
                 } else {
                     let path = checked_file(
                         &root,
@@ -862,8 +1071,17 @@ async fn push_layout(
                             .join(d.digest.encoded())
                             .as_path(),
                     )?;
-                    transfer::upload_file(&target, &repo, &d, &path, None).await?;
+                    transfer::upload_file_progress(
+                        &target,
+                        &repo,
+                        &d,
+                        &path,
+                        None,
+                        progress.as_ref(),
+                    )
+                    .await?;
                 }
+                progress.finish_with(BlobOutcome::Uploaded);
                 Ok(TransferStats {
                     copied_blobs: 1,
                     bytes_transferred: d.size,
@@ -874,11 +1092,13 @@ async fn push_layout(
         .buffer_unordered(target.config().transfer.concurrency)
         .try_collect::<Vec<_>>()
         .await?;
+    drop(display);
     let mut stats = TransferStats::default();
     for outcome in outcomes {
         stats.merge(&outcome);
     }
     if !write.dry_run {
+        let _publishing = observer.begin(Phase::Publishing, 0);
         transfer::publish_children(target, destination, &graph).await?;
         transfer::publish_root(target, destination, &graph.root, write.overwrite).await?;
     }
@@ -889,7 +1109,7 @@ async fn push_layout(
         target_digest: graph.root.digest().clone(),
         stats,
         dry_run: write.dry_run,
-        referrers: transfer::Referrers::NotCopied,
+        referrers: transfer::Referrers::outcome(!graph.referrers.is_empty(), write.dry_run),
     })
 }
 async fn check_output_reference(
@@ -911,8 +1131,23 @@ pub async fn push_docker(
     destination: &Reference,
     write: &WriteOptions,
 ) -> Result<PushResult> {
+    push_docker_with_observer(image, root_ref, target, destination, write, &NoProgress).await
+}
+
+/// Export and push a Docker image with optional progress, including export and local verification.
+pub async fn push_docker_with_observer(
+    image: &Path,
+    root_ref: Option<&str>,
+    target: &Registry,
+    destination: &Reference,
+    write: &WriteOptions,
+    observer: &dyn Observer,
+) -> Result<PushResult> {
     let limits = &target.config().transfer;
+    let exporting = observer.begin(Phase::ExportingDocker, 0);
     let archive = docker::export(image, limits).await?;
+    drop(exporting);
+    let reading = observer.begin(Phase::ReadingLocal, 0);
     let mut extraction_limits = limits.clone();
     let available = parse_size(&limits.max_temp_size)?
         .checked_sub(archive.as_file().metadata()?.len())
@@ -920,7 +1155,17 @@ pub async fn push_docker(
     extraction_limits.max_temp_size = available.to_string();
     let layout = LocalLayout::open_selected(archive.path(), &extraction_limits, root_ref).await?;
     drop(archive);
-    push_layout(image, root_ref, layout, target, destination, write).await
+    drop(reading);
+    push_layout(
+        image,
+        root_ref,
+        layout,
+        target,
+        destination,
+        write,
+        observer,
+    )
+    .await
 }
 
 #[cfg(test)]

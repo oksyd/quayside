@@ -29,12 +29,13 @@ struct Inner {
     name: String,
     base: Url,
     client: HttpClient,
-    public_client: HttpClient,
+    content_clients: Mutex<BTreeMap<String, Arc<HttpClient>>>,
     config: Arc<Config>,
     policy: RegistryConfig,
     credential: Option<Credential>,
     cache: Mutex<BTreeMap<String, CachedAuth>>,
     auth_refreshes: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    referrer_updates: referrers::UpdateLocks,
     blobs: Mutex<BTreeMap<(String, crate::digest::Digest), bytes::Bytes>>,
     downloads: Arc<Semaphore>,
     changed: Arc<AtomicBool>,
@@ -45,7 +46,7 @@ pub enum UploadStart {
     Mounted,
     /// The registry allocated an upload session that requires payload transmission.
     Session {
-        /// Validated upload-session endpoint on the configured registry origin.
+        /// Validated upload-session endpoint, possibly on a delegated content host.
         url: Url,
         /// Minimum chunk size requested by the registry, in bytes.
         minimum_chunk: u64,
@@ -57,6 +58,7 @@ mod blobs;
 mod catalog;
 mod download;
 mod manifests;
+mod referrers;
 mod transport;
 
 impl Registry {
@@ -79,14 +81,10 @@ impl Registry {
             "{}://{endpoint}/",
             if policy.plain_http { "http" } else { "https" }
         ))?;
-        let mut public_base = base.clone();
-        public_base
-            .set_scheme("https")
-            .map_err(|_| Error::input("invalid public endpoint"))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 client: client(&base, &config, &policy)?,
-                public_client: client(&public_base, &config, &RegistryConfig::default())?,
+                content_clients: Mutex::new(BTreeMap::new()),
                 name,
                 base,
                 downloads: Arc::new(Semaphore::new(config.transfer.concurrency)),
@@ -95,6 +93,7 @@ impl Registry {
                 credential,
                 cache: Mutex::new(BTreeMap::new()),
                 auth_refreshes: Mutex::new(BTreeMap::new()),
+                referrer_updates: Mutex::new(BTreeMap::new()),
                 blobs: Mutex::new(BTreeMap::new()),
                 changed,
             }),

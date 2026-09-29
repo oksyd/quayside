@@ -9,6 +9,105 @@ use std::{collections::BTreeMap, ffi::OsString, fs, sync::atomic::Ordering};
 use support::{Harness, Response, Server};
 
 #[test]
+fn copy_resolves_short_sources_to_docker_hub() {
+    let root = tempfile::tempdir().unwrap();
+    let image = support::image_layout(root.path(), 1, 32);
+    let digest = image.digest.clone();
+    let proxy = Server::new(move |request| {
+        if let Some(path) = request.path.strip_prefix("http://registry-1.docker.io/v2/") {
+            assert_eq!(request.method, "GET");
+            let resource = path
+                .strip_prefix("apache/skywalking-banyandb/")
+                .or_else(|| path.strip_prefix("library/nginx/"))
+                .expect("source requests must use the normalized repository");
+            match resource.split('?').next().unwrap() {
+                "tags/list" => Response::new(
+                    200,
+                    br#"{"name":"library/nginx","tags":["latest"]}"#.to_vec(),
+                ),
+                "manifests/0.11.0" | "manifests/latest" => {
+                    Response::new(200, image.manifest.clone())
+                        .header("Content-Type", quayside::model::OCI_MANIFEST)
+                }
+                _ => {
+                    let digest = resource.strip_prefix("blobs/").expect("config request");
+                    Response::new(200, image.blobs[digest].clone())
+                }
+            }
+        } else {
+            assert!(
+                request
+                    .path
+                    .starts_with("http://registry.invalid/v2/team/app/")
+            );
+            assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
+            Response::new(404, vec![])
+        }
+    });
+    let harness = Harness::new(&[("docker.io", true), ("registry.invalid", true)]);
+    fs::write(
+        harness.daemon_config(),
+        serde_json::to_vec(&serde_json::json!({"proxies": {
+            "http-proxy": format!("http://{}", proxy.host)
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    for (source, normalized) in [
+        (
+            "apache/skywalking-banyandb:0.11.0",
+            "docker.io/apache/skywalking-banyandb:0.11.0",
+        ),
+        ("nginx", "docker.io/library/nginx:latest"),
+    ] {
+        let result = harness.json(
+            &[
+                "image",
+                "copy",
+                source,
+                "registry.invalid/team/app:v1",
+                "--dry-run",
+            ],
+            0,
+        );
+        assert_eq!(result["data"]["source"], normalized);
+        assert_eq!(result["data"]["source_digest"], digest);
+        assert_eq!(result["data"]["stats"]["planned_blobs"], 2);
+    }
+    for args in [
+        vec!["tag", "ls", "nginx"],
+        vec!["manifest", "get", "nginx"],
+        vec!["image", "digest", "nginx"],
+        vec!["image", "inspect", "nginx"],
+        vec![
+            "image",
+            "pull",
+            "nginx",
+            "-o",
+            "unused.oci.tar",
+            "--dry-run",
+        ],
+        vec![
+            "index",
+            "create",
+            "registry.invalid/team/app:multi",
+            "--from",
+            "nginx",
+            "--dry-run",
+        ],
+        vec![
+            "image",
+            "tag",
+            "nginx",
+            "docker.io/library/nginx:latest",
+            "--dry-run",
+        ],
+    ] {
+        harness.json(&args, 0);
+    }
+}
+
+#[test]
 fn registry_configuration_does_not_require_decrypting_credentials() {
     let server = Server::new(|_| panic!("unreadable credentials must fail before a request"));
     let harness = Harness::new(&[(&server.host, true)]);

@@ -89,7 +89,7 @@ fn quiet_suppresses_plain_http_warnings_but_preserves_errors() {
             "off",
             "image",
             "digest",
-            "invalid",
+            "invalid@@",
         ],
         2,
     );
@@ -841,4 +841,168 @@ fn copy_conflict_is_reported_before_fetching_child_manifests() {
     );
     assert_eq!(result["error"]["code"], "CONFLICT");
     assert_eq!(children.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn signed_cross_origin_uploads_preserve_methods_and_strip_registry_credentials() {
+    use quayside::{
+        auth::Credential,
+        config::RegistryConfig,
+        digest::Digest,
+        registry::{Registry, UploadStart},
+    };
+    use std::sync::{Mutex, atomic::AtomicBool};
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let received_in = received.clone();
+    let (external, ca) = tls_server_with("127.0.0.1", false, move |request| {
+        assert!(!request.headers.contains_key("authorization"));
+        assert!(request.path.contains("signature=secret"));
+        if request.path.starts_with("/first") {
+            return Response::new(307, vec![]).header("Location", "/second?signature=secret");
+        }
+        if request.path.starts_with("/second") {
+            return Response::new(308, vec![]).header("Location", "/session?signature=secret");
+        }
+        received_in
+            .lock()
+            .unwrap()
+            .push((request.method.clone(), request.body.clone()));
+        match request.method.as_str() {
+            "PATCH" => Response::new(202, vec![]).header("Location", "/session?signature=secret"),
+            "GET" => Response::new(204, vec![])
+                .header("Location", "/session?signature=secret")
+                .header("Range", "0-3"),
+            "PUT" => Response::new(201, vec![]),
+            _ => panic!("unexpected method"),
+        }
+    });
+    let endpoint = format!("https://{}/first?signature=secret", external.host);
+    let origin = Server::new(move |request| {
+        if !request.headers.contains_key("authorization") {
+            return Response::new(401, vec![])
+                .header("WWW-Authenticate", "Basic realm=\"registry\"");
+        }
+        assert_eq!(request.method, "POST");
+        Response::new(202, vec![]).header("Location", &endpoint)
+    });
+    let mut harness = Harness::new(&[(&origin.host, true)]);
+    let ca_file = harness.root.path().join("external.pem");
+    fs::write(&ca_file, ca).unwrap();
+    harness.config.registries.insert(
+        external.host.clone(),
+        RegistryConfig {
+            ca_file: Some(ca_file),
+            ..Default::default()
+        },
+    );
+    let client = Registry::new(
+        &origin.host,
+        Arc::new(harness.config),
+        Some(Credential {
+            username: "alice".into(),
+            secret: "secret".into(),
+        }),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    let digest = Digest::sha256(b"data");
+    let UploadStart::Session { url, .. } = client.start_upload("app", &digest, None).await.unwrap()
+    else {
+        panic!("missing session")
+    };
+    let url = client
+        .patch_upload("app", url, 0, bytes::Bytes::from_static(b"data"))
+        .await
+        .unwrap();
+    let (url, position) = client.upload_status("app", url).await.unwrap();
+    assert_eq!(position, 4);
+    client.finish_upload("app", url, &digest).await.unwrap();
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![
+            ("PATCH".into(), b"data".to_vec()),
+            ("GET".into(), vec![]),
+            ("PUT".into(), vec![])
+        ]
+    );
+}
+
+#[test]
+fn missing_blobs_use_advertised_https_locations_but_permission_failures_do_not() {
+    for (status, corrupt) in [(404, false), (404, true), (403, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut image = image_layout(root.path(), 1, 4096);
+        let blobs = image.blobs.clone();
+        let (external, ca) = tls_server_with("127.0.0.1", false, move |request| {
+            assert!(!request.headers.contains_key("authorization"));
+            let digest = request
+                .path
+                .trim_start_matches('/')
+                .split('?')
+                .next()
+                .unwrap();
+            let mut body = blobs[digest].clone();
+            if corrupt && body.len() == 4096 {
+                body[0] ^= 1;
+            }
+            Response::new(200, body)
+        });
+        let mut value: serde_json::Value = serde_json::from_slice(&image.manifest).unwrap();
+        for field in ["config", "layers"] {
+            let entries = if field == "config" {
+                vec![&mut value[field]]
+            } else {
+                value[field].as_array_mut().unwrap().iter_mut().collect()
+            };
+            for d in entries {
+                d["urls"] = json!([format!(
+                    "https://{}/{}?signature=secret",
+                    external.host,
+                    d["digest"].as_str().unwrap()
+                )]);
+            }
+        }
+        // Shared descriptors can advertise extra locations only on a later occurrence.
+        let advertised = value["layers"][0].clone();
+        value["layers"][0].as_object_mut().unwrap().remove("urls");
+        value["layers"].as_array_mut().unwrap().push(advertised);
+        image.manifest = serde_json::to_vec(&value).unwrap();
+        let origin = Server::new(move |request| {
+            if request.path.contains("/manifests/") {
+                return Response::new(200, image.manifest.clone())
+                    .header("Content-Type", OCI_MANIFEST);
+            }
+            Response::new(status, vec![])
+        });
+        let mut harness = Harness::new(&[(&origin.host, true), (&external.host, false)]);
+        let path = harness.root.path().join("external.pem");
+        fs::write(&path, ca).unwrap();
+        harness
+            .config
+            .registries
+            .get_mut(&external.host)
+            .unwrap()
+            .ca_file = Some(path);
+        let output = harness.root.path().join("image.tar");
+        let result = harness.json(
+            &[
+                "image",
+                "pull",
+                &format!("{}/app:v1", origin.host),
+                "-o",
+                output.to_str().unwrap(),
+            ],
+            if status == 403 {
+                3
+            } else if corrupt {
+                7
+            } else {
+                0
+            },
+        );
+        if status == 403 {
+            assert_eq!(external.connections.load(Ordering::SeqCst), 0);
+        }
+        assert!(!result.to_string().contains("signature=secret"));
+    }
 }

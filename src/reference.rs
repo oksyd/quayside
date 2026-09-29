@@ -125,6 +125,23 @@ impl FromStr for Reference {
     }
 }
 impl Reference {
+    /// Parse a source reference, defaulting unqualified names to Docker Hub.
+    ///
+    /// A registry component contains a dot, a port, or uppercase letters, or is `localhost`.
+    /// Use an explicit port to distinguish a lowercase single-label registry from a Hub namespace.
+    pub fn parse_source(input: &str) -> Result<Self> {
+        let has_registry = input.split_once('/').is_some_and(|(first, _)| {
+            first == "localhost"
+                || first.contains(['.', ':'])
+                || first.chars().any(char::is_uppercase)
+        });
+        if has_registry {
+            input.parse()
+        } else {
+            format!("docker.io/{input}").parse()
+        }
+    }
+
     /// Return the selector as a digest when it is a supported digest rather than a tag.
     pub fn digest(&self) -> Option<Digest> {
         self.selector.parse().ok()
@@ -201,6 +218,73 @@ mod tests {
             "docker.io/alpine".parse::<Reference>().unwrap().repository,
             "library/alpine"
         );
+    }
+    #[test]
+    fn source_short_names_default_to_docker_hub() {
+        for (input, expected, explicit) in [
+            (
+                "apache/skywalking-banyandb:0.11.0",
+                "docker.io/apache/skywalking-banyandb:0.11.0",
+                true,
+            ),
+            ("nginx", "docker.io/library/nginx:latest", false),
+            ("nginx:alpine", "docker.io/library/nginx:alpine", true),
+            ("library/nginx", "docker.io/library/nginx:latest", false),
+            ("team/app", "docker.io/team/app:latest", false),
+        ] {
+            let reference = Reference::parse_source(input).unwrap();
+            assert_eq!(reference.to_string(), expected, "{input}");
+            assert_eq!(reference.explicit, explicit, "{input}");
+        }
+        let digest = Digest::sha256(b"image");
+        for input in [format!("nginx@{digest}"), format!("nginx:alpine@{digest}")] {
+            let reference = Reference::parse_source(&input).unwrap();
+            assert_eq!(
+                reference.to_string(),
+                format!("docker.io/library/nginx@{digest}")
+            );
+            assert_eq!(reference.digest(), Some(digest.clone()));
+            assert!(reference.explicit);
+        }
+    }
+    #[test]
+    fn source_explicit_registries_are_preserved() {
+        for input in [
+            "registry.example.com/team/app:v1",
+            "registry:5000/team/app:v1",
+            "localhost/team/app:v1",
+            "LOCALHOST/team/app:v1",
+            "REGISTRY/team/app:v1",
+            "127.0.0.1/team/app:v1",
+            "[::1]:5000/team/app:v1",
+            "docker.io/nginx:latest",
+            "index.docker.io/library/nginx:latest",
+            "registry-1.docker.io/library/nginx:latest",
+        ] {
+            assert_eq!(
+                Reference::parse_source(input).unwrap(),
+                input.parse().unwrap(),
+                "{input}"
+            );
+        }
+    }
+    #[test]
+    fn source_short_names_still_require_valid_repository_and_selector() {
+        for input in [
+            "",
+            "/nginx",
+            "apache/",
+            "apache//app:v1",
+            "apache/App:v1",
+            "nginx:",
+            "nginx@sha256:invalid",
+            "https://docker.io/nginx:latest",
+            "apache/../app:v1",
+            "nginx latest",
+            "nginx?tag=latest",
+        ] {
+            assert!(Reference::parse_source(input).is_err(), "{input}");
+        }
     }
     #[test]
     fn ipv6_host() {

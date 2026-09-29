@@ -12,6 +12,15 @@ use http::{Method, StatusCode};
 impl Registry {
     /// Fetch and parse a manifest while preserving its original bytes and checking a pinned digest.
     pub async fn get_manifest(&self, reference: &Reference) -> Result<Manifest> {
+        self.manifest_with_etag(reference)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    pub(super) async fn manifest_with_etag(
+        &self,
+        reference: &Reference,
+    ) -> Result<(Manifest, Option<HeaderValue>)> {
         self.validate_reference(reference)?;
         let mut headers = HeaderMap::new();
         headers.insert(header::ACCEPT, HeaderValue::from_static(ACCEPT_MANIFEST));
@@ -43,6 +52,7 @@ impl Registry {
             .and_then(|h| h.to_str().ok())
             .map(str::parse::<Digest>)
             .transpose()?;
+        let etag = response.headers().get(header::ETAG).cloned();
         let raw = limited_body(
             response,
             parse_size(&self.config().transfer.max_manifest_size)?,
@@ -52,7 +62,10 @@ impl Registry {
             d.verify(&raw)?;
         }
         let expected = reference.digest().or(header_digest);
-        Manifest::parse(raw, content_type.as_deref(), expected.as_ref())
+        Ok((
+            Manifest::parse(raw, content_type.as_deref(), expected.as_ref())?,
+            etag,
+        ))
     }
     /// Fetch a manifest, mapping only a not-found response to None.
     pub async fn manifest_optional(&self, reference: &Reference) -> Result<Option<Manifest>> {
@@ -64,12 +77,47 @@ impl Registry {
     }
     /// Publish original manifest bytes at the supplied reference after checking supported content.
     pub async fn put_manifest(&self, reference: &Reference, manifest: &Manifest) -> Result<()> {
-        self.validate_reference(reference)?;
         manifest.check_transfer_supported()?;
+        let subject = manifest.subject()?;
+        let headers = self
+            .put_manifest_raw(reference, manifest, HeaderMap::new())
+            .await?;
+        if let Some(subject) = subject {
+            match headers.get("oci-subject") {
+                Some(value) => {
+                    if value.to_str().ok() != Some(subject.digest.as_str()) {
+                        return Err(Error::integrity(
+                            "registry acknowledged a different subject digest",
+                        ));
+                    }
+                }
+                None => self
+                    .register_referrer(reference, manifest, &subject.digest)
+                    .await
+                    .map_err(|error| {
+                        Error::new(
+                            error.code,
+                            format!("referrer registration failed: {}", error.message),
+                        )
+                    })?,
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn put_manifest_raw(
+        &self,
+        reference: &Reference,
+        manifest: &Manifest,
+        mut headers: HeaderMap,
+    ) -> Result<HeaderMap> {
+        self.validate_reference(reference)?;
+        if manifest.raw.len() as u64 > parse_size(&self.config().transfer.max_manifest_size)? {
+            return Err(Error::input("manifest exceeds configured size limit"));
+        }
         if let Some(expected) = reference.digest() {
             expected.verify(&manifest.raw)?;
         }
-        let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_str(&manifest.descriptor.media_type)
@@ -100,6 +148,6 @@ impl Registry {
             let d: Digest = digest.parse()?;
             d.verify(&manifest.raw)?;
         }
-        Ok(())
+        Ok(response.headers().clone())
     }
 }

@@ -182,3 +182,43 @@ async fn upload_sessions_reject_foreign_origins_before_sending_payloads() {
     assert_eq!(foreign.connections.load(Ordering::SeqCst), 0);
     assert!(!changed.load(Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn referrer_discovery_distinguishes_missing_unauthorized_and_unsafe_pagination() {
+    for (status, link, expected) in [
+        (404, None, None),
+        (403, None, Some(Code::Forbidden)),
+        (500, None, Some(Code::Network)),
+        (
+            200,
+            Some("<https://other.example/referrers>; rel=\"next\""),
+            Some(Code::InvalidInput),
+        ),
+        (
+            200,
+            Some("<?page=again>; rel=\"next\""),
+            Some(Code::InvalidInput),
+        ),
+    ] {
+        let server = Server::new(move |request| {
+            if request.path.contains("/manifests/") {
+                assert_eq!(status, 404);
+                return Response::new(404, vec![]);
+            }
+            let mut response = Response::new(status, br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#.to_vec());
+            if let Some(link) = link {
+                response = response.header("Link", link);
+            }
+            response
+        });
+        let (registry, _) = client(&server);
+        let reference = format!("{}/app@{}", server.host, Digest::sha256(b"subject"))
+            .parse()
+            .unwrap();
+        let result = registry.list_referrers(&reference).await;
+        match expected {
+            Some(code) => rejected(result, code),
+            None => assert!(result.unwrap().is_empty()),
+        }
+    }
+}

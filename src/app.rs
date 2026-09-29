@@ -310,7 +310,7 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
         Command::Tag {
             command: TagCommand::Ls { repository },
         } => {
-            let r: Reference = repository.parse()?;
+            let r = Reference::parse_source(repository)?;
             r.require_repository()?;
             let tags = ctx.registry(&r.registry)?.list_tags(&r.repository).await?;
             let text = tags.join("\n");
@@ -322,7 +322,7 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
         Command::Manifest {
             command: ManifestCommand::Get { reference, raw },
         } => {
-            let r: Reference = reference.parse()?;
+            let r = Reference::parse_source(reference)?;
             let m = ctx.registry(&r.registry)?.get_manifest(&r).await?;
             if *raw {
                 Ok(Output {
@@ -427,7 +427,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             reference,
             platform,
         } => {
-            let r: Reference = reference.parse()?;
+            let r = Reference::parse_source(reference)?;
             let reg = ctx.registry(&r.registry)?;
             let (source_digest, digest) = if let Some(platform) = platform {
                 let resolved = transfer::resolve(&reg, &r, Some(platform)).await?;
@@ -446,7 +446,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             reference,
             platform,
         } => {
-            let r: Reference = reference.parse()?;
+            let r = Reference::parse_source(reference)?;
             let reg = ctx.registry(&r.registry)?;
             let resolved = transfer::resolve(&reg, &r, platform.as_deref()).await?;
             let m = &resolved.manifest;
@@ -472,21 +472,22 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             source,
             destination,
             selection,
+            transfer,
             write,
         } => {
-            let src: Reference = source.parse()?;
+            let src = Reference::parse_source(source)?;
             let dst = parse_destination(destination)?;
-            let data = transfer::copy(
+            let data = transfer::copy_with_options(
                 &ctx.registry(&src.registry)?,
                 &src,
                 &ctx.registry(&dst.registry)?,
                 &dst,
                 selection.platform.as_deref(),
                 &write.into(),
+                &transfer.into(),
                 &crate::progress::TerminalObserver::new(ctx.progress),
             )
             .await?;
-            ctx.warn("Independent referrers (signatures/SBOMs) were not copied.");
             let text = transfer_summary(Some(&data.target_digest), Some(&data.stats), data.dry_run);
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
@@ -495,19 +496,21 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             output,
             format,
             selection,
+            transfer,
             write,
         } => {
-            let r: Reference = reference.parse()?;
-            let data = layout::pull(
+            let r = Reference::parse_source(reference)?;
+            let data = layout::pull_with_options(
                 &ctx.registry(&r.registry)?,
                 &r,
                 output,
                 (*format).into(),
                 selection.platform.as_deref(),
                 &write.into(),
+                &transfer.into(),
+                &crate::progress::TerminalObserver::new(ctx.progress),
             )
             .await?;
-            ctx.warn("Independent referrers were not exported.");
             let text = transfer_summary(Some(&data.target_digest), None, data.dry_run);
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
@@ -520,16 +523,31 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         } => {
             let dst = parse_destination(destination)?;
             let target = ctx.registry(&dst.registry)?;
+            let observer = crate::progress::TerminalObserver::new(ctx.progress);
             let data = if *docker {
-                layout::push_docker(path, reference.as_deref(), &target, &dst, &write.into())
-                    .await?
+                layout::push_docker_with_observer(
+                    path,
+                    reference.as_deref(),
+                    &target,
+                    &dst,
+                    &write.into(),
+                    &observer,
+                )
+                .await?
             } else {
-                layout::push(path, reference.as_deref(), &target, &dst, &write.into()).await?
+                layout::push_with_observer(
+                    path,
+                    reference.as_deref(),
+                    &target,
+                    &dst,
+                    &write.into(),
+                    &observer,
+                )
+                .await?
             };
             if data.converted_from_docker_archive {
                 ctx.warn("Docker save archive converted to OCI; the original registry manifest digest is not preserved.");
             }
-            ctx.warn("Only the selected image dependency graph was pushed; no signature trust verification was performed.");
             let text = transfer_summary(Some(&data.target_digest), Some(&data.stats), data.dry_run);
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
@@ -538,7 +556,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             destination,
             write,
         } => {
-            let src: Reference = source.parse()?;
+            let src = Reference::parse_source(source)?;
             let dst = parse_destination(destination)?;
             if src.registry != dst.registry || src.repository != dst.repository {
                 return Err(Error::input(
@@ -577,7 +595,7 @@ async fn index_create(
     let mut seen_sources = BTreeSet::new();
     let mut blob_sizes = BTreeMap::new();
     for source in sources {
-        let r: Reference = source.parse()?;
+        let r = Reference::parse_source(source)?;
         if !seen_sources.insert(r.to_string()) {
             continue;
         }
@@ -661,7 +679,6 @@ async fn index_create(
         transfer::publish_children(&target, &dst, &graph).await?;
         transfer::publish_root(&target, &dst, index, write.overwrite).await?;
     }
-    ctx.warn("Independent referrers were not copied. Input images were not deleted.");
     let data = json!({"destination":dst.to_string(),"target_digest":index.digest(),"platforms":inputs.keys().collect::<Vec<_>>(),
         "stats":stats,"dry_run":write.dry_run,"referrers":"not-copied"});
     let text = transfer_summary(Some(index.digest()), Some(&stats), write.dry_run);

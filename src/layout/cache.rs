@@ -48,12 +48,27 @@ impl<'a> DockerCache<'a> {
     pub(crate) async fn prepare(&self, budget: &Arc<Budget>) {
         self.archive
             .get_or_init(|| async {
-                match self.load(budget).await {
-                    Ok(archive) => archive,
-                    Err(_) => {
+                let timeout = duration(&self.limits.docker_cache_timeout).ok()?;
+                if timeout.is_zero() {
+                    return None;
+                }
+                // Bound the entire preparation, including continuously streaming exports.
+                // Cache failure is remembered for this copy so workers do not retry it.
+                match tokio::time::timeout(timeout, self.load(budget)).await {
+                    Ok(Ok(archive)) => archive,
+                    Ok(Err(_)) => {
                         log(
                             Level::Debug,
                             format_args!("Docker cache unavailable; using registry downloads"),
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        log(
+                            Level::Debug,
+                            format_args!(
+                                "Docker cache preparation timed out; using registry downloads"
+                            ),
                         );
                         None
                     }

@@ -46,6 +46,8 @@ pub struct TransferConfig {
     pub metadata_timeout: String,
     /// Request timeout configured on the HTTP client, including streaming requests.
     pub idle_timeout: String,
+    /// Total time allowed to prepare the optional Docker cache; zero disables it.
+    pub docker_cache_timeout: String,
     /// Maximum allowed size of an individual manifest or bounded metadata payload.
     pub max_manifest_size: String,
     /// Maximum cumulative manifest metadata held for a dependency graph.
@@ -58,6 +60,8 @@ pub struct TransferConfig {
     pub max_archive_size: String,
     /// Shared temporary-file storage budget for active transfer workers.
     pub max_temp_size: String,
+    /// Optional private directory for --resume state; defaults to the user's cache directory.
+    pub resume_dir: Option<PathBuf>,
 }
 impl Default for TransferConfig {
     fn default() -> Self {
@@ -68,12 +72,14 @@ impl Default for TransferConfig {
             connect_timeout: "10s".into(),
             metadata_timeout: "60s".into(),
             idle_timeout: "60s".into(),
+            docker_cache_timeout: "2s".into(),
             max_manifest_size: "8MiB".into(),
             max_metadata_size: "64MiB".into(),
             max_objects: 10_000,
             max_depth: 32,
             max_archive_size: "1TiB".into(),
             max_temp_size: "64GiB".into(),
+            resume_dir: None,
         }
     }
 }
@@ -133,6 +139,7 @@ impl Config {
                 return Err(Error::input("timeouts must be positive"));
             }
         }
+        duration(&t.docker_cache_timeout)?;
         let manifest = parse_size(&t.max_manifest_size)?;
         let metadata = parse_size(&t.max_metadata_size)?;
         if !(1024..=64 * 1024 * 1024).contains(&manifest)
@@ -206,6 +213,18 @@ mod tests {
     #[test]
     fn valid_defaults() {
         Config::default().validate().unwrap();
+    }
+    #[test]
+    fn docker_cache_deadline_is_optional_and_accepts_zero_to_disable() {
+        let mut config: Config = toml::from_str("version = 1").unwrap();
+        assert_eq!(
+            duration(&config.transfer.docker_cache_timeout).unwrap(),
+            Duration::from_secs(2)
+        );
+        config.transfer.docker_cache_timeout = "0s".into();
+        config.validate().unwrap();
+        config.transfer.docker_cache_timeout = "invalid".into();
+        assert!(config.validate().is_err());
     }
     #[test]
     fn rejects_unknown_config_key() {

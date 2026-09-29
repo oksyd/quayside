@@ -9,7 +9,10 @@ use quayside::{
     transfer::transfer_remote_blobs,
 };
 use serde_json::json;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, atomic::AtomicBool},
+};
 
 #[derive(Clone, Default)]
 struct Outcomes(Arc<Mutex<Vec<BlobOutcome>>>);
@@ -148,4 +151,194 @@ async fn completion_reports_verified_outcomes_and_never_finishes_failed_uploads(
     assert_eq!(*outcomes.0.lock().unwrap(), [BlobOutcome::Mounted]);
     assert_eq!(stats.mounted_blobs, 1);
     assert_eq!(stats.copied_blobs, 0);
+}
+
+#[derive(Default)]
+struct Events {
+    stages: Vec<Phase>,
+    blobs: BTreeMap<String, BlobEvents>,
+}
+#[derive(Default)]
+struct BlobEvents {
+    size: u64,
+    phases: Vec<BlobPhase>,
+    position: u64,
+    outcome: Option<BlobOutcome>,
+}
+#[derive(Clone, Default)]
+struct Recording(Arc<Mutex<Events>>);
+struct RecordedBlob(Recording, String);
+impl Observer for Recording {
+    fn begin(&self, phase: Phase, _: usize) -> Box<dyn Operation> {
+        self.0.lock().unwrap().stages.push(phase);
+        Box::new(self.clone())
+    }
+}
+impl Operation for Recording {
+    fn blob(&self, digest: String, size: u64) -> Box<dyn BlobProgress> {
+        self.0.lock().unwrap().blobs.insert(
+            digest.clone(),
+            BlobEvents {
+                size,
+                ..Default::default()
+            },
+        );
+        Box::new(RecordedBlob(self.clone(), digest))
+    }
+}
+impl BlobProgress for RecordedBlob {
+    fn phase(&self, phase: BlobPhase) {
+        self.0
+            .0
+            .lock()
+            .unwrap()
+            .blobs
+            .get_mut(&self.1)
+            .unwrap()
+            .phases
+            .push(phase);
+    }
+    fn position(&self, position: u64) {
+        let mut events = self.0.0.lock().unwrap();
+        let blob = events.blobs.get_mut(&self.1).unwrap();
+        assert!(position <= blob.size);
+        blob.position = position;
+    }
+    fn finish(&self) {
+        panic!("expected a specific transfer outcome");
+    }
+    fn finish_with(&self, outcome: BlobOutcome) {
+        let mut events = self.0.0.lock().unwrap();
+        let blob = events.blobs.get_mut(&self.1).unwrap();
+        assert!(
+            blob.outcome.replace(outcome).is_none(),
+            "duplicate completion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pull_and_push_observe_verified_bytes_plans_skips_and_failures() {
+    use quayside::{
+        layout,
+        options::{ArchiveFormat, WriteOptions},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let image = crate::support::image_layout(&root.path().join("source"), 2, 8192);
+    let count = image.blobs.len();
+    let source = Server::new(move |request| {
+        if request.path.contains("/manifests/") {
+            Response::new(200, image.manifest.clone()).header("Content-Type", OCI_MANIFEST)
+        } else {
+            Response::new(
+                200,
+                image.blobs[request.path.rsplit('/').next().unwrap()].clone(),
+            )
+        }
+    });
+    let source_client = client(&source);
+    let reference = format!("{}/app:v1", source.host).parse().unwrap();
+    let write = WriteOptions::default();
+    let dry = WriteOptions {
+        dry_run: true,
+        ..write
+    };
+    for (index, format) in [ArchiveFormat::OciLayout, ArchiveFormat::OciArchive]
+        .into_iter()
+        .enumerate()
+    {
+        let path = root.path().join(format!("export-{index}"));
+        let planned = Recording::default();
+        layout::pull_with_observer(
+            &source_client,
+            &reference,
+            &path,
+            format,
+            None,
+            &dry,
+            &planned,
+        )
+        .await
+        .unwrap();
+        assert!(!path.exists());
+        assert!(
+            planned
+                .0
+                .lock()
+                .unwrap()
+                .blobs
+                .values()
+                .all(|b| b.outcome == Some(BlobOutcome::Planned) && b.phases.is_empty())
+        );
+
+        let pulled = Recording::default();
+        layout::pull_with_observer(
+            &source_client,
+            &reference,
+            &path,
+            format,
+            None,
+            &write,
+            &pulled,
+        )
+        .await
+        .unwrap();
+        {
+            let events = pulled.0.lock().unwrap();
+            assert_eq!(
+                events.stages,
+                [Phase::Resolving, Phase::Pulling, Phase::Saving]
+            );
+            assert_eq!(events.blobs.len(), count);
+            for blob in events.blobs.values() {
+                assert!(blob.phases.contains(&BlobPhase::Downloading));
+                assert_eq!(blob.position, blob.size);
+                assert_eq!(blob.outcome, Some(BlobOutcome::Downloaded));
+            }
+        }
+        let target = destination(|_| true);
+        let target_client = client(&target);
+        let dst = format!("{}/app:v1", target.host).parse().unwrap();
+        for (write, outcome) in [
+            (&dry, BlobOutcome::Planned),
+            (&write, BlobOutcome::Uploaded),
+            (&write, BlobOutcome::AlreadyExists),
+        ] {
+            let recorded = Recording::default();
+            layout::push_with_observer(&path, None, &target_client, &dst, write, &recorded)
+                .await
+                .unwrap();
+            let events = recorded.0.lock().unwrap();
+            assert_eq!(events.blobs.len(), count);
+            assert!(events.stages.contains(&Phase::VerifyingLocal));
+            assert_eq!(events.stages.contains(&Phase::Publishing), !write.dry_run);
+            for blob in events.blobs.values() {
+                assert_eq!(blob.outcome, Some(outcome));
+                assert_eq!(
+                    blob.phases.contains(&BlobPhase::Uploading),
+                    outcome == BlobOutcome::Uploaded
+                );
+                if outcome == BlobOutcome::Uploaded {
+                    assert_eq!(blob.position, blob.size);
+                }
+            }
+        }
+        let failed = destination_with_commit(|_| true, || false);
+        let recorded = Recording::default();
+        assert!(
+            layout::push_with_observer(
+                &path,
+                None,
+                &client(&failed),
+                &format!("{}/app:v1", failed.host).parse().unwrap(),
+                &write,
+                &recorded
+            )
+            .await
+            .is_err()
+        );
+        let events = recorded.0.lock().unwrap();
+        assert!(!events.stages.contains(&Phase::Publishing));
+        assert!(events.blobs.values().all(|b| b.outcome.is_none()));
+    }
 }

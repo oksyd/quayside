@@ -2,6 +2,8 @@
 mod docker_cache;
 #[path = "transfer_pipeline/progress.rs"]
 mod progress;
+#[path = "transfer_pipeline/resume.rs"]
+mod resume;
 mod support;
 
 use quayside::digest::Digest;

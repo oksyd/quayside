@@ -136,6 +136,12 @@ case "$2" in
     [ "$3" = -- ] && [ "$4" = "$DOCKER_IMAGE_ID" ] || exit 23
     [ "$DOCKER_BEHAVIOR" = export_failure ] && exit 1
     [ "$DOCKER_BEHAVIOR" = export_timeout ] && exec sleep 30
+    if [ "$DOCKER_BEHAVIOR" = export_busy ]; then
+      while :; do
+        printf '%0512d' 0
+        sleep 0.05
+      done
+    fi
     cat "$DOCKER_ARCHIVE"
     ;;
   *) exit 24 ;;
@@ -368,4 +374,28 @@ fn malformed_docker_exports_fall_back_before_uploading_unverified_bytes() {
     .unwrap();
     let result = fixture.run(&bin, "", &[]);
     assert_eq!(result["data"]["stats"]["reused_blobs"], 0);
+}
+
+#[test]
+fn cache_preparation_deadline_bounds_streaming_exports_and_can_disable_probing() {
+    for disabled in [false, true] {
+        let mut fixture = Fixture::new(false);
+        fixture.harness.config.transfer.docker_cache_timeout =
+            if disabled { "0s" } else { "400ms" }.into();
+        let bin = fixture.docker(&fixture.local);
+        let start = Instant::now();
+        let result = fixture.run(&bin, "export_busy", &[]);
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "cache preparation blocked downloads"
+        );
+        assert_eq!(result["data"]["stats"]["reused_blobs"], 0);
+        assert_eq!(fixture.reads.lock().unwrap().values().sum::<usize>(), 4);
+        let calls = fixture.harness.root.path().join("calls");
+        if disabled {
+            assert!(!calls.exists());
+        } else {
+            assert_eq!(fs::read_to_string(calls).unwrap(), "inspect\nsave\n");
+        }
+    }
 }

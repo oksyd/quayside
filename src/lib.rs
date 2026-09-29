@@ -28,6 +28,7 @@ mod proxy;
 /// Registry, repository, tag and digest reference parsing.
 pub mod reference;
 pub mod registry;
+mod resume;
 pub mod storage;
 mod temporary;
 /// Platform selection, verified blob copying and manifest publication.

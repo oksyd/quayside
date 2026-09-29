@@ -42,7 +42,11 @@ pub async fn resolve(
         let platforms = root
             .children()?
             .iter()
-            .filter_map(|d| d.platform.as_ref().map(ToString::to_string))
+            .filter_map(|d| d.platform.as_ref())
+            .filter(|p| p.os != "unknown" && p.architecture != "unknown")
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         return Ok(Resolved {
             source_digest: original,

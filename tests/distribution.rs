@@ -5,6 +5,96 @@ use support::{Harness, image_layout, image_layout_for};
 
 #[test]
 #[ignore = "requires QUAYSIDE_TEST_SOURCE and QUAYSIDE_TEST_TARGET disposable HTTP registries"]
+fn distribution_attested_index_round_trip() {
+    let source = env::var("QUAYSIDE_TEST_SOURCE").unwrap();
+    let target = env::var("QUAYSIDE_TEST_TARGET").unwrap();
+    let harness = Harness::new(&[(&source, true), (&target, true)]);
+    let image = support::attested_layout(harness.root.path());
+    let repository = format!("quayside-{}/attested", std::process::id());
+    let src = format!("{source}/{repository}:v1");
+    let dst = format!("{target}/{repository}:v1");
+    harness.json(
+        &["image", "push", image.directory.to_str().unwrap(), &src],
+        0,
+    );
+    // Leave proofs registered but remove them from the root index, so discovery is required.
+    let mut value: serde_json::Value = serde_json::from_slice(&image.manifest).unwrap();
+    value["manifests"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|d| d["platform"]["os"] != "unknown");
+    let raw = serde_json::to_vec(&value).unwrap();
+    let digest = quayside::digest::Digest::sha256(&raw);
+    fs::write(
+        image.directory.join("blobs/sha256").join(digest.encoded()),
+        &raw,
+    )
+    .unwrap();
+    let index = serde_json::json!({"schemaVersion":2,"mediaType":quayside::model::OCI_INDEX,"manifests":[{"mediaType":quayside::model::OCI_INDEX,"digest":digest,"size":raw.len()}]});
+    fs::write(
+        image.directory.join("index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    harness.json(
+        &[
+            "image",
+            "push",
+            image.directory.to_str().unwrap(),
+            &src,
+            "--overwrite",
+        ],
+        0,
+    );
+    for _ in 0..2 {
+        let copied = harness.json(
+            &[
+                "image",
+                "copy",
+                &src,
+                &dst,
+                "--referrers",
+                "all",
+                "--resume",
+            ],
+            0,
+        );
+        assert_eq!(copied["data"]["target_digest"], digest.to_string());
+    }
+    let output = harness.root.path().join("pulled");
+    harness.json(
+        &[
+            "image",
+            "pull",
+            &dst,
+            "--output",
+            output.to_str().unwrap(),
+            "--referrers",
+            "all",
+            "--resume",
+            "--format",
+            "oci-layout",
+        ],
+        0,
+    );
+    for (digest, original) in &image.blobs {
+        assert_eq!(
+            fs::read(
+                output
+                    .join("blobs/sha256")
+                    .join(digest.strip_prefix("sha256:").unwrap())
+            )
+            .unwrap(),
+            *original
+        );
+    }
+    let restored = format!("{source}/{repository}:restored");
+    let result = harness.json(&["image", "push", output.to_str().unwrap(), &restored], 0);
+    assert_eq!(result["data"]["target_digest"], digest.to_string());
+}
+
+#[test]
+#[ignore = "requires QUAYSIDE_TEST_SOURCE and QUAYSIDE_TEST_TARGET disposable HTTP registries"]
 fn distribution_round_trip_copy_limits_and_mount() {
     let source = env::var("QUAYSIDE_TEST_SOURCE").expect("set QUAYSIDE_TEST_SOURCE=127.0.0.1:port");
     let target = env::var("QUAYSIDE_TEST_TARGET").expect("set QUAYSIDE_TEST_TARGET=127.0.0.1:port");

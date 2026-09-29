@@ -19,7 +19,7 @@ pub(crate) async fn publish_children(
     graph: &Graph,
 ) -> Result<()> {
     // Publishing the root at the final reference also makes it addressable by digest.
-    publish_graph(target, destination, graph, false).await
+    publish_graph(target, destination, graph, !graph.referrers.is_empty()).await
 }
 
 async fn publish_graph(
@@ -97,7 +97,12 @@ async fn publish_one(
 ) -> Result<crate::digest::Digest> {
     let pinned = destination.pinned(manifest.digest());
     match target.manifest_optional(&pinned).await? {
-        Some(existing) if existing.raw == manifest.raw => {}
+        Some(existing) if existing.raw == manifest.raw => {
+            // A previous attempt may have stored the bytes but failed to register the subject.
+            if manifest.subject()?.is_some() {
+                target.put_manifest(&pinned, manifest).await?;
+            }
+        }
         Some(_) => {
             return Err(Error::integrity(
                 "registry returned different manifest bytes for a digest",
@@ -116,7 +121,7 @@ pub async fn publish_root(
     overwrite: bool,
 ) -> Result<()> {
     // Recheck immediately before publishing the tag. This still cannot replace server-side CAS.
-    if check_destination(target, destination, root, overwrite).await? {
+    if check_destination(target, destination, root, overwrite).await? && root.subject()?.is_none() {
         return Ok(());
     }
     target.put_manifest(destination, root).await?;

@@ -217,6 +217,37 @@ pub struct Selection {
     #[arg(long)]
     pub platform: Option<String>,
 }
+/// Additional transfer behavior for remote sources.
+#[derive(Debug, Clone, Default, Args)]
+pub struct TransferOptions {
+    /// Discover and copy independent signatures, SBOMs and other referrers.
+    #[arg(long, value_enum, default_value = "none")]
+    pub referrers: ReferrerMode,
+    /// Preserve indexed attestations with the selected platform (creates a filtered index).
+    #[arg(long, requires = "platform")]
+    pub include_attestations: bool,
+    /// Resume unfinished blob transfers across invocations using the private cache directory.
+    #[arg(long)]
+    pub resume: bool,
+}
+/// Whether remote transfers discover independently attached artifacts.
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum ReferrerMode {
+    /// Copy only the selected forward dependency graph.
+    #[default]
+    None,
+    /// Recursively include associated artifacts discovered through OCI referrers.
+    All,
+}
+impl From<&TransferOptions> for crate::options::TransferOptions {
+    fn from(value: &TransferOptions) -> Self {
+        Self {
+            referrers: matches!(value.referrers, ReferrerMode::All),
+            include_attestations: value.include_attestations,
+            resume: value.resume,
+        }
+    }
+}
 /// CLI flags controlling planning and destination replacement.
 #[derive(Debug, Clone, Default, Args)]
 pub struct WriteOptions {
@@ -256,13 +287,16 @@ pub enum ImageCommand {
     },
     /// Copy the selected dependency graph between registry references.
     Copy {
-        /// Source registry reference.
+        /// Source image reference; unqualified names default to Docker Hub.
         source: String,
         /// Fully qualified destination reference with an explicit tag or digest.
         destination: String,
         /// Platform selection options.
         #[command(flatten)]
         selection: Selection,
+        /// Referrer discovery, attestation retention and transfer recovery.
+        #[command(flatten)]
+        transfer: TransferOptions,
         /// Dry-run and overwrite policy for this operation.
         #[command(flatten)]
         write: WriteOptions,
@@ -280,6 +314,9 @@ pub enum ImageCommand {
         /// Platform selection options.
         #[command(flatten)]
         selection: Selection,
+        /// Referrer discovery, attestation retention and transfer recovery.
+        #[command(flatten)]
+        transfer: TransferOptions,
         /// Dry-run and overwrite policy for this operation.
         #[command(flatten)]
         write: WriteOptions,

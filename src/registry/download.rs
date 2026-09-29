@@ -6,8 +6,8 @@ use crate::observer::{BlobPhase, BlobProgress};
 use crate::reference::validate_repository;
 use crate::{Error, Result};
 use futures_util::{StreamExt, stream};
+use http::StatusCode;
 use http::header::{self, HeaderMap, HeaderValue};
-use http::{Method, StatusCode};
 use reqx::ResponseStream as Response;
 use std::ops::Range;
 use std::path::Path;
@@ -49,10 +49,26 @@ impl Registry {
         progress: &dyn BlobProgress,
         slots: Arc<Semaphore>,
     ) -> Result<()> {
+        self.download_resumable(repo, d, output, progress, slots, None)
+            .await
+    }
+
+    pub(crate) async fn download_resumable(
+        &self,
+        repo: &str,
+        d: &Descriptor,
+        output: &Path,
+        progress: &dyn BlobProgress,
+        slots: Arc<Semaphore>,
+        resume: Option<&crate::resume::Blob>,
+    ) -> Result<()> {
         validate_repository(repo)?;
         progress.phase(BlobPhase::Downloading);
         if let Some(raw) = d.embedded()?.or(self.cached_blob(repo, d).await?) {
             tokio::fs::write(output, &raw).await?;
+            if let Some(resume) = resume {
+                resume.downloaded(d.size)?;
+            }
             progress.position(d.size);
             return Ok(());
         }
@@ -62,26 +78,61 @@ impl Registry {
             descriptor: d,
             progress,
             slots,
+            resume,
         };
-        let ranges = ranges(d.size, self.config().transfer.concurrency);
-        let mut first = None;
-        if ranges.len() > 1 {
-            let response = download.request(Some(ranges[0].clone())).await?;
-            match response.0.status() {
-                StatusCode::PARTIAL_CONTENT => {
-                    if download.parallel(output, ranges, response).await? {
-                        return Ok(());
-                    }
-                    progress.phase(BlobPhase::Downloading);
-                    progress.position(0);
-                }
-                // Consume the full response directly when the server ignores Range.
-                StatusCode::OK => first = Some(response),
-                status if range_unsupported(status) => {}
-                _ => return Err(http_error(&response.0)),
-            }
+        let saved = resume.map(|r| r.saved_ranges()).unwrap_or_default();
+        let ranges = if saved.is_empty() {
+            ranges(d.size, self.config().transfer.concurrency)
+        } else {
+            saved
+        };
+        if let Some(resume) = resume {
+            resume.ranges(&ranges)?;
         }
-        download.sequential(output, first).await
+        let result = async {
+            if ranges.len() > 1
+                && resume
+                    .is_some_and(|r| ranges.iter().any(|part| r.offset(part.start) > part.start))
+            {
+                if download.parallel(output, ranges.clone(), None).await? {
+                    return Ok(());
+                }
+                if let Some(resume) = resume {
+                    resume.ranges(std::slice::from_ref(&(0..d.size)))?;
+                }
+                return download.sequential(output, None).await;
+            }
+            let mut first = None;
+            if ranges.len() > 1 {
+                let response = download.request(Some(ranges[0].clone())).await?;
+                match response.0.status() {
+                    StatusCode::PARTIAL_CONTENT => {
+                        if download.parallel(output, ranges, Some(response)).await? {
+                            return Ok(());
+                        }
+                        progress.phase(BlobPhase::Downloading);
+                        progress.position(0);
+                    }
+                    // Consume the full response directly when the server ignores Range.
+                    StatusCode::OK => first = Some(response),
+                    status if range_unsupported(status) => {}
+                    _ => return Err(http_error(&response.0)),
+                }
+            }
+            if let Some(resume) = resume {
+                resume.ranges(std::slice::from_ref(&(0..d.size)))?;
+            }
+            download.sequential(output, first).await
+        }
+        .await;
+        if result
+            .as_ref()
+            .is_err_and(|e| e.code == crate::error::Code::Integrity)
+            && let Some(resume) = resume
+        {
+            resume.reset()?;
+        }
+        result
     }
 }
 
@@ -91,6 +142,7 @@ struct Download<'a> {
     descriptor: &'a Descriptor,
     progress: &'a dyn BlobProgress,
     slots: Arc<Semaphore>,
+    resume: Option<&'a crate::resume::Blob>,
 }
 
 impl Download<'_> {
@@ -109,20 +161,9 @@ impl Download<'_> {
                     .map_err(|_| Error::input("invalid download range"))?,
             );
         }
-        let (response, _) = self
+        let response = self
             .registry
-            .request(
-                Method::GET,
-                self.registry.url(&format!(
-                    "v2/{}/blobs/{}",
-                    self.repo, self.descriptor.digest
-                ))?,
-                &Registry::scope(self.repo, "pull"),
-                headers,
-                None,
-                true,
-                true,
-            )
+            .blob_response(self.repo, self.descriptor, headers, true)
             .await?;
         Ok((response, permit))
     }
@@ -130,15 +171,40 @@ impl Download<'_> {
     async fn sequential(&self, output: &Path, mut first: Option<DownloadResponse>) -> Result<()> {
         let d = self.descriptor;
         // The copy pipeline needs a readable file, not crash-durable temporary storage.
-        let mut file =
-            BufWriter::with_capacity(1024 * 1024, tokio::fs::File::create(output).await?);
+        let mut file = BufWriter::with_capacity(
+            1024 * 1024,
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(self.resume.is_none())
+                .open(output)
+                .await?,
+        );
         let mut hasher = d.digest.hasher();
-        let mut count = 0u64;
+        let mut count = self.resume.map_or(0, |r| r.offset(0));
+        if count > 0 {
+            let mut prefix = tokio::fs::File::open(output).await?.take(count);
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let n = prefix.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+            }
+            file.seek(std::io::SeekFrom::Start(count)).await?;
+            self.progress.position(count);
+        }
         let mut attempt = 0;
         loop {
             let result = self
                 .download_once(&mut file, &mut hasher, &mut count, first.take())
                 .await;
+            if let Some(resume) = self.resume {
+                file.flush().await?;
+                file.get_ref().sync_data().await?;
+                resume.checkpoint(0, count)?;
+            }
             match result {
                 Ok(()) => break,
                 Err(e)
@@ -181,6 +247,9 @@ impl Download<'_> {
                     file.seek(std::io::SeekFrom::Start(0)).await?;
                     *hasher = d.digest.hasher();
                     *count = 0;
+                    if let Some(resume) = self.resume {
+                        resume.checkpoint(0, 0)?;
+                    }
                     progress.position(0);
                 }
             }
@@ -223,6 +292,13 @@ impl Download<'_> {
             hasher.update(&buffer[..size]);
             *count = next;
             progress.position(*count);
+            if let Some(resume) = self.resume
+                && *count - resume.offset(0) >= 4 * 1024 * 1024
+            {
+                file.flush().await?;
+                file.get_ref().sync_data().await?;
+                resume.checkpoint(0, *count)?;
+            }
         }
         if *count != d.size {
             return Err(Error::network(
@@ -238,20 +314,41 @@ impl Download<'_> {
         &self,
         output: &Path,
         ranges: Vec<Range<u64>>,
-        first: DownloadResponse,
+        first: Option<DownloadResponse>,
     ) -> Result<bool> {
-        tokio::fs::File::create(output)
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(self.resume.is_none())
+            .open(output)
             .await?
             .set_len(self.descriptor.size)
             .await?;
-        let completed = Mutex::new(0u64);
-        let mut first = Some(first);
+        let completed = Mutex::new(
+            ranges
+                .iter()
+                .map(|range| {
+                    self.resume
+                        .map_or(0, |r| r.offset(range.start) - range.start)
+                })
+                .sum(),
+        );
+        let mut first = first;
         let mut parts = stream::iter(ranges)
             .map(|range| self.part(output, range, first.take(), &completed))
             .buffer_unordered(self.registry.config().transfer.concurrency);
         let mut supported = true;
+        let mut failure = None;
         while let Some(result) = parts.next().await {
-            supported &= result?;
+            match result {
+                Ok(value) => supported &= value,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         // Finish and flush every writer before reusing the same inode for a fallback.
         // Dropping Tokio file futures alone does not wait for their background writes.
@@ -290,11 +387,18 @@ impl Download<'_> {
         mut first: Option<DownloadResponse>,
         completed: &Mutex<u64>,
     ) -> Result<bool> {
-        let mut offset = range.start;
+        let mut offset = self.resume.map_or(range.start, |r| r.offset(range.start));
         let mut attempt = 0;
         while offset < range.end {
             let result = self
-                .part_once(output, &mut offset, range.end, first.take(), completed)
+                .part_once(
+                    output,
+                    range.start,
+                    &mut offset,
+                    range.end,
+                    first.take(),
+                    completed,
+                )
                 .await;
             match result {
                 Ok(false) => return Ok(false),
@@ -315,6 +419,7 @@ impl Download<'_> {
     async fn part_once(
         &self,
         output: &Path,
+        start: u64,
         offset: &mut u64,
         end: u64,
         first: Option<DownloadResponse>,
@@ -356,9 +461,13 @@ impl Download<'_> {
         );
         file.seek(std::io::SeekFrom::Start(*offset)).await?;
         let result = self
-            .read_part(&mut response, &mut file, offset, end, completed)
+            .read_part(&mut response, &mut file, start, offset, end, completed)
             .await;
         file.flush().await?;
+        if let Some(resume) = self.resume {
+            file.get_ref().sync_data().await?;
+            resume.checkpoint(start, *offset)?;
+        }
         result
     }
 
@@ -366,6 +475,7 @@ impl Download<'_> {
         &self,
         response: &mut Response,
         file: &mut BufWriter<tokio::fs::File>,
+        start: u64,
         offset: &mut u64,
         end: u64,
         completed: &Mutex<u64>,
@@ -387,6 +497,13 @@ impl Download<'_> {
             }
             file.write_all(&buffer[..size]).await?;
             *offset = next;
+            if let Some(resume) = self.resume
+                && *offset - resume.offset(start) >= 4 * 1024 * 1024
+            {
+                file.flush().await?;
+                file.get_ref().sync_data().await?;
+                resume.checkpoint(start, *offset)?;
+            }
             // Serialize callbacks so concurrent parts never report progress out of order.
             let mut count = completed.lock().expect("download progress lock poisoned");
             *count += size as u64;

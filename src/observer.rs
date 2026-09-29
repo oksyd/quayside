@@ -1,7 +1,7 @@
 //! Optional operation observation. Implementations own presentation and cleanup.
 //! Dropping an operation ends observation, including on errors and cancellation.
 /// Operation-level stages reported independently of terminal presentation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Resolving the source manifest and dependency graph.
     Resolving,
@@ -9,13 +9,25 @@ pub enum Phase {
     CheckingDestination,
     /// Processing the remote blob dependency set.
     Copying,
+    /// Downloading payloads to a local layout or archive.
+    Pulling,
+    /// Uploading payloads from a local layout or archive.
+    Pushing,
+    /// Opening and selecting a local image layout or archive.
+    ReadingLocal,
+    /// Verifying the selected local dependency graph before remote writes.
+    VerifyingLocal,
+    /// Exporting an explicitly requested image from the Docker daemon.
+    ExportingDocker,
+    /// Writing the final local layout or archive.
+    Saving,
     /// Inspecting the blob dependency set without performing writes.
     Planning,
     /// Publishing and verifying dependency and root manifests.
     Publishing,
 }
 /// Stages within one blob transfer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlobPhase {
     /// Receiving payload bytes from the source registry.
     Downloading,
@@ -34,6 +46,10 @@ pub enum BlobPhase {
 pub enum BlobOutcome {
     /// Uploaded and verified at the destination.
     Copied,
+    /// Downloaded and verified in local staging storage.
+    Downloaded,
+    /// Uploaded from local storage and verified at the destination.
+    Uploaded,
     /// Uploaded using verified payload bytes from the local Docker cache.
     Reused,
     /// Verified as already present at the destination.
