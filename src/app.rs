@@ -477,17 +477,26 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         } => {
             let src = Reference::parse_source(source)?;
             let dst = parse_destination(destination)?;
-            let data = transfer::copy_with_options(
-                &ctx.registry(&src.registry)?,
+            let source = ctx.registry(&src.registry)?;
+            let target = ctx.registry(&dst.registry)?;
+            let observer = crate::progress::TerminalObserver::new(
+                ctx.progress,
+                src.to_string(),
+                crate::observer::Phase::Copying,
+            );
+            let result = transfer::copy_with_options(
+                &source,
                 &src,
-                &ctx.registry(&dst.registry)?,
+                &target,
                 &dst,
                 selection.platform.as_deref(),
                 &write.into(),
                 &transfer.into(),
-                &crate::progress::TerminalObserver::new(ctx.progress),
+                &observer,
             )
-            .await?;
+            .await;
+            observer.complete(&result);
+            let data = result?;
             let text = transfer_summary(Some(&data.target_digest), Some(&data.stats), data.dry_run);
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
@@ -500,17 +509,25 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             write,
         } => {
             let r = Reference::parse_source(reference)?;
-            let data = layout::pull_with_options(
-                &ctx.registry(&r.registry)?,
+            let source = ctx.registry(&r.registry)?;
+            let observer = crate::progress::TerminalObserver::new(
+                ctx.progress,
+                r.to_string(),
+                crate::observer::Phase::Pulling,
+            );
+            let result = layout::pull_with_options(
+                &source,
                 &r,
                 output,
                 (*format).into(),
                 selection.platform.as_deref(),
                 &write.into(),
                 &transfer.into(),
-                &crate::progress::TerminalObserver::new(ctx.progress),
+                &observer,
             )
-            .await?;
+            .await;
+            observer.complete(&result);
+            let data = result?;
             let text = transfer_summary(Some(&data.target_digest), None, data.dry_run);
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
@@ -523,8 +540,12 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         } => {
             let dst = parse_destination(destination)?;
             let target = ctx.registry(&dst.registry)?;
-            let observer = crate::progress::TerminalObserver::new(ctx.progress);
-            let data = if *docker {
+            let observer = crate::progress::TerminalObserver::new(
+                ctx.progress,
+                dst.to_string(),
+                crate::observer::Phase::Pushing,
+            );
+            let result = if *docker {
                 layout::push_docker_with_observer(
                     path,
                     reference.as_deref(),
@@ -533,7 +554,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                     &write.into(),
                     &observer,
                 )
-                .await?
+                .await
             } else {
                 layout::push_with_observer(
                     path,
@@ -543,8 +564,10 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                     &write.into(),
                     &observer,
                 )
-                .await?
+                .await
             };
+            observer.complete(&result);
+            let data = result?;
             if data.converted_from_docker_archive {
                 ctx.warn("Docker save archive converted to OCI; the original registry manifest digest is not preserved.");
             }
@@ -665,20 +688,33 @@ async fn index_create(
     .await?;
     let index = &graph.root;
     transfer::check_destination(&target, &dst, index, write.overwrite).await?;
-    let stats = transfer::transfer_remote_inputs(
-        inputs
-            .values()
-            .map(|(source, reference, graph)| (source, reference, graph)),
-        &target,
-        &dst,
-        write.dry_run,
-        &crate::progress::TerminalObserver::new(ctx.progress),
-    )
-    .await?;
-    if !write.dry_run {
-        transfer::publish_children(&target, &dst, &graph).await?;
-        transfer::publish_root(&target, &dst, index, write.overwrite).await?;
+    let observer = crate::progress::TerminalObserver::new(
+        ctx.progress,
+        dst.to_string(),
+        crate::observer::Phase::Copying,
+    );
+    let result = async {
+        let stats = transfer::transfer_remote_inputs(
+            inputs
+                .values()
+                .map(|(source, reference, graph)| (source, reference, graph)),
+            &target,
+            &dst,
+            write.dry_run,
+            &observer,
+        )
+        .await?;
+        if !write.dry_run {
+            let _publishing =
+                crate::observer::Observer::begin(&observer, crate::observer::Phase::Publishing, 0);
+            transfer::publish_children(&target, &dst, &graph).await?;
+            transfer::publish_root(&target, &dst, index, write.overwrite).await?;
+        }
+        Ok(stats)
     }
+    .await;
+    observer.complete(&result);
+    let stats = result?;
     let data = json!({"destination":dst.to_string(),"target_digest":index.digest(),"platforms":inputs.keys().collect::<Vec<_>>(),
         "stats":stats,"dry_run":write.dry_run,"referrers":"not-copied"});
     let text = transfer_summary(Some(index.digest()), Some(&stats), write.dry_run);

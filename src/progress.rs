@@ -1,75 +1,163 @@
-//! Terminal-only progress; upload positions are registry-acknowledged offsets.
-use crate::observer::BlobOutcome;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+//! One terminal display spans resolution, payload transfer and final publication.
+use crate::{
+    Result,
+    error::Code,
+    observer::{BlobOutcome, BlobPhase, Observer, Operation, Phase},
+};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     io::IsTerminal,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
+mod render;
+#[cfg(test)]
+mod tests;
+
 static ACTIVE: Mutex<Weak<Display>> = Mutex::new(Weak::new());
-const RECENT_LIMIT: usize = 3;
-const RECENT_LIFETIME: Duration = Duration::from_secs(2);
 
 pub(crate) fn suspend(write: impl FnOnce()) {
     let display = ACTIVE.lock().ok().and_then(|active| active.upgrade());
     if let Some(display) = display {
-        display.multi.suspend(write);
+        display.bar.suspend(write);
     } else {
         write();
     }
 }
 
-fn style(template: &str) -> ProgressStyle {
-    ProgressStyle::with_template(template)
-        .expect("valid static progress template")
-        .progress_chars("=> ")
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"])
-}
-fn activity_style() -> ProgressStyle {
-    style(" {spinner} {prefix} {wide_msg}")
-}
-fn transfer_style() -> ProgressStyle {
-    style(" {spinner} {prefix} {msg:11} [{wide_bar}] {bytes}/{total_bytes}")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Running,
+    Complete,
+    Failed,
+    Interrupted,
 }
 
-#[derive(Default)]
-struct Counts {
-    active: BTreeMap<String, ProgressBar>,
-    recent: VecDeque<(Instant, ProgressBar)>,
-    completed: u64,
-    stopped: bool,
+struct Row {
+    digest: String,
+    size: u64,
+    started: Option<Instant>,
+    stopped: Option<Instant>,
+    phase: Option<BlobPhase>,
+    position: u64,
+    downloaded: u64,
+    uploaded: u64,
+    outcome: Option<BlobOutcome>,
+    failed: bool,
 }
-struct Display {
-    multi: MultiProgress,
-    summary: ProgressBar,
-    counts: Mutex<Counts>,
-}
-impl Display {
-    fn prune_recent(&self, counts: &mut Counts, now: Instant) {
-        while counts.recent.front().is_some_and(|(finished, _)| {
-            counts.recent.len() > RECENT_LIMIT || now.duration_since(*finished) >= RECENT_LIFETIME
-        }) {
-            let (_, bar) = counts.recent.pop_front().expect("nonempty recent rows");
-            bar.finish_and_clear();
-            self.multi.remove(&bar);
-        }
+impl Row {
+    fn settled(&self) -> bool {
+        self.outcome.is_some() || self.failed
+    }
+    fn progress(&self, action: Phase) -> (u128, u128) {
+        let total = u128::from(self.size.max(1)) * if action == Phase::Copying { 2 } else { 1 };
+        let current = if self.outcome.is_some() {
+            total
+        } else {
+            match action {
+                Phase::Copying => u128::from(self.downloaded) + u128::from(self.uploaded),
+                Phase::Pushing => u128::from(self.uploaded),
+                _ => u128::from(self.downloaded),
+            }
+        };
+        (current.min(total), total)
     }
 }
-pub(crate) struct Progress {
+
+struct State {
+    image: String,
+    action: Phase,
+    phase: Phase,
+    total: Option<usize>,
+    rows: Vec<Row>,
+    indices: BTreeMap<String, usize>,
+    started: Instant,
+    stopped: Option<Instant>,
+    status: Status,
+    planning: bool,
+}
+impl State {
+    fn new(image: String, action: Phase) -> Self {
+        Self {
+            image: image
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect(),
+            action,
+            phase: Phase::Resolving,
+            total: None,
+            rows: vec![],
+            indices: BTreeMap::new(),
+            started: Instant::now(),
+            stopped: None,
+            status: Status::Running,
+            planning: false,
+        }
+    }
+    fn register(&mut self, digest: String, size: u64) -> usize {
+        if let Some(index) = self.indices.get(&digest) {
+            return *index;
+        }
+        let index = self.rows.len();
+        self.indices.insert(digest.clone(), index);
+        self.rows.push(Row {
+            digest,
+            size,
+            started: None,
+            stopped: None,
+            phase: None,
+            position: 0,
+            downloaded: 0,
+            uploaded: 0,
+            outcome: None,
+            failed: false,
+        });
+        index
+    }
+}
+
+struct Display {
+    bar: ProgressBar,
+    state: Mutex<State>,
+    dimensions: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
+}
+impl Display {
+    fn draw(&self) {
+        let state = self.state.lock().expect("progress state lock");
+        if state.status != Status::Running {
+            return;
+        }
+        let (height, width) = (self.dimensions)();
+        self.bar.set_message(render::frame(
+            &state,
+            width as usize,
+            height as usize,
+            Instant::now(),
+        ));
+    }
+    fn finish(&self, status: Status) {
+        let mut state = self.state.lock().expect("progress state lock");
+        if state.status != Status::Running {
+            return;
+        }
+        state.status = status;
+        state.stopped = Some(Instant::now());
+        let (height, width) = (self.dimensions)();
+        let frame = render::frame(&state, width as usize, height as usize, Instant::now());
+        // Finish once with the final frame; stage guards never clear the screen.
+        self.bar.finish_with_message(frame);
+    }
+}
+
+/// CLI adapter retaining one image and its blob rows for the entire command.
+pub(crate) struct TerminalObserver {
     display: Option<Arc<Display>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
-#[derive(Clone, Default)]
-pub(crate) struct Blob {
-    display: Option<Arc<Display>>,
-    bar: Option<ProgressBar>,
-    key: String,
-    size: u64,
-}
-impl Progress {
-    pub(crate) fn new(enabled: bool, phase: &'static str, total: usize) -> Self {
+impl TerminalObserver {
+    pub(crate) fn new(enabled: bool, image: String, action: Phase) -> Self {
         if !enabled
             || !std::io::stderr().is_terminal()
             || std::env::var("TERM").is_ok_and(|term| term == "dumb")
@@ -79,384 +167,170 @@ impl Progress {
                 task: None,
             };
         }
-        let mut progress = Self::with_target(phase, total, ProgressDrawTarget::stderr_with_hz(10));
-        let display = progress.display.as_ref().expect("initialized display");
-        if let Ok(mut active) = ACTIVE.lock() {
-            *active = Arc::downgrade(display);
-        }
+        let terminal = console::Term::stderr();
+        let mut observer = Self::with_target(
+            image,
+            action,
+            ProgressDrawTarget::stderr_with_hz(10),
+            Box::new(move || terminal.size()),
+        );
+        let display = observer.display.as_ref().expect("initialized display");
+        *ACTIVE.lock().expect("active progress lock") = Arc::downgrade(display);
         let weak = Arc::downgrade(display);
-        // One ticker for all workers, rather than one thread for every progress bar.
-        progress.task = Some(tokio::spawn(async move {
+        observer.task = Some(tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_millis(100));
             loop {
                 timer.tick().await;
                 let Some(display) = weak.upgrade() else {
                     break;
                 };
-                if let Ok(mut counts) = display.counts.lock() {
-                    if counts.stopped {
-                        break;
-                    }
-                    display.prune_recent(&mut counts, Instant::now());
-                    display.summary.tick();
-                    for bar in counts.active.values() {
-                        bar.tick();
-                    }
-                }
+                display.draw();
             }
         }));
-        progress
+        observer
     }
-    fn with_target(phase: &'static str, total: usize, target: ProgressDrawTarget) -> Self {
-        let multi = MultiProgress::with_draw_target(target);
-        let summary = multi.add(ProgressBar::new(total as u64));
-        if total == 0 {
-            summary.set_style(style("[{spinner}] {wide_msg} {elapsed_precise}"));
-            summary.set_message(phase);
-        } else {
-            summary.set_style(style(
-                "[+] {prefix} {pos}/{len} blobs{wide_msg} {elapsed_precise}",
-            ));
-            summary.set_prefix(phase);
-        }
+    fn with_target(
+        image: String,
+        action: Phase,
+        target: ProgressDrawTarget,
+        dimensions: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
+    ) -> Self {
+        let bar = ProgressBar::with_draw_target(None, target);
+        bar.set_style(
+            ProgressStyle::with_template("{msg}").expect("valid static progress template"),
+        );
         Self {
             display: Some(Arc::new(Display {
-                multi,
-                summary,
-                counts: Mutex::new(Counts::default()),
+                bar,
+                state: Mutex::new(State::new(image, action)),
+                dimensions,
             })),
             task: None,
         }
     }
-    pub(crate) fn blob(&self, key: String, size: u64) -> Blob {
-        let Some(display) = &self.display else {
-            return Blob::default();
-        };
-        let Ok(mut counts) = display.counts.lock() else {
-            return Blob::default();
-        };
-        display.prune_recent(&mut counts, Instant::now());
-        // Keep active workers above the small, expiring completion history.
-        let bar = display
-            .multi
-            .insert(1 + counts.active.len(), ProgressBar::new(size));
-        bar.set_style(activity_style());
-        bar.set_prefix(
-            key.split(':')
-                .next_back()
-                .unwrap_or(&key)
-                .chars()
-                .take(12)
-                .collect::<String>(),
-        );
-        bar.set_message("Checking");
-        counts.active.insert(key.clone(), bar.clone());
-        Blob {
-            display: Some(display.clone()),
-            bar: Some(bar),
-            key,
-            size,
+    pub(crate) fn complete<T>(&self, result: &Result<T>) {
+        if let Some(display) = &self.display {
+            display.finish(match result {
+                Ok(_) => Status::Complete,
+                Err(error) if error.code == Code::Interrupted => Status::Interrupted,
+                Err(_) => Status::Failed,
+            });
+            self.detach();
+        }
+    }
+    fn detach(&self) {
+        if let Ok(mut active) = ACTIVE.lock()
+            && let (Some(display), Some(current)) = (&self.display, active.upgrade())
+            && Arc::ptr_eq(display, &current)
+        {
+            *active = Weak::new();
         }
     }
 }
-impl Drop for Progress {
+impl Drop for TerminalObserver {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
             task.abort();
         }
-        if let Some(display) = &self.display
-            && let Ok(mut counts) = display.counts.lock()
-        {
-            counts.stopped = true;
-            for bar in counts.active.values() {
-                bar.finish_and_clear();
+        // Dropping the command future (Ctrl-C) must preserve an interrupted, never successful, result.
+        if let Some(display) = &self.display {
+            display.finish(Status::Interrupted);
+        }
+        self.detach();
+    }
+}
+impl Observer for TerminalObserver {
+    fn begin(&self, phase: Phase, total: usize) -> Box<dyn Operation> {
+        if let Some(display) = &self.display {
+            let mut state = display.state.lock().expect("progress state lock");
+            if state.status == Status::Running {
+                state.phase = phase;
+                if matches!(
+                    phase,
+                    Phase::Copying | Phase::Pulling | Phase::Pushing | Phase::Planning
+                ) {
+                    state.total = Some(total);
+                    state.planning = phase == Phase::Planning;
+                }
             }
-            counts.active.clear();
-            for (_, bar) in counts.recent.drain(..) {
-                bar.finish_and_clear();
-                display.multi.remove(&bar);
-            }
-            display.summary.finish_and_clear();
-            let _ = display.multi.clear();
+        }
+        Box::new(Stage(self.display.clone()))
+    }
+}
+struct Stage(Option<Arc<Display>>);
+impl Operation for Stage {
+    fn register_blob(&self, digest: String, size: u64) {
+        if let Some(display) = &self.0 {
+            display
+                .state
+                .lock()
+                .expect("progress state lock")
+                .register(digest, size);
         }
     }
+    fn blob(&self, digest: String, size: u64) -> Box<dyn crate::observer::BlobProgress> {
+        let index = self.0.as_ref().map(|display| {
+            let mut state = display.state.lock().expect("progress state lock");
+            let index = state.register(digest, size);
+            state.rows[index].started.get_or_insert_with(Instant::now);
+            index
+        });
+        Box::new(Blob {
+            display: self.0.clone(),
+            index,
+        })
+    }
+}
+struct Blob {
+    display: Option<Arc<Display>>,
+    index: Option<usize>,
 }
 impl Blob {
-    pub(crate) fn phase(&self, phase: &'static str) {
-        if let Some(bar) = &self.bar
-            && !bar.is_finished()
-        {
-            if matches!(phase, "Downloading" | "Uploading") {
-                // Reset the offset on direction changes and retries.
-                bar.reset();
-                bar.set_style(transfer_style());
-            } else {
-                bar.set_style(activity_style());
+    fn update(&self, change: impl FnOnce(&mut Row)) {
+        if let (Some(display), Some(index)) = (&self.display, self.index) {
+            let mut state = display.state.lock().expect("progress state lock");
+            if state.status == Status::Running && !state.rows[index].settled() {
+                change(&mut state.rows[index]);
             }
-            bar.set_message(phase);
         }
-    }
-    pub(crate) fn position(&self, position: u64) {
-        if let Some(bar) = &self.bar
-            && !bar.is_finished()
-        {
-            bar.set_position(position.min(self.size));
-        }
-    }
-    pub(crate) fn finish(&self, outcome: BlobOutcome) {
-        if let Some(display) = &self.display
-            && let Ok(mut counts) = display.counts.lock()
-            && let Some(bar) = counts.active.remove(&self.key)
-        {
-            counts.completed += 1;
-            // Moving completed rows below active workers keeps long transfers visible.
-            display.multi.remove(&bar);
-            let bar = display.multi.add(bar);
-            bar.set_style(activity_style());
-            bar.finish_with_message(match outcome {
-                BlobOutcome::Copied => "Copied",
-                BlobOutcome::Downloaded => "Downloaded",
-                BlobOutcome::Uploaded => "Uploaded",
-                BlobOutcome::Reused => "Copied (local)",
-                BlobOutcome::AlreadyExists => "Already exists",
-                BlobOutcome::Mounted => "Mounted",
-                BlobOutcome::Planned => "Would transfer",
-            });
-            let now = Instant::now();
-            counts.recent.push_back((now, bar));
-            display.prune_recent(&mut counts, now);
-            display.summary.set_position(counts.completed);
-        }
-    }
-}
-
-/// CLI adapter; core transfer code only depends on observer traits.
-pub(crate) struct TerminalObserver {
-    enabled: bool,
-    started: Instant,
-}
-impl TerminalObserver {
-    pub(crate) fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            started: Instant::now(),
-        }
-    }
-}
-impl crate::observer::Observer for TerminalObserver {
-    fn begin(
-        &self,
-        phase: crate::observer::Phase,
-        total: usize,
-    ) -> Box<dyn crate::observer::Operation> {
-        use crate::observer::Phase;
-        let label = match phase {
-            Phase::Resolving => "Resolving manifests",
-            Phase::CheckingDestination => "Checking destination",
-            Phase::Copying => "Copying",
-            Phase::Pulling => "Pulling",
-            Phase::Pushing => "Pushing",
-            Phase::ReadingLocal => "Reading local image",
-            Phase::VerifyingLocal => "Verifying local content",
-            Phase::ExportingDocker => "Exporting Docker image",
-            Phase::Saving => "Saving local image",
-            Phase::Planning => "Planning",
-            Phase::Publishing => "Publishing manifests",
-        };
-        let progress = Progress::new(self.enabled, label, total);
-        if let Some(display) = &progress.display {
-            display.summary.set_elapsed(self.started.elapsed());
-        }
-        Box::new(progress)
-    }
-}
-impl crate::observer::Operation for Progress {
-    fn blob(&self, digest: String, size: u64) -> Box<dyn crate::observer::BlobProgress> {
-        Box::new(self.blob(digest, size))
     }
 }
 impl crate::observer::BlobProgress for Blob {
-    fn phase(&self, phase: crate::observer::BlobPhase) {
-        use crate::observer::BlobPhase;
-        self.phase(match phase {
-            BlobPhase::Downloading => "Downloading",
-            BlobPhase::Verifying => "Verifying",
-            BlobPhase::Uploading => "Uploading",
-            BlobPhase::Committing => "Committing",
-            BlobPhase::Waiting => "Waiting",
+    fn phase(&self, phase: BlobPhase) {
+        self.update(|row| {
+            if matches!(phase, BlobPhase::Downloading | BlobPhase::Uploading) {
+                row.position = 0;
+            }
+            if phase == BlobPhase::Uploading {
+                row.downloaded = row.size;
+            }
+            row.phase = Some(phase);
         });
     }
     fn position(&self, position: u64) {
-        self.position(position);
+        self.update(|row| {
+            row.position = position.min(row.size);
+            // High-water marks keep aggregate work progress continuous across stage changes and retries.
+            match row.phase {
+                Some(BlobPhase::Downloading) => row.downloaded = row.downloaded.max(row.position),
+                Some(BlobPhase::Uploading) => row.uploaded = row.uploaded.max(row.position),
+                _ => {}
+            }
+        });
     }
     fn finish(&self) {
-        self.finish(BlobOutcome::Copied);
+        self.finish_with(BlobOutcome::Copied);
     }
     fn finish_with(&self, outcome: BlobOutcome) {
-        self.finish(outcome);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn retries_reset_positions_and_completion_is_idempotent() {
-        let progress = Progress::with_target("Checking", 2, ProgressDrawTarget::hidden());
-        let blob = progress.blob("sha256:0123456789abcdef".into(), 100);
-        let bar = blob.bar.as_ref().unwrap();
-        blob.phase("Downloading");
-        blob.position(70);
-        blob.phase("Downloading");
-        assert_eq!(bar.position(), 0);
-        blob.position(30);
-        assert_eq!(bar.position(), 30);
-        blob.position(100);
-        blob.phase("Uploading");
-        assert_eq!(bar.position(), 0);
-        blob.position(200);
-        assert_eq!(bar.position(), 100);
-        blob.phase("Committing");
-        assert_eq!(bar.position(), 100);
-        blob.finish(BlobOutcome::Copied);
-        blob.finish(BlobOutcome::AlreadyExists);
-        assert!(bar.is_finished());
-        assert_eq!(bar.message(), "Copied");
-        blob.phase("Downloading");
-        blob.position(0);
-        assert_eq!(bar.message(), "Copied");
-        assert_eq!(bar.position(), 100);
-        let pending = progress.blob("sha256:pending".into(), 100);
-        let display = progress.display.as_ref().unwrap().clone();
-        assert_eq!(display.counts.lock().unwrap().completed, 1);
-        drop(progress);
-        assert!(pending.bar.as_ref().unwrap().is_finished());
-        assert!(display.counts.lock().unwrap().stopped);
-        assert!(display.counts.lock().unwrap().active.is_empty());
-        assert!(display.counts.lock().unwrap().recent.is_empty());
-    }
-    #[derive(Clone, Debug)]
-    struct Terminal {
-        width: Arc<std::sync::atomic::AtomicU16>,
-        writes: Arc<Mutex<String>>,
-    }
-    impl indicatif::TermLike for Terminal {
-        fn width(&self) -> u16 {
-            self.width.load(std::sync::atomic::Ordering::Relaxed)
-        }
-        fn height(&self) -> u16 {
-            24
-        }
-        fn move_cursor_up(&self, _: usize) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn move_cursor_down(&self, _: usize) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn move_cursor_right(&self, _: usize) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn move_cursor_left(&self, _: usize) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn write_line(&self, text: &str) -> std::io::Result<()> {
-            self.write_str(&format!("{text}\n"))
-        }
-        fn write_str(&self, text: &str) -> std::io::Result<()> {
-            self.writes.lock().unwrap().push_str(text);
-            Ok(())
-        }
-        fn clear_line(&self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn flush(&self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    #[test]
-    fn terminal_resize_and_completed_rows_do_not_accumulate() {
-        let terminal = Terminal {
-            width: Arc::new(std::sync::atomic::AtomicU16::new(120)),
-            writes: Arc::new(Mutex::new(String::new())),
-        };
-        let progress = Progress::with_target(
-            "Copying",
-            88,
-            ProgressDrawTarget::term_like(Box::new(terminal.clone())),
-        );
-        let first = progress.blob("sha256:first".into(), 1024);
-        first.phase("Downloading");
-        first.position(512);
-        first.bar.as_ref().unwrap().force_draw();
-        terminal
-            .width
-            .store(40, std::sync::atomic::Ordering::Relaxed);
-        first.phase("Uploading");
-        first.position(256);
-        first.bar.as_ref().unwrap().force_draw();
-        terminal
-            .width
-            .store(100, std::sync::atomic::Ordering::Relaxed);
-        let display = progress.display.as_ref().unwrap();
-        display.multi.suspend(|| {
-            terminal
-                .writes
-                .lock()
-                .unwrap()
-                .push_str("Diagnostic preserved\n");
+        self.update(|row| {
+            row.outcome = Some(outcome);
+            row.stopped = Some(Instant::now());
         });
-        first.finish(BlobOutcome::Copied);
-        for index in 1..88 {
-            progress
-                .blob(format!("sha256:{index:012}"), 0)
-                .finish(BlobOutcome::AlreadyExists);
-        }
-        assert_eq!(display.summary.position(), 88);
-        assert!(display.counts.lock().unwrap().active.is_empty());
-        {
-            let text = terminal.writes.lock().unwrap();
-            for expected in [
-                "[+] Copying",
-                "00:00:00",
-                "Downloading",
-                "Uploading",
-                "Copied",
-                "Already exists",
-                "Diagnostic preserved",
-            ] {
-                assert!(text.contains(expected), "missing {expected}: {text}");
-            }
-        }
-        assert_eq!(display.counts.lock().unwrap().recent.len(), RECENT_LIMIT);
-        let active = progress.blob("sha256:active".into(), 1024);
-        active.phase("Uploading");
-        terminal.writes.lock().unwrap().clear();
-        display.summary.force_draw();
-        {
-            let text = terminal.writes.lock().unwrap();
-            assert!(text.contains("000000000087"));
-            assert!(!text.contains("000000000084"));
-            assert!(text.find("active").unwrap() < text.find("000000000085").unwrap());
-        }
-        // Advance the history's clock without sleeping; active transfers must survive expiry.
-        display.prune_recent(
-            &mut display.counts.lock().unwrap(),
-            Instant::now() + RECENT_LIFETIME,
-        );
-        terminal.writes.lock().unwrap().clear();
-        display.summary.force_draw();
-        assert!(terminal.writes.lock().unwrap().contains("active"));
-        assert!(!terminal.writes.lock().unwrap().contains("000000000087"));
-        assert!(display.counts.lock().unwrap().recent.is_empty());
-        drop(progress);
     }
-    #[test]
-    fn disabled_progress_does_not_require_an_async_runtime() {
-        let progress = Progress::new(false, "Resolving", 1);
-        let blob = progress.blob("sha256:abc".into(), 0);
-        blob.phase("Uploading");
-        blob.position(1);
-        blob.finish(BlobOutcome::Copied);
-        assert!(progress.display.is_none());
+    fn fail(&self) {
+        self.update(|row| {
+            row.failed = true;
+            row.stopped = Some(Instant::now());
+        });
     }
 }

@@ -90,7 +90,7 @@ Legacy Docker archives are converted to OCI; the original registry manifest dige
 
 Repeat the same `copy` or `pull` command with `--resume` after an interruption. Cached bytes are verified; expired upload sessions restart automatically. Resume data is private to your user, stored under the system cache directory in `quayside/transfers`, and removed after success. Set `transfer.resume_dir` to choose another directory. Interrupted caches can be deleted when no transfer is running. `transfer.max_temp_size` bounds each operation's payload storage, including resume data; resumable exports require room for both cached blobs and the output staging. Resume mode uses its own cache instead of exporting Docker's local cache.
 
-Copy, pull, and push show interactive progress. Use `--no-progress` to hide it.
+Copy, pull, and push show an image summary with per-blob progress through completion. Rows stay in order, with extra rows folded to fit the terminal; completed and failed results remain visible. Use `--no-progress` to hide it.
 
 ## Configuration
 

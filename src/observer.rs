@@ -1,5 +1,5 @@
 //! Optional operation observation. Implementations own presentation and cleanup.
-//! Dropping an operation ends observation, including on errors and cancellation.
+//! Operation guards delimit stages; observers may retain rows until the command ends.
 /// Operation-level stages reported independently of terminal presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -67,11 +67,15 @@ pub trait Observer: Send + Sync {
 }
 /// Owns one stage. Implementations should release display/resources when dropped.
 pub trait Operation: Send + Sync {
+    /// Declare queued blobs before starting workers, so totals and display order remain stable.
+    fn register_blob(&self, _digest: String, _size: u64) {}
     /// Begin observing a blob identified by its digest and declared payload size.
     fn blob(&self, digest: String, size: u64) -> Box<dyn BlobProgress>;
 }
 /// Per-blob callbacks may run concurrently for different blobs.
 pub trait BlobProgress: Send + Sync {
+    /// Mark this blob as failed; cancellation of sibling workers must not imply their failure.
+    fn fail(&self) {}
     /// Report a transfer-phase change, including restarts after a retry.
     fn phase(&self, phase: BlobPhase);
     /// Absolute offset in the current phase; may decrease after retry/reconciliation.

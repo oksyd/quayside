@@ -485,6 +485,9 @@ async fn transfer_inputs<'a>(
         },
         blobs.len(),
     );
+    for blob in &blobs {
+        display.register_blob(blob.descriptor.digest.to_string(), blob.descriptor.size);
+    }
     let temp_limit = parse_size(&target.config().transfer.max_temp_size)?;
     // Cross-registry transfers cannot mount: reject an impossible staging plan before any write.
     for blob in &blobs {
@@ -526,7 +529,11 @@ async fn transfer_inputs<'a>(
                 let from_repo = blob.repository;
                 let to_repo = destination.repository.clone();
                 async move {
-                    if target.blob_exists(&to_repo, &d).await? {
+                    if target
+                        .blob_exists(&to_repo, &d)
+                        .await
+                        .inspect_err(|_| progress.fail())?
+                    {
                         progress.finish_with(crate::observer::BlobOutcome::AlreadyExists);
                         return Ok::<_, Error>(TransferStats {
                             skipped_blobs: 1,
@@ -546,13 +553,19 @@ async fn transfer_inputs<'a>(
                         Some(
                             target
                                 .start_upload(&to_repo, &d.digest, Some(&from_repo))
-                                .await?,
+                                .await
+                                .inspect_err(|_| progress.fail())?,
                         )
                     } else {
                         None
                     };
                     if matches!(&initial, Some(UploadStart::Mounted)) {
-                        if !target.blob_exists(&to_repo, &d).await? {
+                        if !target
+                            .blob_exists(&to_repo, &d)
+                            .await
+                            .inspect_err(|_| progress.fail())?
+                        {
+                            progress.fail();
                             return Err(Error::integrity("mounted blob cannot be read back"));
                         }
                         progress.finish_with(crate::observer::BlobOutcome::Mounted);
@@ -576,9 +589,13 @@ async fn transfer_inputs<'a>(
                         // Initialize the archive before workers hold staging reservations.
                         local.prepare(&budget).await;
                     }
-                    let _reservation = budget.reserve(d.size).await?;
+                    let _reservation = budget
+                        .reserve(d.size)
+                        .await
+                        .inspect_err(|_| progress.fail())?;
                     // One verified temporary file per active worker, never a whole layer in RAM.
-                    let temporary = crate::resume::Staging::new(resume, &d)?;
+                    let temporary =
+                        crate::resume::Staging::new(resume, &d).inspect_err(|_| progress.fail())?;
                     let reused = match local {
                         Some(local) => local.stage(&d, temporary.path(), progress.as_ref()).await,
                         None => false,
@@ -593,7 +610,8 @@ async fn transfer_inputs<'a>(
                                 slots,
                                 temporary.resume(),
                             )
-                            .await?;
+                            .await
+                            .inspect_err(|_| progress.fail())?;
                     }
                     progress.phase(crate::observer::BlobPhase::Waiting);
                     sender
@@ -633,8 +651,11 @@ async fn transfer_inputs<'a>(
             blob.progress.as_ref(),
             blob.temporary.resume(),
         )
-        .await?;
-        blob.temporary.complete()?;
+        .await
+        .inspect_err(|_| blob.progress.fail())?;
+        blob.temporary
+            .complete()
+            .inspect_err(|_| blob.progress.fail())?;
         blob.progress.finish_with(if blob.reused {
             crate::observer::BlobOutcome::Reused
         } else {

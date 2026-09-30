@@ -868,6 +868,9 @@ pub async fn pull_with_options(
             source.config().transfer.concurrency,
         ));
         let display = observer.begin(Phase::Pulling, graph.blobs.len());
+        for d in transfer::largest_blobs_first(&graph) {
+            display.register_blob(d.digest.to_string(), d.size);
+        }
         fs::create_dir_all(storage::parent(output))?;
         let temp = tempfile::tempdir_in(storage::parent(output))?;
         storage::restrict(temp.path(), true)?;
@@ -886,35 +889,42 @@ pub async fn pull_with_options(
                 let resume = resume.clone();
                 let slots = slots.clone();
                 async move {
-                    if let Some(store) = resume {
-                        let blob = store.blob(&d)?;
-                        source
-                            .download_resumable(
-                                &repo,
-                                &d,
-                                &blob.path,
-                                progress.as_ref(),
-                                slots,
-                                Some(&blob),
-                            )
-                            .await?;
-                        tokio::fs::copy(&blob.path, &path).await?;
-                    } else {
-                        source
-                            .download_blob_progress(&repo, &d, &path, progress.as_ref())
-                            .await?;
+                    let result = async {
+                        if let Some(store) = resume {
+                            let blob = store.blob(&d)?;
+                            source
+                                .download_resumable(
+                                    &repo,
+                                    &d,
+                                    &blob.path,
+                                    progress.as_ref(),
+                                    slots,
+                                    Some(&blob),
+                                )
+                                .await?;
+                            tokio::fs::copy(&blob.path, &path).await?;
+                        } else {
+                            source
+                                .download_blob_progress(&repo, &d, &path, progress.as_ref())
+                                .await?;
+                        }
+                        if matches!(format, ArchiveFormat::OciLayout) {
+                            // Layout files become durable; archive staging files remain disposable.
+                            tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&path)
+                                .await?
+                                .sync_all()
+                                .await?;
+                        }
+                        progress.finish_with(BlobOutcome::Downloaded);
+                        Ok::<_, Error>(())
                     }
-                    if matches!(format, ArchiveFormat::OciLayout) {
-                        // Layout files become durable; archive staging files remain disposable.
-                        tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&path)
-                            .await?
-                            .sync_all()
-                            .await?;
+                    .await;
+                    if result.is_err() {
+                        progress.fail();
                     }
-                    progress.finish_with(BlobOutcome::Downloaded);
-                    Ok::<_, Error>(())
+                    result
                 }
             })
             .buffer_unordered(source.config().transfer.concurrency)
@@ -1027,6 +1037,9 @@ async fn push_layout(
         },
         graph.blobs.len(),
     );
+    for d in transfer::largest_blobs_first(&graph) {
+        display.register_blob(d.digest.to_string(), d.size);
+    }
     let outcomes = stream::iter(transfer::largest_blobs_first(&graph))
         .map(|d| {
             let budget = budget.clone();
@@ -1035,58 +1048,65 @@ async fn push_layout(
             let repo = destination.repository.clone();
             let progress = display.blob(d.digest.to_string(), d.size);
             async move {
-                if target.blob_exists(&repo, &d).await? {
-                    progress.finish_with(BlobOutcome::AlreadyExists);
-                    return Ok::<_, Error>(TransferStats {
-                        skipped_blobs: 1,
+                let result = async {
+                    if target.blob_exists(&repo, &d).await? {
+                        progress.finish_with(BlobOutcome::AlreadyExists);
+                        return Ok::<_, Error>(TransferStats {
+                            skipped_blobs: 1,
+                            ..Default::default()
+                        });
+                    }
+                    if write.dry_run {
+                        progress.finish_with(BlobOutcome::Planned);
+                        return Ok(TransferStats {
+                            planned_blobs: 1,
+                            ..Default::default()
+                        });
+                    }
+                    if let Some(raw) = d.embedded()? {
+                        progress.phase(BlobPhase::Waiting);
+                        let _reservation = budget.reserve(d.size).await?;
+                        let temp = tempfile::NamedTempFile::new()?;
+                        tokio::fs::write(temp.path(), &raw).await?;
+                        transfer::upload_file_progress(
+                            &target,
+                            &repo,
+                            &d,
+                            temp.path(),
+                            None,
+                            progress.as_ref(),
+                        )
+                        .await?;
+                    } else {
+                        let path = checked_file(
+                            &root,
+                            Path::new("blobs")
+                                .join(d.digest.algorithm())
+                                .join(d.digest.encoded())
+                                .as_path(),
+                        )?;
+                        transfer::upload_file_progress(
+                            &target,
+                            &repo,
+                            &d,
+                            &path,
+                            None,
+                            progress.as_ref(),
+                        )
+                        .await?;
+                    }
+                    progress.finish_with(BlobOutcome::Uploaded);
+                    Ok(TransferStats {
+                        copied_blobs: 1,
+                        bytes_transferred: d.size,
                         ..Default::default()
-                    });
+                    })
                 }
-                if write.dry_run {
-                    progress.finish_with(BlobOutcome::Planned);
-                    return Ok(TransferStats {
-                        planned_blobs: 1,
-                        ..Default::default()
-                    });
+                .await;
+                if result.is_err() {
+                    progress.fail();
                 }
-                if let Some(raw) = d.embedded()? {
-                    progress.phase(BlobPhase::Waiting);
-                    let _reservation = budget.reserve(d.size).await?;
-                    let temp = tempfile::NamedTempFile::new()?;
-                    tokio::fs::write(temp.path(), &raw).await?;
-                    transfer::upload_file_progress(
-                        &target,
-                        &repo,
-                        &d,
-                        temp.path(),
-                        None,
-                        progress.as_ref(),
-                    )
-                    .await?;
-                } else {
-                    let path = checked_file(
-                        &root,
-                        Path::new("blobs")
-                            .join(d.digest.algorithm())
-                            .join(d.digest.encoded())
-                            .as_path(),
-                    )?;
-                    transfer::upload_file_progress(
-                        &target,
-                        &repo,
-                        &d,
-                        &path,
-                        None,
-                        progress.as_ref(),
-                    )
-                    .await?;
-                }
-                progress.finish_with(BlobOutcome::Uploaded);
-                Ok(TransferStats {
-                    copied_blobs: 1,
-                    bytes_transferred: d.size,
-                    ..Default::default()
-                })
+                result
             }
         })
         .buffer_unordered(target.config().transfer.concurrency)

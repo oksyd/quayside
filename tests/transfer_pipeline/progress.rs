@@ -15,7 +15,10 @@ use std::{
 };
 
 #[derive(Clone, Default)]
-struct Outcomes(Arc<Mutex<Vec<BlobOutcome>>>);
+struct Outcomes(
+    Arc<Mutex<Vec<BlobOutcome>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 impl Observer for Outcomes {
     fn begin(&self, _: Phase, _: usize) -> Box<dyn Operation> {
         Box::new(self.clone())
@@ -27,6 +30,9 @@ impl Operation for Outcomes {
     }
 }
 impl BlobProgress for Outcomes {
+    fn fail(&self) {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     fn phase(&self, _: BlobPhase) {}
     fn position(&self, _: u64) {}
     fn finish(&self) {
@@ -122,6 +128,7 @@ async fn completion_reports_verified_outcomes_and_never_finishes_failed_uploads(
         .is_err()
     );
     assert!(outcomes.0.lock().unwrap().is_empty());
+    assert_eq!(outcomes.1.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let mounted = AtomicBool::new(false);
     let mount = Server::new(move |request| match request.method.as_str() {
