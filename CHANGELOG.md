@@ -1,8 +1,17 @@
+## [0.1.11] - 2026-09-30
+
+### 🚀 Features
+
+- Add persistent hierarchical progress for image transfers
 ## [0.1.10] - 2026-09-29
 
 ### 🚀 Features
 
 - Support OCI referrers and resumable image transfers
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.10
 ## [0.1.9] - 2026-09-29
 
 ### 🚀 Features
