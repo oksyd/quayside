@@ -1,16 +1,17 @@
-## [Unreleased]
+## [0.1.13] - 2026-10-10
 
-### Changed
+### 🚀 Features
 
-- `image copy` and `image pull` now select the local container platform by default (Linux containers on macOS). Use `--all` to preserve all platforms and indexed attestations, or `--platform` to select another platform. Platformless OCI artifacts remain intact.
-- Show the selected platform before transfer. `--include-attestations` also accepts the default local platform.
-- Identify rejected manifests by digest and type, with guidance for destinations that reject build attestations. Token-service failures retain separate diagnostics.
-
+- Default image transfers to the native platform
 ## [0.1.12] - 2026-10-10
 
 ### 🐛 Bug Fixes
 
 - Improve registry authentication failure diagnostics
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.12
 ## [0.1.11] - 2026-09-30
 
 ### 🚀 Features
