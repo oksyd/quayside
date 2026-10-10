@@ -10,12 +10,14 @@ use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use reqx::prelude::{RedirectPolicy, RetryPolicy, StatusPolicy, TlsRootStore};
 use reqx::{Client, ResponseStream as Response, TransportErrorKind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncReadExt;
 use url::Url;
 
 struct PendingWrite<'a>(Option<&'a AtomicBool>);
+
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for PendingWrite<'_> {
     fn drop(&mut self) {
@@ -239,6 +241,9 @@ impl Registry {
         retry_safe: bool,
     ) -> Result<(Response, bool)> {
         self.validate_content_url(&url)?;
+        let operation = super::diagnostics::operation(&method, &url);
+        let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let mut attempts = 0usize;
         let mut auth = self
             .inner
             .cache
@@ -251,6 +256,7 @@ impl Registry {
         let mut retries = 0usize;
         let mut redirects = 0usize;
         loop {
+            attempts += 1;
             let local = same_origin(&url, &self.inner.base);
             let external = if local {
                 None
@@ -306,9 +312,8 @@ impl Registry {
             diagnostics::log(
                 Level::Debug,
                 format_args!(
-                    "HTTP {method} to {} attempt {}",
+                    "HTTP {method} to {} attempt {attempts} [request {request_id}; {operation}]",
                     authority(&url),
-                    retries + 1
                 ),
             );
             diagnostics::log(
@@ -352,7 +357,7 @@ impl Registry {
             diagnostics::log(
                 Level::Debug,
                 format_args!(
-                    "HTTP {method} from {}: {} in {}ms",
+                    "HTTP {method} from {}: {} in {}ms [request {request_id}; {operation}]",
                     authority(&url),
                     response.status(),
                     started.elapsed().as_millis()
@@ -377,6 +382,12 @@ impl Registry {
                 // Another request may have refreshed the rejected credential while we waited.
                 // Different permission scopes have separate locks and can authenticate concurrently.
                 if recent.is_some() && recent != auth {
+                    diagnostics::log(
+                        Level::Debug,
+                        format_args!(
+                            "Authentication for request {request_id}: reuse refreshed credential"
+                        ),
+                    );
                     auth = recent;
                     refreshes += 1;
                     continue;
@@ -403,6 +414,12 @@ impl Registry {
                         } else {
                             scope
                         };
+                        diagnostics::log(
+                            Level::Debug,
+                            format_args!(
+                                "Authentication for request {request_id}: request bearer token"
+                            ),
+                        );
                         Some(self.token(realm, service.as_deref(), requested).await?)
                     }
                     Some(Challenge::Basic) if self.inner.credential.is_some() => {
@@ -477,6 +494,19 @@ impl Registry {
                 tokio::time::sleep(delay).await;
                 retries += 1;
                 continue;
+            }
+            if matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
+                let authorization = match auth.as_ref().filter(|_| local) {
+                    Some(CachedAuth::Bearer { .. }) => "bearer token",
+                    Some(CachedAuth::Basic) if used_auth => "basic credentials",
+                    _ => "none",
+                };
+                return Err(
+                    super::diagnostics::response_error(response, operation, authorization).await,
+                );
             }
             return Ok((response, used_auth));
         }

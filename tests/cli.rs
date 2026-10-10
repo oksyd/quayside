@@ -211,6 +211,217 @@ fn signed_redirects_and_credentials_never_appear_in_trace_logs() {
 }
 
 #[test]
+fn successful_blob_uploads_then_refreshed_manifest_denial_report_the_actual_operation() {
+    use quayside::auth::{AuthFile, Credential};
+    use std::{
+        collections::BTreeMap,
+        sync::{Mutex, atomic::AtomicUsize},
+    };
+
+    let data = tempfile::tempdir().unwrap();
+    let image = image_layout(data.path(), 1, 1024);
+    let blob_count = image.blobs.len();
+    let source = source(image);
+    let blobs = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+    let stored = blobs.clone();
+    let tokens = Arc::new(AtomicUsize::new(0));
+    let issued = tokens.clone();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let attempted = writes.clone();
+    let next = AtomicUsize::new(0);
+    let target = Server::new(move |request| {
+        let url = url::Url::parse(&format!("http://localhost{}", request.path)).unwrap();
+        if url.path() == "/token" {
+            assert_eq!(request.headers["authorization"], "Basic cm9ib3Q6c2VjcmV0");
+            assert!(
+                url.query_pairs()
+                    .any(|(k, v)| k == "scope" && v == "repository:private/repo:pull,push")
+            );
+            let number = issued.fetch_add(1, Ordering::SeqCst) + 1;
+            return Response::new(
+                200,
+                serde_json::to_vec(&json!({
+                    "token": format!("fixture-token-{number}"), "expires_in": 3600
+                }))
+                .unwrap(),
+            );
+        }
+        if request.method == "GET" {
+            return Response::new(404, vec![]);
+        }
+        if request.method == "HEAD" {
+            return stored
+                .lock()
+                .unwrap()
+                .get(url.path().rsplit('/').next().unwrap())
+                .map(|body| {
+                    Response::new(200, vec![]).header("Content-Length", &body.len().to_string())
+                })
+                .unwrap_or_else(|| Response::new(404, vec![]));
+        }
+        let publishing = url.path().contains("/manifests/");
+        if publishing {
+            attempted.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(stored.lock().unwrap().len(), blob_count);
+        }
+        let authorized = request.headers.get("authorization").map(String::as_str);
+        if authorized.is_none() || (publishing && authorized == Some("Bearer fixture-token-1")) {
+            return Response::new(401, vec![]).header("WWW-Authenticate", &format!(
+                "Bearer realm=\"http://{}/token\",service=\"fixture\",scope=\"repository:private/repo:pull,push\"",
+                request.headers["host"]
+            ));
+        }
+        if publishing {
+            assert_eq!(authorized, Some("Bearer fixture-token-2"));
+            return Response::new(403, br#"{"errors":[{"code":"DENIED","message":"secret-server-message","detail":"secret-server-detail"},{"code":"secret-server-code"}]}"#.to_vec())
+                .header("x-acs-request-id", "fixture-request-42");
+        }
+        if request.method == "POST" {
+            return Response::new(202, vec![]).header(
+                "Location",
+                &format!(
+                    "/v2/private/repo/blobs/uploads/{}?signature=secret-upload-query",
+                    next.fetch_add(1, Ordering::SeqCst)
+                ),
+            );
+        }
+        assert_eq!(request.method, "PUT");
+        let digest = url
+            .query_pairs()
+            .find(|(k, _)| k == "digest")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(
+            quayside::digest::Digest::sha256(&request.body).to_string(),
+            digest
+        );
+        stored.lock().unwrap().insert(digest, request.body);
+        Response::new(201, vec![])
+    });
+    let mut harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+    harness.config.transfer.max_retries = 3;
+    AuthFile::put(
+        &harness.root.path().join("auth.json"),
+        &harness.root.path().join("keys/master.key"),
+        &target.host,
+        Credential {
+            username: "robot".into(),
+            secret: "secret".into(),
+        },
+    )
+    .unwrap();
+    let output = harness.output(
+        &[
+            "--json",
+            "--log-level",
+            "debug",
+            "image",
+            "copy",
+            &format!("{}/app:v1", source.host),
+            &format!("{}/private/repo:v1", target.host),
+            "--overwrite",
+        ],
+        9,
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "partial");
+    assert_eq!(value["error"]["code"], "FORBIDDEN");
+    let message = value["error"]["message"].as_str().unwrap();
+    for expected in [
+        "Operation: publish manifest tag",
+        "Authorization: bearer token",
+        "Registry error: DENIED",
+        "Request ID: fixture-request-42",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    let logs = String::from_utf8(output.stderr).unwrap();
+    for expected in [
+        "commit blob upload",
+        "publish manifest tag",
+        "request bearer token",
+        "using stored credentials",
+        "attempt 2 [request",
+    ] {
+        assert!(logs.contains(expected), "{logs}");
+    }
+    let all = format!("{message}{logs}");
+    for secret in [
+        "fixture-token-",
+        "secret-",
+        "cm9ib3Q6c2VjcmV0",
+        "/private/repo",
+    ] {
+        assert!(!all.contains(secret), "leaked {secret}: {all}");
+    }
+    assert_eq!(blobs.lock().unwrap().len(), blob_count);
+    assert_eq!(tokens.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        2,
+        "403 must not trigger another write or token refresh"
+    );
+}
+
+#[test]
+fn denial_diagnostics_preserve_status_for_oversized_invalid_and_slow_bodies() {
+    for (body, delay) in [
+        (vec![b'x'; 16 * 1024 + 1], Duration::ZERO),
+        (b"not JSON: secret-response".to_vec(), Duration::ZERO),
+        (b"{}".to_vec(), Duration::from_millis(150)),
+    ] {
+        let server = Server::new(move |_| {
+            let mut response =
+                Response::new(403, body.clone()).header("x-request-id", "Bearer secret-header");
+            response.delay = delay;
+            response
+        });
+        let mut harness = Harness::new(&[(&server.host, true)]);
+        harness.config.transfer.metadata_timeout = "50ms".into();
+        let result = harness.json(&["registry", "ping", &server.host], 3);
+        assert_eq!(result["error"]["code"], "FORBIDDEN");
+        let message = result["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Operation: check registry"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("Request ID"));
+    }
+}
+
+#[test]
+fn token_service_denial_is_distinct_from_a_registry_write_denial() {
+    let server = Server::new(|request| {
+        if request.path.starts_with("/token") {
+            Response::new(
+                403,
+                br#"{"Code":"SecurityTokenExpired","Message":"secret-token-message"}"#.to_vec(),
+            )
+            .header("x-request-id", "fixture-token-request")
+        } else {
+            Response::new(401, vec![]).header(
+                "WWW-Authenticate",
+                &format!(
+                    "Bearer realm=\"http://{}/token\",service=\"fixture\"",
+                    request.headers["host"]
+                ),
+            )
+        }
+    });
+    let harness = Harness::new(&[(&server.host, true)]);
+    let result = harness.json(&["registry", "ping", &server.host], 3);
+    let message = result["error"]["message"].as_str().unwrap();
+    for expected in [
+        "Operation: request registry token",
+        "Authorization: anonymous",
+        "Registry error: SecurityTokenExpired",
+        "Request ID: fixture-token-request",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(!message.contains("secret"));
+}
+
+#[test]
 fn metadata_deadline_covers_body_reads() {
     let data = tempfile::tempdir().unwrap();
     let image = image_layout(data.path(), 0, 0);

@@ -56,6 +56,7 @@ pub enum UploadStart {
 mod authentication;
 mod blobs;
 mod catalog;
+mod diagnostics;
 mod download;
 mod manifests;
 mod referrers;

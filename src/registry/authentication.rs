@@ -1,10 +1,10 @@
 use super::Registry;
 use super::transport::{
-    authority, client, http_error, is_connect, is_timeout, limited_body, retry_delay, same_origin,
-    valid_url,
+    authority, client, is_connect, is_timeout, limited_body, retry_delay, same_origin, valid_url,
 };
 use crate::auth::Credential;
 use crate::config::duration;
+use crate::diagnostics::{self, Level};
 use crate::error::Code;
 use crate::{Error, Result};
 use base64::Engine;
@@ -125,6 +125,17 @@ impl Registry {
         }
         let max_retries = self.inner.config.transfer.max_retries;
         let mut attempt = 0;
+        let authorization = if self.inner.credential.is_some() {
+            "stored credentials"
+        } else {
+            "anonymous"
+        };
+        let push_requested = scope.split_whitespace().any(|entry| {
+            entry
+                .rsplit(':')
+                .next()
+                .is_some_and(|actions| actions.split(',').any(|action| action == "push"))
+        });
         let response = loop {
             let mut request = http
                 .inner
@@ -133,7 +144,26 @@ impl Registry {
             if let Some(credential) = &self.inner.credential {
                 request = request.header(header::AUTHORIZATION, basic_auth(credential)?);
             }
-            match request.send_stream().await {
+            diagnostics::log(
+                Level::Debug,
+                format_args!(
+                    "Token request to {host} using {authorization}, attempt {} [push requested: {push_requested}]",
+                    attempt + 1
+                ),
+            );
+            let started = Instant::now();
+            let result = request.send_stream().await;
+            if let Ok(response) = &result {
+                diagnostics::log(
+                    Level::Debug,
+                    format_args!(
+                        "Token response from {host}: {} in {}ms",
+                        response.status(),
+                        started.elapsed().as_millis()
+                    ),
+                );
+            }
+            match result {
                 Ok(r)
                     if (r.status() == StatusCode::TOO_MANY_REQUESTS
                         || r.status().is_server_error())
@@ -157,7 +187,12 @@ impl Registry {
             }
         };
         if response.status() != StatusCode::OK {
-            return Err(http_error(&response));
+            return Err(super::diagnostics::response_error(
+                response,
+                "request registry token",
+                authorization,
+            )
+            .await);
         }
         let bytes = Zeroizing::new(limited_body(response, 1024 * 1024).await?.to_vec());
         let mut v: Value = serde_json::from_slice(&bytes)
