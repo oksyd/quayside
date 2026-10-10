@@ -260,6 +260,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_reasons_preserve_typed_refusal_and_timeout() {
+        for (kind, reason) in [
+            (std::io::ErrorKind::ConnectionRefused, "Connection refused"),
+            (std::io::ErrorKind::TimedOut, "Connection timed out"),
+        ] {
+            let url =
+                url::Url::parse("https://registry-1.docker.io/private?signature=secret").unwrap();
+            let error = Error::request(
+                reqx::Error::Transport {
+                    kind: reqx::TransportErrorKind::Connect,
+                    method: http::Method::GET,
+                    uri: url.to_string(),
+                    message: "secret transport detail".into(),
+                    source: Box::new(std::io::Error::new(kind, "secret socket detail")),
+                },
+                &url,
+                Some("proxy.example:3128 (from HTTPS_PROXY)".into()),
+            );
+            assert_eq!(error.code, Code::Network);
+            assert_eq!(
+                error.message,
+                format!(
+                    "Unable to connect to Docker Hub (registry-1.docker.io:443)\nProxy: proxy.example:3128 (from HTTPS_PROXY)\nReason: {reason}"
+                )
+            );
+        }
+    }
+
+    #[test]
     fn request_context_hides_paths_queries_and_unverified_reasons() {
         let url = url::Url::parse("https://registry.example/private?signature=secret").unwrap();
         let error = Error::request(

@@ -9,6 +9,19 @@ use std::{
 };
 use support::{Harness, Response, Server};
 
+fn assert_unreachable_socket(message: &str) {
+    // A bound, non-listening socket reserves the port, but its TCP behavior varies:
+    // Linux refuses the connection, while macOS runners can let it time out.
+    // Exact ErrorKind-to-message mappings are covered without network I/O in error.rs.
+    let reason = message
+        .lines()
+        .find_map(|line| line.strip_prefix("Reason: "));
+    assert!(
+        matches!(reason, Some("Connection refused" | "Connection timed out")),
+        "{message}"
+    );
+}
+
 #[test]
 fn docker_proxy_is_used_env_overrides_and_no_proxy_bypasses() {
     let seen = Arc::new(AtomicUsize::new(0));
@@ -139,7 +152,8 @@ fn connection_errors_show_safe_destination_proxy_source_and_typed_reason() {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = socket.local_addr().unwrap().to_string();
-    let harness = Harness::new(&[(&address, true)]);
+    let mut harness = Harness::new(&[(&address, true)]);
+    harness.config.transfer.connect_timeout = "100ms".into();
     let daemon = harness.daemon_config();
     fs::write(
         &daemon,
@@ -160,7 +174,7 @@ fn connection_errors_show_safe_destination_proxy_source_and_typed_reason() {
         text.contains(&format!("Proxy: {address} (from {})", daemon.display())),
         "{text}"
     );
-    assert!(text.contains("Reason: Connection refused"), "{text}");
+    assert_unreachable_socket(&text);
     assert!(!text.contains("private-user"));
     assert!(!text.contains("secret-password"));
     let output = harness
@@ -173,6 +187,8 @@ fn connection_errors_show_safe_destination_proxy_source_and_typed_reason() {
         text.contains(&format!("Proxy: {address} (from HTTPS_PROXY)")),
         "{text}"
     );
+    assert_eq!(output.status.code(), Some(6));
+    assert_unreachable_socket(&text);
     for rule in ["*", "127.0.0.1", "127.0.0.0/8", &address] {
         let output = harness
             .command(&["--json", "registry", "ping", &address])
@@ -182,7 +198,7 @@ fn connection_errors_show_safe_destination_proxy_source_and_typed_reason() {
         assert_eq!(output.status.code(), Some(6));
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("Reason: Connection refused"), "{message}");
+        assert_unreachable_socket(message);
         assert!(!message.contains("Proxy:"), "{message}");
         assert_eq!(value["error"]["code"], "NETWORK");
     }
@@ -243,7 +259,8 @@ fn native_cidr_routing_does_not_resolve_hostnames_and_reports_invalid_rules() {
     if let Some(host) = &ipv6 {
         hosts.push((host.as_str(), true));
     }
-    let harness = Harness::new(&hosts);
+    let mut harness = Harness::new(&hosts);
+    harness.config.transfer.connect_timeout = "100ms".into();
     fs::write(
         harness.daemon_config(),
         serde_json::to_vec(&json!({"proxies":{
@@ -253,11 +270,12 @@ fn native_cidr_routing_does_not_resolve_hostnames_and_reports_invalid_rules() {
         .unwrap(),
     )
     .unwrap();
-    // A matching literal bypasses the healthy proxy and reaches a refused direct connection.
+    // A matching literal bypasses the healthy proxy and reaches an unreachable direct socket.
     for host in std::iter::once(&literal).chain(ipv6.iter()) {
         let value = harness.json(&["registry", "ping", host], 6);
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("Connection refused"), "{message}");
+        assert_eq!(value["error"]["code"], "NETWORK");
+        assert_unreachable_socket(message);
         assert!(!message.contains("Proxy:"), "{message}");
     }
     assert_eq!(seen.load(Ordering::SeqCst), 0);

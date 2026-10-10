@@ -51,6 +51,7 @@ fn distribution_attested_index_round_trip() {
             &[
                 "image",
                 "copy",
+                "--all",
                 &src,
                 &dst,
                 "--referrers",
@@ -66,6 +67,7 @@ fn distribution_attested_index_round_trip() {
         &[
             "image",
             "pull",
+            "--all",
             &dst,
             "--output",
             output.to_str().unwrap(),
@@ -91,6 +93,81 @@ fn distribution_attested_index_round_trip() {
     let restored = format!("{source}/{repository}:restored");
     let result = harness.json(&["image", "push", output.to_str().unwrap(), &restored], 0);
     assert_eq!(result["data"]["target_digest"], digest.to_string());
+}
+
+#[test]
+#[ignore = "requires QUAYSIDE_TEST_SOURCE and QUAYSIDE_TEST_TARGET disposable HTTP registries"]
+fn distribution_native_platform_round_trip() {
+    let source = env::var("QUAYSIDE_TEST_SOURCE").unwrap();
+    let target = env::var("QUAYSIDE_TEST_TARGET").unwrap();
+    let harness = Harness::new(&[(&source, true), (&target, true)]);
+    let image = support::attested_layout(harness.root.path());
+    let platform = quayside::model::Platform::native().unwrap();
+    let index: serde_json::Value = serde_json::from_slice(&image.manifest).unwrap();
+    let selected = index["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| {
+            d["platform"]["os"] == platform.os
+                && d["platform"]["architecture"] == platform.architecture
+        })
+        .unwrap();
+    let digest = selected["digest"].as_str().unwrap();
+    let repository = format!("quayside-{}/native", std::process::id());
+    let src = format!("{source}/{repository}:v1");
+    let dst = format!("{target}/{repository}:v1");
+    harness.json(
+        &["image", "push", image.directory.to_str().unwrap(), &src],
+        0,
+    );
+    let copied = harness.json(&["image", "copy", &src, &dst], 0);
+    assert_eq!(copied["data"]["source_digest"], image.digest);
+    assert_eq!(copied["data"]["target_digest"], digest);
+    assert_eq!(
+        copied["data"]["platforms"],
+        serde_json::json!([platform.to_string()])
+    );
+    assert_eq!(
+        harness
+            .output(&["manifest", "get", &dst, "--raw"], 0)
+            .stdout,
+        image.blobs[digest]
+    );
+
+    let output = harness.root.path().join("native-pull");
+    let pulled = harness.json(
+        &[
+            "image",
+            "pull",
+            &src,
+            "-o",
+            output.to_str().unwrap(),
+            "--format",
+            "oci-layout",
+        ],
+        0,
+    );
+    assert_eq!(pulled["data"]["target_digest"], digest);
+    assert_eq!(
+        pulled["data"]["platforms"],
+        serde_json::json!([platform.to_string()])
+    );
+    assert_eq!(pulled["data"]["manifests"], 1);
+    for descriptor in index["manifests"].as_array().unwrap() {
+        let child = descriptor["digest"].as_str().unwrap();
+        if child != digest {
+            assert!(
+                !output
+                    .join("blobs/sha256")
+                    .join(child.strip_prefix("sha256:").unwrap())
+                    .exists()
+            );
+        }
+    }
+    let restored = format!("{source}/{repository}:restored");
+    let pushed = harness.json(&["image", "push", output.to_str().unwrap(), &restored], 0);
+    assert_eq!(pushed["data"]["target_digest"], digest);
 }
 
 #[test]
