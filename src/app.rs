@@ -6,6 +6,7 @@ use crate::{
     error::Code,
     layout,
     model::{Manifest, ManifestKind, OCI_INDEX},
+    observer::Phase,
     reference::{Reference, registry_name, validate_repository},
     registry::Registry,
     transfer::{self, TransferStats},
@@ -186,6 +187,7 @@ fn parse_destination(s: &str) -> Result<Reference> {
     Ok(r)
 }
 fn transfer_summary(
+    action: Phase,
     digest: Option<&crate::digest::Digest>,
     stats: Option<&TransferStats>,
     dry_run: bool,
@@ -206,8 +208,13 @@ fn transfer_summary(
             stats.planned_blobs, stats.skipped_blobs
         )
     } else {
+        let outcome = match action {
+            Phase::Pulling => "Downloaded",
+            Phase::Pushing => "Uploaded",
+            _ => "Copied",
+        };
         let mut summary = format!(
-            "Copied: {} blobs, skipped: {}",
+            "{outcome}: {} blobs, skipped: {}",
             stats.copied_blobs, stats.skipped_blobs
         );
         if stats.mounted_blobs > 0 {
@@ -502,7 +509,12 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             .await;
             observer.complete(&result);
             let data = result?;
-            let text = transfer_summary(Some(&data.target_digest), Some(&data.stats), data.dry_run);
+            let text = transfer_summary(
+                Phase::Copying,
+                Some(&data.target_digest),
+                Some(&data.stats),
+                data.dry_run,
+            );
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
         ImageCommand::Pull {
@@ -535,7 +547,12 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             .await;
             observer.complete(&result);
             let data = result?;
-            let text = transfer_summary(Some(&data.target_digest), None, data.dry_run);
+            let text = transfer_summary(
+                Phase::Pulling,
+                Some(&data.target_digest),
+                None,
+                data.dry_run,
+            );
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
         ImageCommand::Push {
@@ -578,7 +595,12 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             if data.converted_from_docker_archive {
                 ctx.warn("Docker save archive converted to OCI; the original registry manifest digest is not preserved.");
             }
-            let text = transfer_summary(Some(&data.target_digest), Some(&data.stats), data.dry_run);
+            let text = transfer_summary(
+                Phase::Pushing,
+                Some(&data.target_digest),
+                Some(&data.stats),
+                data.dry_run,
+            );
             Ok(Output::new(serde_json::to_value(data)?, text))
         }
         ImageCommand::Tag {
@@ -605,7 +627,8 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                 transfer::publish_root(&reg, &dst, &manifest, write.overwrite).await?;
             }
             let data = json!({"source":src.to_string(),"destination":dst.to_string(),"target_digest":manifest.digest(),"dry_run":write.dry_run});
-            let text = transfer_summary(Some(manifest.digest()), None, write.dry_run);
+            let text =
+                transfer_summary(Phase::Copying, Some(manifest.digest()), None, write.dry_run);
             Ok(Output::new(data, text))
         }
     }
@@ -724,7 +747,12 @@ async fn index_create(
     let stats = result?;
     let data = json!({"destination":dst.to_string(),"target_digest":index.digest(),"platforms":inputs.keys().collect::<Vec<_>>(),
         "stats":stats,"dry_run":write.dry_run,"referrers":"not-copied"});
-    let text = transfer_summary(Some(index.digest()), Some(&stats), write.dry_run);
+    let text = transfer_summary(
+        Phase::Copying,
+        Some(index.digest()),
+        Some(&stats),
+        write.dry_run,
+    );
     Ok(Output::new(data, text))
 }
 
@@ -739,17 +767,29 @@ mod tests {
             skipped_blobs: 19,
             ..Default::default()
         };
-        assert_eq!(
-            transfer_summary(Some(&digest), Some(&stats), false),
-            format!("Copied: 69 blobs, skipped: 19\nCompleted: {digest}")
-        );
+        for (action, outcome) in [
+            (Phase::Copying, "Copied"),
+            (Phase::Pulling, "Downloaded"),
+            (Phase::Pushing, "Uploaded"),
+        ] {
+            assert_eq!(
+                transfer_summary(action, Some(&digest), Some(&stats), false),
+                format!("{outcome}: 69 blobs, skipped: 19\nCompleted: {digest}")
+            );
+            stats.planned_blobs = 69;
+            assert_eq!(
+                transfer_summary(action, Some(&digest), Some(&stats), true),
+                "Planned: 69 blobs, skipped: 19\nDry run complete; no remote content was changed."
+            );
+        }
         stats.mounted_blobs = 2;
-        assert!(transfer_summary(Some(&digest), Some(&stats), false).contains("mounted: 2"));
-        stats.planned_blobs = 69;
-        assert_eq!(
-            transfer_summary(Some(&digest), Some(&stats), true),
-            "Planned: 69 blobs, skipped: 19\nDry run complete; no remote content was changed."
+        assert!(
+            transfer_summary(Phase::Copying, Some(&digest), Some(&stats), false)
+                .contains("mounted: 2")
         );
-        assert_eq!(transfer_summary(None, None, false), "Completed.");
+        assert_eq!(
+            transfer_summary(Phase::Copying, None, None, false),
+            "Completed."
+        );
     }
 }

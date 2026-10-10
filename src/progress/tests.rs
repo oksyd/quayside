@@ -53,6 +53,7 @@ fn rows_keep_their_order_and_final_results_across_command_stages() {
     let screen = snapshot(&observer, 100, 24);
     assert!(screen.contains("3/3 blobs"));
     assert!(screen.contains("Publishing manifests"));
+    assert!(!screen.contains('%'));
     assert!(screen.contains("aaaaaaaaaaaa Copied"));
     observer.complete(&Ok(()));
     let final_screen = observer.display.as_ref().unwrap().bar.message();
@@ -99,6 +100,39 @@ fn aggregate_progress_is_weighted_and_continuous_through_upload_and_retry() {
 }
 
 #[test]
+fn byte_progress_is_only_shown_during_payload_transfer() {
+    for action in [Phase::Copying, Phase::Pulling, Phase::Pushing] {
+        let observer = TerminalObserver::with_target(
+            "docker.io/library/nginx:latest".into(),
+            action,
+            ProgressDrawTarget::hidden(),
+            Box::new(|| (24, 100)),
+        );
+        let stage = observer.begin(action, 1);
+        stage
+            .blob("sha256:payload".into(), 1024)
+            .finish_with(BlobOutcome::AlreadyExists);
+        assert!(snapshot(&observer, 100, 24).contains("100%"));
+        for (phase, label) in [
+            (Phase::CheckingDestination, "Checking destination"),
+            (Phase::VerifyingLocal, "Verifying local content"),
+            (Phase::Planning, "Planning"),
+            (Phase::Publishing, "Publishing manifests"),
+            (Phase::Saving, "Saving local image"),
+        ] {
+            let _stage = observer.begin(phase, 1);
+            for width in [26, 40, 60, 100] {
+                let screen = snapshot(&observer, width, 24);
+                assert!(!screen.contains('%'), "{screen}");
+                let parent = screen.lines().nth(1).unwrap();
+                assert!(!parent.contains('✔'), "{screen}");
+                assert!(parent.contains(label), "{screen}");
+            }
+        }
+    }
+}
+
+#[test]
 fn failure_identifies_the_blob_and_cancellation_never_marks_success() {
     let (observer, stage) = display(3);
     let good = stage.blob("sha256:good".into(), 100);
@@ -140,8 +174,8 @@ fn folding_preserves_active_and_failed_rows_and_respects_terminal_dimensions() {
     let frame = snapshot(&observer, 100, 10);
     assert!(frame.contains("000000000080 Uploading"));
     assert!(frame.contains("000000000081 Failed"));
-    assert!(frame.contains("hidden (80 complete, 6 waiting in total)"));
-    for height in [1, 3, 8, 24, 100] {
+    assert!(frame.contains("83 hidden (77 complete, 6 waiting)"));
+    for height in [1, 3, 5, 6, 8, 24, 100] {
         for width in [1, 12, 25, 40, 80, 160] {
             let frame = snapshot(&observer, width, height);
             assert!(frame.lines().count() <= height.saturating_sub(2).max(1));
@@ -157,6 +191,82 @@ fn folding_preserves_active_and_failed_rows_and_respects_terminal_dimensions() {
     assert!(!wide.contains("hidden"));
     assert!(wide.contains("000000000000 Already exists"));
     assert!(wide.contains("000000000087 Waiting"));
+}
+
+#[test]
+fn short_terminals_show_the_relevant_blob_before_folded_counts() {
+    let (observer, stage) = display(3);
+    stage
+        .blob("sha256:complete".into(), 100)
+        .finish_with(BlobOutcome::Copied);
+    stage.register_blob("sha256:waiting".into(), 100);
+    let active = stage.blob("sha256:active".into(), 100);
+    active.phase(BlobPhase::Uploading);
+    let screen = snapshot(&observer, 80, 5);
+    assert!(screen.contains("active Uploading"), "{screen}");
+    active.fail();
+    observer.complete::<()>(&Err(crate::Error::network("upload failed")));
+    let screen = snapshot(&observer, 80, 5);
+    assert!(screen.contains("active Failed"), "{screen}");
+}
+
+#[test]
+fn folded_unfinished_rows_are_cancelled_or_interrupted_after_stopping() {
+    for interrupted in [false, true] {
+        let (observer, stage) = display(5);
+        stage
+            .blob("sha256:complete".into(), 100)
+            .finish_with(BlobOutcome::Copied);
+        let active = stage.blob("sha256:active".into(), 100);
+        active.phase(BlobPhase::Downloading);
+        for digest in ["sha256:queued-a", "sha256:queued-b", "sha256:queued-c"] {
+            stage.register_blob(digest.into(), 100);
+        }
+        let running = snapshot(&observer, 100, 6);
+        assert!(
+            running.contains("4 hidden (1 complete, 3 waiting)"),
+            "{running}"
+        );
+        if interrupted {
+            observer
+                .display
+                .as_ref()
+                .unwrap()
+                .finish(Status::Interrupted);
+        } else {
+            active.fail();
+            observer.complete::<()>(&Err(crate::Error::network("download failed")));
+        }
+        let screen = snapshot(&observer, 100, 6);
+        let label = if interrupted {
+            "interrupted"
+        } else {
+            "cancelled"
+        };
+        assert!(
+            screen.contains(&format!("4 hidden (3 {label}, 1 complete)")),
+            "{screen}"
+        );
+        assert!(!screen.contains("waiting"), "{screen}");
+        assert!(!screen.contains("active)"), "{screen}");
+    }
+}
+
+#[test]
+fn narrow_rows_prioritize_status_over_digest_and_elapsed_time() {
+    let (observer, stage) = display(1);
+    let blob = stage.blob("sha256:aaaaaaaaaaaa".into(), 100);
+    blob.phase(BlobPhase::Waiting);
+    observer
+        .display
+        .as_ref()
+        .unwrap()
+        .finish(Status::Interrupted);
+    for width in [16, 25, 32] {
+        let screen = snapshot(&observer, width, 24);
+        let row = screen.lines().nth(2).unwrap();
+        assert!(row.contains("Interrupted"), "{screen}");
+    }
 }
 
 #[test]

@@ -94,11 +94,18 @@ fn row_line(row: &Row, state: &State, columns: usize, now: Instant, spinner: &st
         .chars()
         .take(if columns < 40 { 8 } else { 12 })
         .collect();
-    let mut text = format!("   {icon} {digest} {status:<11}");
-    let timing = row
+    let mut text = if columns < 6 + width(&digest) + width(status) {
+        format!("   {icon} {status}")
+    } else {
+        format!("   {icon} {digest} {status:<11}")
+    };
+    let mut timing = row
         .started
         .map(|started| elapsed(started, row.stopped.or(state.stopped), now))
         .unwrap_or_default();
+    if columns < width(text.trim_end()) + width(&timing) + 1 {
+        timing.clear();
+    }
     if state.status == Status::Running
         && !row.settled()
         && matches!(
@@ -130,7 +137,49 @@ fn row_line(row: &Row, state: &State, columns: usize, now: Instant, spinner: &st
             text.push_str(&format!(" {amount}"));
         }
     }
-    line(&text, &timing, columns)
+    line(text.trim_end(), &timing, columns)
+}
+
+fn hidden_summary(state: &State, hidden: &[usize]) -> String {
+    let (mut failed, mut active, mut complete, mut waiting) = (0, 0, 0, 0);
+    for &index in hidden {
+        let row = &state.rows[index];
+        if row.failed {
+            failed += 1;
+        } else if row.outcome.is_some() {
+            complete += 1;
+        } else if row.started.is_some() {
+            active += 1;
+        } else {
+            waiting += 1;
+        }
+    }
+    let cancelled = if state.status == Status::Running {
+        0
+    } else {
+        let count = active + waiting;
+        active = 0;
+        waiting = 0;
+        count
+    };
+    let cancelled_label = if state.status == Status::Interrupted {
+        "interrupted"
+    } else {
+        "cancelled"
+    };
+    let counts = [
+        (failed, "failed"),
+        (active, "active"),
+        (cancelled, cancelled_label),
+        (complete, "complete"),
+        (waiting, "waiting"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect::<Vec<_>>()
+    .join(", ");
+    format!("   … {} hidden ({counts})", hidden.len())
 }
 
 pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) -> String {
@@ -177,7 +226,14 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
         Status::Interrupted => "-",
     };
     let mut details = status.to_owned();
-    if !state.rows.is_empty() && state.status == Status::Running && columns >= 60 {
+    if !state.rows.is_empty()
+        && state.status == Status::Running
+        && matches!(
+            state.phase,
+            Phase::Copying | Phase::Pulling | Phase::Pushing
+        )
+        && columns >= 60
+    {
         let (current, total) = state
             .rows
             .iter()
@@ -194,14 +250,26 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
         }
         details = format!("[{blocks}] {percent}% {status}");
     }
-    let timing = elapsed(state.started, state.stopped, now);
-    let name_space = columns
-        .saturating_sub(width(&details) + width(&timing) + 5)
-        .max(8);
-    let name = truncate_str(&state.image, name_space, "…");
-    let parent = if columns < 40 {
-        format!(" {icon} {status} {name}")
+    let mut timing = elapsed(state.started, state.stopped, now);
+    let name_space = columns.saturating_sub(width(&details) + width(&timing) + 5);
+    let parent = if columns < 40 || name_space < 8 {
+        let prefix = format!(" {icon} {status}");
+        if columns < width(&prefix) + width(&timing) + 1 {
+            timing.clear();
+        }
+        let time_space = if timing.is_empty() {
+            0
+        } else {
+            width(&timing) + 1
+        };
+        let name_space = columns.saturating_sub(width(&prefix) + time_space + 1);
+        if name_space > 0 {
+            format!("{prefix} {}", truncate_str(&state.image, name_space, "…"))
+        } else {
+            prefix
+        }
     } else {
+        let name = truncate_str(&state.image, name_space, "…");
         format!(" {icon} {name} {details}")
     };
     lines.push(line(&parent, &timing, columns));
@@ -231,26 +299,19 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
                 *i,
             )
         });
-        indices.truncate(capacity - 1);
+        // Even a single available row must show a failure or active transfer.
+        let visible = capacity.saturating_sub(1).max(1);
+        let summary = (capacity > 1).then(|| hidden_summary(state, &indices[visible..]));
+        indices.truncate(visible);
         indices.sort_unstable();
         lines.extend(
             indices
                 .iter()
                 .map(|i| row_line(&state.rows[*i], state, columns, now, spinner)),
         );
-        let waiting = state
-            .rows
-            .iter()
-            .filter(|row| row.started.is_none())
-            .count();
-        lines.push(line(
-            &format!(
-                "   … {} hidden ({done} complete, {waiting} waiting in total)",
-                state.rows.len() - indices.len()
-            ),
-            "",
-            columns,
-        ));
+        if let Some(summary) = summary {
+            lines.push(line(&summary, "", columns));
+        }
     }
     lines.join("\n")
 }
