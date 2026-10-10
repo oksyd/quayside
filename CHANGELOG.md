@@ -1,8 +1,17 @@
+## [0.1.14] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.13] - 2026-10-10
 
 ### 🚀 Features
 
 - Default image transfers to the native platform
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.13
 ## [0.1.12] - 2026-10-10
 
 ### 🐛 Bug Fixes
