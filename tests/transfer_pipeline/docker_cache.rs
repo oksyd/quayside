@@ -36,10 +36,11 @@ impl Fixture {
         let mut local = BTreeMap::new();
         let mut single = vec![];
         let mut selected_digest = String::new();
+        let native = quayside::model::Platform::native().unwrap();
         for (arch, size) in if multiple {
             vec![("amd64", 16384), ("arm64", 32768)]
         } else {
-            vec![("amd64", 16384)]
+            vec![(native.architecture.as_str(), 16384)]
         } {
             let image = support::image_layout_for(&root.path().join(arch), 3, size, arch);
             let mut descriptor = Descriptor::new(
@@ -49,7 +50,7 @@ impl Fixture {
             );
             descriptor.platform = Some(format!("linux/{arch}").parse().unwrap());
             children.push(descriptor);
-            if arch == "amd64" {
+            if !multiple || arch == "amd64" {
                 local = image.blobs.clone();
                 selected_digest = image.digest.clone();
             }
@@ -254,7 +255,7 @@ fn matching_docker_blobs_skip_downloads_and_export_once() {
 fn partial_local_platforms_preserve_the_complete_remote_index() {
     let fixture = Fixture::new(true);
     let bin = fixture.docker(&fixture.local);
-    let result = fixture.run(&bin, "", &[]);
+    let result = fixture.run(&bin, "", &["--all"]);
     assert_eq!(result["data"]["stats"]["reused_blobs"], 4);
     assert_eq!(result["data"]["stats"]["copied_blobs"], 8);
     assert_eq!(

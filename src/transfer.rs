@@ -692,12 +692,16 @@ pub async fn copy(
     write: &WriteOptions,
     observer: &dyn crate::observer::Observer,
 ) -> Result<CopyResult> {
+    let selection = match platform {
+        Some(platform) => crate::options::PlatformSelection::Platform(platform.parse()?),
+        None => crate::options::PlatformSelection::All,
+    };
     copy_with_options(
         source,
         source_ref,
         target,
         destination,
-        platform,
+        &selection,
         write,
         &crate::options::TransferOptions::default(),
         observer,
@@ -712,13 +716,14 @@ pub async fn copy_with_options(
     source_ref: &Reference,
     target: &Registry,
     destination: &Reference,
-    platform: Option<&str>,
+    selection: &crate::options::PlatformSelection,
     write: &WriteOptions,
     options: &crate::options::TransferOptions,
     observer: &dyn crate::observer::Observer,
 ) -> Result<CopyResult> {
     let resolving = observer.begin(crate::observer::Phase::Resolving, 0);
-    let resolved = associated::selected(source, source_ref, platform, options).await?;
+    let resolved = associated::selected(source, source_ref, selection, options).await?;
+    observer.selected_platforms(&resolved.platforms);
     resolved.manifest.check_transfer_supported()?;
     drop(resolving);
     let checking = observer.begin(crate::observer::Phase::CheckingDestination, 0);

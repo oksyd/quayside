@@ -26,7 +26,7 @@ fn source(image: Image) -> Server {
 #[test]
 fn inspect_single_platform_uses_config_and_preserves_json_with_debug_logs() {
     let data = tempfile::tempdir().unwrap();
-    let server = source(image_layout(data.path(), 2, 4096));
+    let server = source(support::image_layout_for(data.path(), 2, 4096, "arm64"));
     let harness = Harness::new(&[(&server.host, true)]);
     let reference = format!("{}/team/app:v1", server.host);
     let out = harness.output(
@@ -333,9 +333,11 @@ fn successful_blob_uploads_then_refreshed_manifest_denial_report_the_actual_oper
         "Authorization: bearer token",
         "Registry error: DENIED",
         "Request ID: fixture-request-42",
+        "(container image)",
     ] {
         assert!(message.contains(expected), "{message}");
     }
+    assert!(!message.contains("attestation"), "{message}");
     let logs = String::from_utf8(output.stderr).unwrap();
     for expected in [
         "commit blob upload",
@@ -699,7 +701,7 @@ fn platform_selection_skips_artifacts_in_mixed_index() {
     };
     let data = tempfile::tempdir().unwrap();
     let artifact = support::artifact_layout(&data.path().join("db"), false, false);
-    let image = image_layout(&data.path().join("image"), 0, 0);
+    let image = support::image_layout_for(&data.path().join("image"), 0, 0, "arm64");
     let expected = image.digest.clone();
     let mut artifact_desc = Descriptor::new(
         OCI_MANIFEST,
@@ -743,7 +745,14 @@ fn platform_selection_skips_artifacts_in_mixed_index() {
     assert_eq!(selected["data"]["source_digest"], index_digest);
     let archive = data.path().join("mixed.tar");
     harness.json(
-        &["image", "pull", &reference, "-o", archive.to_str().unwrap()],
+        &[
+            "image",
+            "pull",
+            &reference,
+            "--all",
+            "-o",
+            archive.to_str().unwrap(),
+        ],
         0,
     );
 }
@@ -1045,6 +1054,7 @@ fn copy_conflict_is_reported_before_fetching_child_manifests() {
         &[
             "image",
             "copy",
+            "--all",
             &format!("{}/app:v1", source.host),
             &format!("{}/app:v1", target.host),
         ],

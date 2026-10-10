@@ -324,7 +324,12 @@ pub struct Image {
     pub directory: PathBuf,
 }
 pub fn image_layout(root: &Path, layers: usize, layer_size: usize) -> Image {
-    image_layout_for(root, layers, layer_size, "arm64")
+    image_layout_for(
+        root,
+        layers,
+        layer_size,
+        &quayside::model::Platform::native().unwrap().architecture,
+    )
 }
 
 pub fn image_layout_for(

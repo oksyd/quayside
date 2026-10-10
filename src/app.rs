@@ -45,6 +45,8 @@ pub struct Context {
     warnings: Mutex<BTreeSet<String>>,
     /// Whether this invocation may display interactive terminal progress.
     pub progress: bool,
+    /// Whether ordinary human-readable status notices are enabled.
+    pub notices: bool,
 }
 impl Context {
     /// Load command configuration and determine terminal capabilities; credentials are read on demand.
@@ -68,6 +70,7 @@ impl Context {
                 && !cli.quiet
                 && !cli.no_progress
                 && std::io::stderr().is_terminal(),
+            notices: !cli.json && !cli.quiet,
         })
     }
     /// Record a deduplicated warning for the command result.
@@ -477,19 +480,21 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         } => {
             let src = Reference::parse_source(source)?;
             let dst = parse_destination(destination)?;
+            let selection = selection.try_into()?;
             let source = ctx.registry(&src.registry)?;
             let target = ctx.registry(&dst.registry)?;
             let observer = crate::progress::TerminalObserver::new(
                 ctx.progress,
                 src.to_string(),
                 crate::observer::Phase::Copying,
-            );
+            )
+            .with_platform_notice(ctx.notices);
             let result = transfer::copy_with_options(
                 &source,
                 &src,
                 &target,
                 &dst,
-                selection.platform.as_deref(),
+                &selection,
                 &write.into(),
                 &transfer.into(),
                 &observer,
@@ -509,18 +514,20 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             write,
         } => {
             let r = Reference::parse_source(reference)?;
+            let selection = selection.try_into()?;
             let source = ctx.registry(&r.registry)?;
             let observer = crate::progress::TerminalObserver::new(
                 ctx.progress,
                 r.to_string(),
                 crate::observer::Phase::Pulling,
-            );
+            )
+            .with_platform_notice(ctx.notices);
             let result = layout::pull_with_options(
                 &source,
                 &r,
                 output,
                 (*format).into(),
-                selection.platform.as_deref(),
+                &selection,
                 &write.into(),
                 &transfer.into(),
                 &observer,

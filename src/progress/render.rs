@@ -150,6 +150,9 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
     if let Some(total) = state.total {
         heading.push_str(&format!(" {done}/{total} blobs"));
     }
+    if let Some(platforms) = &state.platforms {
+        heading.push_str(&format!(" | {platforms}"));
+    }
     let spinner =
         SPINNERS[(now.saturating_duration_since(state.started).as_millis() / 100 % 10) as usize];
     let status = match state.status {

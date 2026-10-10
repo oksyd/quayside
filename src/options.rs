@@ -1,4 +1,16 @@
 //! Operation options independent of command-line parsing.
+/// Platform policy for remote image transfers; artifacts remain intact in native mode.
+#[derive(Debug, Clone, Default)]
+pub enum PlatformSelection {
+    /// Select the local container platform, using Linux on macOS.
+    #[default]
+    Native,
+    /// Preserve the complete source graph, including indexed attestations.
+    All,
+    /// Select exactly one explicitly requested platform.
+    Platform(crate::model::Platform),
+}
+
 /// Optional graph expansion and durable transfer behavior.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TransferOptions {

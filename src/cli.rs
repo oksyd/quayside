@@ -207,15 +207,28 @@ pub enum TagCommand {
         repository: String,
     },
 }
-/// Explicit platform filtering; omitted filters preserve all source platforms.
+/// Platform filtering; omitted flags select the local container platform.
 #[derive(Debug, Clone, Default, Args)]
 pub struct Selection {
-    /// Explicitly select the complete source graph across platforms.
+    /// Copy all platforms and indexed attestations, preserving the source graph.
     #[arg(long, conflicts_with = "platform")]
     pub all: bool,
-    /// Optional platform selector in `os/architecture[/variant]` form.
+    /// Select os/architecture[/variant] (default: local platform; Linux on macOS).
     #[arg(long)]
     pub platform: Option<String>,
+}
+impl TryFrom<&Selection> for crate::options::PlatformSelection {
+    type Error = crate::Error;
+
+    fn try_from(value: &Selection) -> crate::Result<Self> {
+        Ok(if value.all {
+            Self::All
+        } else if let Some(platform) = &value.platform {
+            Self::Platform(platform.parse()?)
+        } else {
+            Self::Native
+        })
+    }
 }
 /// Additional transfer behavior for remote sources.
 #[derive(Debug, Clone, Default, Args)]
@@ -224,7 +237,7 @@ pub struct TransferOptions {
     #[arg(long, value_enum, default_value = "none")]
     pub referrers: ReferrerMode,
     /// Preserve indexed attestations with the selected platform (creates a filtered index).
-    #[arg(long, requires = "platform")]
+    #[arg(long, conflicts_with = "all")]
     pub include_attestations: bool,
     /// Resume unfinished blob transfers across invocations using the private cache directory.
     #[arg(long)]
@@ -472,6 +485,55 @@ mod tests {
                 "--all",
                 "--platform",
                 "linux/amd64"
+            ])
+            .is_err()
+        );
+    }
+    #[test]
+    fn transfer_platform_defaults_and_attestation_options() {
+        use crate::options::PlatformSelection;
+        for extra in [
+            vec![],
+            vec!["--all"],
+            vec!["--platform", "linux/arm64"],
+            vec!["--include-attestations"],
+        ] {
+            let mut args = vec!["quayside", "image", "copy", "a.io/b:v1", "b.io/a:v1"];
+            args.extend(&extra);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Image {
+                command:
+                    ImageCommand::Copy {
+                        selection,
+                        transfer,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected image copy");
+            };
+            let selection = PlatformSelection::try_from(&selection).unwrap();
+            match extra.first().copied() {
+                Some("--all") => assert!(matches!(selection, PlatformSelection::All)),
+                Some("--platform") => assert!(
+                    matches!(selection, PlatformSelection::Platform(p) if p.to_string() == "linux/arm64")
+                ),
+                _ => assert!(matches!(selection, PlatformSelection::Native)),
+            }
+            assert_eq!(
+                transfer.include_attestations,
+                extra.contains(&"--include-attestations")
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "quayside",
+                "image",
+                "copy",
+                "a.io/b:v1",
+                "b.io/a:v1",
+                "--all",
+                "--include-attestations"
             ])
             .is_err()
         );

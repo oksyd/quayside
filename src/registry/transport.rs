@@ -241,7 +241,8 @@ impl Registry {
         retry_safe: bool,
     ) -> Result<(Response, bool)> {
         self.validate_content_url(&url)?;
-        let operation = super::diagnostics::operation(&method, &url);
+        let request_operation = super::diagnostics::operation(&method, &url);
+        let operation = request_operation.label();
         let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
         let mut attempts = 0usize;
         let mut auth = self
@@ -498,15 +499,30 @@ impl Registry {
             if matches!(
                 response.status(),
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
+            ) || (matches!(
+                request_operation,
+                super::diagnostics::Operation::PublishManifest(_)
+            ) && response.status() != StatusCode::CREATED)
+            {
+                let status = response.status();
                 let authorization = match auth.as_ref().filter(|_| local) {
                     Some(CachedAuth::Bearer { .. }) => "bearer token",
                     Some(CachedAuth::Basic) if used_auth => "basic credentials",
                     _ => "none",
                 };
-                return Err(
-                    super::diagnostics::response_error(response, operation, authorization).await,
-                );
+                let mut error =
+                    super::diagnostics::response_error(response, operation, authorization).await;
+                if let super::diagnostics::Operation::PublishManifest(expected) = &request_operation
+                    && let Some(body) = &body
+                {
+                    super::diagnostics::manifest_rejection(
+                        &mut error,
+                        body,
+                        expected.as_ref(),
+                        status,
+                    );
+                }
+                return Err(error);
             }
             return Ok((response, used_auth));
         }

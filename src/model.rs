@@ -41,6 +41,10 @@ pub struct Platform {
     pub extra: Map<String, Value>,
 }
 impl Platform {
+    /// Return the local container platform; supported macOS hosts run Linux containers.
+    pub fn native() -> Result<Self> {
+        native_platform(std::env::consts::OS, std::env::consts::ARCH)?.parse()
+    }
     /// Compare operating system and architecture, also checking the requested variant when supplied.
     pub fn matches(&self, wanted: &Platform) -> bool {
         self.os == wanted.os
@@ -82,6 +86,15 @@ impl Platform {
             })
             .unwrap_or_default();
         Ok(p)
+    }
+}
+fn native_platform(os: &str, architecture: &str) -> Result<&'static str> {
+    match (os, architecture) {
+        ("linux", "x86_64") => Ok("linux/amd64"),
+        ("linux" | "macos", "aarch64") => Ok("linux/arm64"),
+        _ => Err(Error::input(
+            "cannot determine the local container platform; use --platform or --all",
+        )),
     }
 }
 impl FromStr for Platform {
@@ -441,6 +454,14 @@ mod tests {
         assert!(!parse(&value).is_artifact().unwrap());
     }
 
+    #[test]
+    fn native_platform_maps_supported_container_hosts() {
+        assert_eq!(native_platform("linux", "x86_64").unwrap(), "linux/amd64");
+        assert_eq!(native_platform("linux", "aarch64").unwrap(), "linux/arm64");
+        assert_eq!(native_platform("macos", "aarch64").unwrap(), "linux/arm64");
+        assert!(native_platform("unknown", "unknown").is_err());
+        assert!(native_platform("linux", "arm").is_err());
+    }
     #[test]
     fn platform_matching() {
         let full: Platform = "linux/arm64/v8".parse().unwrap();

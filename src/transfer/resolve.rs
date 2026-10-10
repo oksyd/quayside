@@ -3,6 +3,7 @@ use crate::{
     config::parse_size,
     digest::Digest,
     model::{Descriptor, Manifest, ManifestKind, Platform},
+    options::PlatformSelection,
     reference::Reference,
     registry::Registry,
 };
@@ -19,16 +20,33 @@ pub struct Resolved {
     pub platforms: Vec<String>,
 }
 
-/// Selects content by a pinned digest. No selection ever defaults to the host CPU.
+/// Resolve an explicit platform, or preserve the entire graph when no platform is supplied.
 pub async fn resolve(
     source: &Registry,
     reference: &Reference,
     platform: Option<&str>,
 ) -> Result<Resolved> {
-    let wanted = platform.map(str::parse::<Platform>).transpose()?;
+    let selection = match platform {
+        Some(platform) => PlatformSelection::Platform(platform.parse()?),
+        None => PlatformSelection::All,
+    };
+    resolve_selection(source, reference, &selection).await
+}
+
+pub(super) async fn resolve_selection(
+    source: &Registry,
+    reference: &Reference,
+    selection: &PlatformSelection,
+) -> Result<Resolved> {
     let root = source.get_manifest(reference).await?;
     let original = root.digest().clone();
-    if root.kind == ManifestKind::Image && platform.is_none() && !root.is_artifact()? {
+    let wanted = match selection {
+        PlatformSelection::All => None,
+        PlatformSelection::Native if root.is_artifact()? => None,
+        PlatformSelection::Native => Some(Platform::native()?),
+        PlatformSelection::Platform(platform) => Some(platform.clone()),
+    };
+    if root.kind == ManifestKind::Image && wanted.is_none() && !root.is_artifact()? {
         let p = image_platform(source, &reference.repository, &root).await?;
         let mut root = root;
         root.descriptor.platform = Some(p.clone());
@@ -57,7 +75,9 @@ pub async fn resolve(
     if root.kind == ManifestKind::Image {
         let p = image_platform(source, &reference.repository, &root).await?;
         if !p.matches(&wanted) {
-            return Err(Error::input(format!("requested {wanted}, image is {p}")));
+            return Err(Error::input(format!(
+                "requested {wanted}, image is {p}; use --platform to select it or --all to preserve all content"
+            )));
         }
         let mut root = root;
         root.descriptor.platform = Some(p.clone());
@@ -162,7 +182,7 @@ pub async fn resolve(
     }
     if candidates.len() != 1 {
         return Err(Error::input(format!(
-            "platform {wanted} matched {} objects; available: {}",
+            "platform {wanted} matched {} objects; available: {}; use --platform to select a platform or --all to preserve all content",
             candidates.len(),
             available.into_iter().collect::<Vec<_>>().join(", ")
         )));

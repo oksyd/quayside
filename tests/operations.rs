@@ -15,7 +15,7 @@ use support::{Harness, Response, Server, image_layout};
 #[test]
 fn digest_reads_only_manifest_and_inspect_reads_config_once() {
     let root = tempfile::tempdir().unwrap();
-    let image = image_layout(root.path(), 1, 8192);
+    let image = support::image_layout_for(root.path(), 1, 8192, "arm64");
     let expected = image.digest.clone();
     let reads = Arc::new(AtomicUsize::new(0));
     let observed = reads.clone();
@@ -196,7 +196,7 @@ fn copy_publishes_siblings_concurrently_and_parents_after_children() {
     harness.config.transfer.concurrency = 2;
     let src = format!("{}/app:v1", source.host);
     let dst = format!("{}/app:v1", target.host);
-    harness.json(&["image", "copy", &src, &dst], 0);
+    harness.json(&["image", "copy", "--all", &src, &dst], 0);
     let writes = writes.lock().unwrap();
     assert_eq!(writes.len(), 4);
     assert_eq!(writes.last().unwrap(), "v1");
@@ -238,6 +238,7 @@ fn failed_dependency_check_never_publishes_parent() {
         &[
             "image",
             "copy",
+            "--all",
             &format!("{}/app:v1", source.host),
             &format!("{}/app:v1", target.host),
         ],
@@ -292,6 +293,7 @@ fn cancelled_manifest_write_reports_uncertain_remote_changes() {
         &[
             "image",
             "copy",
+            "--all",
             &format!("{}/app:v1", source.host),
             &format!("{}/app:v1", target.host),
         ],
@@ -367,6 +369,7 @@ fn ready_parent_does_not_wait_for_an_unrelated_slow_branch() {
         &[
             "image",
             "copy",
+            "--all",
             &format!("{}/app:v1", source.host),
             &format!("{}/app:v1", target.host),
         ],
@@ -377,7 +380,7 @@ fn ready_parent_does_not_wait_for_an_unrelated_slow_branch() {
 #[test]
 fn platform_selection_fetches_candidates_concurrently_and_deduplicates_them() {
     let root = tempfile::tempdir().unwrap();
-    let arm = image_layout(&root.path().join("arm"), 0, 0);
+    let arm = support::image_layout_for(&root.path().join("arm"), 0, 0, "arm64");
     let amd = support::image_layout_for(&root.path().join("amd"), 0, 0, "amd64");
     let arm_manifest =
         Manifest::parse(arm.manifest.clone().into(), Some(OCI_MANIFEST), None).unwrap();
@@ -495,7 +498,7 @@ fn platform_selection_reserves_limits_before_requests_and_rejects_conflicting_de
 #[test]
 fn nested_platform_selection_counts_each_manifest_once_against_budget() {
     let temp = tempfile::tempdir().unwrap();
-    let image = image_layout(temp.path(), 0, 0);
+    let image = support::image_layout_for(temp.path(), 0, 0, "arm64");
     let mut value: serde_json::Value = serde_json::from_slice(&image.manifest).unwrap();
     value["annotations"] = json!({"fixture": "x".repeat(400)});
     let leaf = Manifest::parse(
@@ -548,7 +551,7 @@ fn nested_platform_selection_counts_each_manifest_once_against_budget() {
 #[test]
 fn platform_selection_checks_deeper_paths_through_shared_indexes() {
     let temp = tempfile::tempdir().unwrap();
-    let image = image_layout(temp.path(), 0, 0);
+    let image = support::image_layout_for(temp.path(), 0, 0, "arm64");
     let leaf = Manifest::parse(image.manifest.clone().into(), Some(OCI_MANIFEST), None).unwrap();
     let shared = index(&[&leaf], "shared");
     let branch = index(&[&shared], "branch");
@@ -741,6 +744,7 @@ fn manifest_publication_latency_benchmark() {
         &[
             "image",
             "copy",
+            "--all",
             &format!("{}/app:v1", source.host),
             &format!("{}/app:v1", target.host),
         ],

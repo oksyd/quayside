@@ -62,6 +62,8 @@ pub enum BlobOutcome {
 
 /// Receives operation stages without imposing a terminal or logging backend.
 pub trait Observer: Send + Sync {
+    /// Report selected image platforms before transferring content; an empty list denotes no platform.
+    fn selected_platforms(&self, _platforms: &[String]) {}
     /// Begin observing an operation stage; total is the known blob count, or zero for metadata work.
     fn begin(&self, phase: Phase, total: usize) -> Box<dyn Operation>;
 }

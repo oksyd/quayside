@@ -39,6 +39,8 @@ pub struct PullResult {
     pub source_digest: crate::digest::Digest,
     /// Digest of the selected or published destination manifest.
     pub target_digest: crate::digest::Digest,
+    /// Platforms selected for export; empty for an artifact without an image platform.
+    pub platforms: Vec<String>,
     /// Destination path for the exported layout directory or archive.
     pub output: PathBuf,
     /// OCI layout directory or uncompressed tar archive format.
@@ -754,12 +756,16 @@ pub async fn pull_with_observer(
     write: &WriteOptions,
     observer: &dyn Observer,
 ) -> Result<PullResult> {
+    let selection = match platform {
+        Some(platform) => crate::options::PlatformSelection::Platform(platform.parse()?),
+        None => crate::options::PlatformSelection::All,
+    };
     pull_with_options(
         source,
         reference,
         output,
         format,
-        platform,
+        &selection,
         write,
         &crate::options::TransferOptions::default(),
         observer,
@@ -774,14 +780,15 @@ pub async fn pull_with_options(
     reference: &Reference,
     output: &Path,
     format: ArchiveFormat,
-    platform: Option<&str>,
+    selection: &crate::options::PlatformSelection,
     write: &WriteOptions,
     options: &crate::options::TransferOptions,
     observer: &dyn Observer,
 ) -> Result<PullResult> {
     check_output(output, write.overwrite)?;
     let resolving = observer.begin(Phase::Resolving, 0);
-    let resolved = transfer::associated::selected(source, reference, platform, options).await?;
+    let resolved = transfer::associated::selected(source, reference, selection, options).await?;
+    observer.selected_platforms(&resolved.platforms);
     let mut graph = transfer::remote_graph(source, reference, resolved.manifest).await?;
     if options.referrers {
         transfer::associated::expand(source, reference, &mut graph).await?;
@@ -958,6 +965,11 @@ pub async fn pull_with_options(
         source: reference.to_string(),
         source_digest: resolved.source_digest,
         target_digest: graph.root.digest().clone(),
+        platforms: if resolved.platforms.is_empty() {
+            graph.platforms()?
+        } else {
+            resolved.platforms
+        },
         output: output.to_owned(),
         format,
         blob_bytes,

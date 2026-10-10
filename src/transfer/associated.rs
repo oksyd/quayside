@@ -1,19 +1,26 @@
-use super::{Graph, Manifest, Reference, Registry, Resolved, remote_graph, resolve};
-use crate::{Error, Result, digest::Digest, model::OCI_INDEX, options::TransferOptions};
+use super::{
+    Graph, Manifest, Reference, Registry, Resolved, remote_graph, resolve::resolve_selection,
+};
+use crate::{
+    Error, Result,
+    digest::Digest,
+    model::OCI_INDEX,
+    options::{PlatformSelection, TransferOptions},
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(crate) async fn selected(
     source: &Registry,
     reference: &Reference,
-    platform: Option<&str>,
+    selection: &PlatformSelection,
     options: &TransferOptions,
 ) -> Result<Resolved> {
-    if options.include_attestations && platform.is_none() {
+    if options.include_attestations && matches!(selection, PlatformSelection::All) {
         return Err(Error::input(
-            "include_attestations requires an explicit platform",
+            "--all already includes indexed attestations; omit --include-attestations",
         ));
     }
-    let mut resolved = resolve(source, reference, platform).await?;
+    let mut resolved = resolve_selection(source, reference, selection).await?;
     if !options.include_attestations || &resolved.source_digest == resolved.manifest.digest() {
         return Ok(resolved);
     }

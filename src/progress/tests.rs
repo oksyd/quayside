@@ -25,6 +25,7 @@ fn snapshot(observer: &TerminalObserver, width: usize, height: usize) -> String 
 #[test]
 fn rows_keep_their_order_and_final_results_across_command_stages() {
     let (observer, stage) = display(3);
+    observer.selected_platforms(&["linux/amd64".into()]);
     for id in ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"] {
         stage.register_blob(format!("sha256:{id}"), 1024);
     }
@@ -35,6 +36,7 @@ fn rows_keep_their_order_and_final_results_across_command_stages() {
     first.position(512);
     let screen = snapshot(&observer, 100, 24);
     assert!(screen.contains("[+] Copying 1/3 blobs"));
+    assert!(screen.contains("Platform: linux/amd64"));
     assert!(screen.contains("nginx:latest"));
     assert!(screen.contains("512 B/1.00 KiB"));
     let rows: Vec<_> = screen.lines().skip(2).collect();

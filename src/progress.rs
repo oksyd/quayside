@@ -7,7 +7,7 @@ use crate::{
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::{
     collections::BTreeMap,
-    io::IsTerminal,
+    io::{IsTerminal, Write},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
@@ -68,6 +68,7 @@ impl Row {
 
 struct State {
     image: String,
+    platforms: Option<String>,
     action: Phase,
     phase: Phase,
     total: Option<usize>,
@@ -85,6 +86,7 @@ impl State {
                 .chars()
                 .map(|c| if c.is_control() { '?' } else { c })
                 .collect(),
+            platforms: None,
             action,
             phase: Phase::Resolving,
             total: None,
@@ -155,6 +157,7 @@ impl Display {
 pub(crate) struct TerminalObserver {
     display: Option<Arc<Display>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    platform_notice: bool,
 }
 impl TerminalObserver {
     pub(crate) fn new(enabled: bool, image: String, action: Phase) -> Self {
@@ -165,6 +168,7 @@ impl TerminalObserver {
             return Self {
                 display: None,
                 task: None,
+                platform_notice: false,
             };
         }
         let terminal = console::Term::stderr();
@@ -206,7 +210,12 @@ impl TerminalObserver {
                 dimensions,
             })),
             task: None,
+            platform_notice: false,
         }
+    }
+    pub(crate) fn with_platform_notice(mut self, enabled: bool) -> Self {
+        self.platform_notice = enabled;
+        self
     }
     pub(crate) fn complete<T>(&self, result: &Result<T>) {
         if let Some(display) = &self.display {
@@ -240,6 +249,27 @@ impl Drop for TerminalObserver {
     }
 }
 impl Observer for TerminalObserver {
+    fn selected_platforms(&self, platforms: &[String]) {
+        if platforms.is_empty() {
+            return;
+        }
+        let label = if platforms.len() == 1 {
+            "Platform"
+        } else {
+            "Platforms"
+        };
+        let text: String = format!("{label}: {}", platforms.join(", "))
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
+        if let Some(display) = &self.display {
+            display.state.lock().expect("progress state lock").platforms = Some(text);
+        } else if self.platform_notice {
+            suspend(|| {
+                let _ = writeln!(std::io::stderr().lock(), "{text}");
+            });
+        }
+    }
     fn begin(&self, phase: Phase, total: usize) -> Box<dyn Operation> {
         if let Some(display) = &self.display {
             let mut state = display.state.lock().expect("progress state lock");

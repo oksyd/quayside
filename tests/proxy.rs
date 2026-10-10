@@ -135,9 +135,10 @@ fn docker_https_proxy_is_used_for_connect_tunnel() {
 
 #[test]
 fn connection_errors_show_safe_destination_proxy_source_and_typed_reason() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    drop(listener);
+    // Reserve a port without listening so concurrent fixtures cannot claim it.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap().to_string();
     let harness = Harness::new(&[(&address, true)]);
     let daemon = harness.daemon_config();
     fs::write(
@@ -218,14 +219,20 @@ fn docker_cidr_rules_bypass_local_ips_and_preserve_proxy_for_other_hosts() {
 
 #[test]
 fn native_cidr_routing_does_not_resolve_hostnames_and_reports_invalid_rules() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
     let literal = address.to_string();
     let hostname = format!("localhost:{}", address.port());
-    drop(listener);
-    let ipv6 = std::net::TcpListener::bind("[::1]:0")
-        .ok()
-        .map(|listener| listener.local_addr().unwrap().to_string());
+    let ipv6_socket = tokio::net::TcpSocket::new_v6()
+        .and_then(|socket| {
+            socket.bind("[::1]:0".parse().unwrap())?;
+            Ok(socket)
+        })
+        .ok();
+    let ipv6 = ipv6_socket
+        .as_ref()
+        .map(|socket| socket.local_addr().unwrap().to_string());
     let seen = Arc::new(AtomicUsize::new(0));
     let count = seen.clone();
     let proxy = Server::new(move |_| {

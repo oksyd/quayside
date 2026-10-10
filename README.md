@@ -25,9 +25,10 @@ quayside image copy nginx:latest \
 
 Source names default to Docker Hub: `nginx:latest` resolves to `docker.io/library/nginx:latest`, and `apache/skywalking-banyandb:0.11.0` to `docker.io/apache/skywalking-banyandb:0.11.0`.
 
-All image platforms are copied by default. Optional flags:
+Copy and pull select the local container platform by default: `linux/amd64` on Linux x86_64, or `linux/arm64` on Linux ARM64 and macOS Apple Silicon. The selected platform is displayed before transfer; a missing match is an error. Optional flags:
 
-- `--platform linux/amd64`: copy one platform.
+- `--platform linux/amd64`: select a different platform explicitly.
+- `--all`: preserve all platforms and indexed attestations.
 - `--include-attestations`: retain that platform's indexed attestations in a new OCI index.
 - `--referrers all`: discover and recursively copy associated signatures and SBOMs.
 - `--resume`: retain partial downloads and upload sessions for the next run.
@@ -35,7 +36,9 @@ All image platforms are copied by default. Optional flags:
 - `--overwrite`: replace a different destination manifest.
 - `--no-progress`: hide progress bars.
 
-OCI artifacts such as Trivy databases can also be copied. Attestations included in the selected image index are preserved, with subject associations registered at the destination. Independent referrers are discovered only with `--referrers all`; signatures are not verified. Filtering platforms with `--include-attestations` creates a new index digest; child manifests remain unchanged.
+OCI artifacts such as Trivy databases are copied intact without platform filtering. Single-platform transfers omit indexed attestations unless `--include-attestations` is set. This flag also works with the default local platform; it creates a new index digest while preserving child manifest bytes. Independent referrers are discovered only with `--referrers all`; signatures are not verified.
+
+If the destination rejects build attestations, use the default platform or `--platform` without `--include-attestations` or `--referrers all`. Preserving attestations with `--all` or `--include-attestations` requires destination support for those manifests.
 
 `image copy` automatically reuses matching blobs from Docker's current context when available.
 Missing content is downloaded from the source registry; the original digests and platform selection are preserved.

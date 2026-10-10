@@ -100,7 +100,7 @@ fn distribution_round_trip_copy_limits_and_mount() {
     let target = env::var("QUAYSIDE_TEST_TARGET").expect("set QUAYSIDE_TEST_TARGET=127.0.0.1:port");
     assert_ne!(source, target);
     let mut harness = Harness::new(&[(&source, true), (&target, true)]);
-    let image = image_layout(harness.root.path(), 4, 4096);
+    let image = image_layout_for(harness.root.path(), 4, 4096, "arm64");
     let run = format!("quayside-{}", std::process::id());
     let src = format!("{source}/{run}/source:v1");
     let dst = format!("{target}/{run}/target:v1");
@@ -109,7 +109,7 @@ fn distribution_round_trip_copy_limits_and_mount() {
         0,
     );
     harness.config.transfer.max_temp_size = "1KiB".into();
-    let rejected = harness.json(&["image", "copy", &src, &dst], 2);
+    let rejected = harness.json(&["image", "copy", "--all", &src, &dst], 2);
     assert!(
         rejected["error"]["message"]
             .as_str()
@@ -118,7 +118,7 @@ fn distribution_round_trip_copy_limits_and_mount() {
     );
     harness.json(&["image", "digest", &dst], 4);
     harness.config.transfer.max_temp_size = "4KiB".into();
-    let copied = harness.json(&["image", "copy", &src, &dst], 0);
+    let copied = harness.json(&["image", "copy", "--all", &src, &dst], 0);
     assert_eq!(copied["data"]["target_digest"], image.digest);
     assert_eq!(
         copied["data"]["platforms"],
@@ -131,19 +131,26 @@ fn distribution_round_trip_copy_limits_and_mount() {
             .count(),
         0
     );
-    let repeated = harness.json(&["image", "copy", &src, &dst], 0);
+    let repeated = harness.json(&["image", "copy", "--all", &src, &dst], 0);
     assert_eq!(repeated["data"]["stats"]["copied_blobs"], 0);
     assert_eq!(repeated["data"]["stats"]["skipped_blobs"], 5);
     let mounted = format!("{source}/{run}/mounted:v1");
-    let result = harness.json(&["image", "copy", &src, &mounted], 0);
+    let result = harness.json(&["image", "copy", "--all", &src, &mounted], 0);
     assert_eq!(result["data"]["stats"]["mounted_blobs"], 5);
     let dry = format!("{target}/{run}/dry:v1");
-    harness.json(&["image", "copy", &src, &dry, "--dry-run"], 0);
+    harness.json(&["image", "copy", "--all", &src, &dry, "--dry-run"], 0);
     harness.json(&["image", "digest", &dry], 4);
     harness.config.transfer.max_temp_size = "1MiB".into();
     let archive = harness.root.path().join("image.tar");
     harness.json(
-        &["image", "pull", &src, "--output", archive.to_str().unwrap()],
+        &[
+            "image",
+            "pull",
+            "--all",
+            &src,
+            "--output",
+            archive.to_str().unwrap(),
+        ],
         0,
     );
     let restored = format!("{target}/{run}/restored:v1");
@@ -161,7 +168,7 @@ fn distribution_round_trip_copy_limits_and_mount() {
         0,
     );
     let all = format!("{source}/{run}/all:v1");
-    let copied = harness.json(&["image", "copy", &index, &all], 0);
+    let copied = harness.json(&["image", "copy", "--all", &index, &all], 0);
     assert_eq!(
         copied["data"]["target_digest"],
         aggregated["data"]["target_digest"]
@@ -183,8 +190,8 @@ fn distribution_round_trip_copy_limits_and_mount() {
         0,
     );
     assert_eq!(selected["data"]["target_digest"], other.digest);
-    harness.json(&["image", "copy", &index, &dst], 8);
-    harness.json(&["image", "copy", &index, &dst, "--overwrite"], 0);
+    harness.json(&["image", "copy", "--all", &index, &dst], 8);
+    harness.json(&["image", "copy", "--all", &index, &dst, "--overwrite"], 0);
     let tags = harness.json(&["tag", "ls", &format!("{target}/{run}/target")], 0);
     assert_eq!(tags["data"]["tags"], serde_json::json!(["v1"]));
 
