@@ -1,8 +1,17 @@
+## [0.1.12] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Improve registry authentication failure diagnostics
 ## [0.1.11] - 2026-09-30
 
 ### 🚀 Features
 
 - Add persistent hierarchical progress for image transfers
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.11
 ## [0.1.10] - 2026-09-29
 
 ### 🚀 Features
