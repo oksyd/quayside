@@ -1,8 +1,18 @@
+## [0.1.15] - 2026-10-27
+
+### 🐛 Bug Fixes
+
+- Correct transfer progress states and compact terminal display
+- Preserve manifest metadata and correct transfer recovery
 ## [0.1.14] - 2026-10-10
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.14
 ## [0.1.13] - 2026-10-10
 
 ### 🚀 Features
