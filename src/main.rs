@@ -58,7 +58,7 @@ fn emit_error(
         let _ = serde_json::to_writer(&mut stdout, &envelope);
         let _ = writeln!(stdout);
     } else {
-        eprintln!("error [{:?}]: {}", error.code, error.message);
+        eprintln!("error [{:?}]: {error}", error.code);
         if partial {
             eprintln!(
                 "warning: remote writes may have occurred; no remote objects were automatically deleted."
@@ -118,11 +118,13 @@ async fn main() {
         Err(e) => std::process::exit(emit_error(&e, label, cli.json, false, &[])),
     };
     let result = tokio::select! {
-        result = app::run(&ctx, &cli.command) => result,
+        // Register interruption handling before a password prompt or other work begins.
+        biased;
         signal = tokio::signal::ctrl_c() => match signal {
             Ok(()) => Err(Error::new(Code::Interrupted, "interrupted by user")),
             Err(e) => Err(Error::from(e)),
         },
+        result = app::run(&ctx, &cli.command) => result,
     };
     let warnings = ctx.warnings();
     let exit = match result {

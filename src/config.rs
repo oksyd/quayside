@@ -1,4 +1,8 @@
-use crate::{Error, Result, reference::registry_name, storage};
+use crate::{
+    Error, Result,
+    reference::{authority_name, registry_name},
+    storage,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -159,7 +163,7 @@ impl Config {
                 ));
             }
             for h in &registry.auth_hosts {
-                registry_name(h)?;
+                authority_name(h)?;
             }
         }
         Ok(())

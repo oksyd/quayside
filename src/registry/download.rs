@@ -60,14 +60,14 @@ impl Registry {
         output: &Path,
         progress: &dyn BlobProgress,
         slots: Arc<Semaphore>,
-        resume: Option<&crate::resume::Blob>,
+        resume: Option<&Arc<crate::resume::Blob>>,
     ) -> Result<()> {
         validate_repository(repo)?;
         progress.phase(BlobPhase::Downloading);
         if let Some(raw) = d.embedded()?.or(self.cached_blob(repo, d).await?) {
             tokio::fs::write(output, &raw).await?;
             if let Some(resume) = resume {
-                resume.downloaded(d.size)?;
+                resume.downloaded(d.size).await?;
             }
             progress.position(d.size);
             return Ok(());
@@ -87,7 +87,7 @@ impl Registry {
             saved
         };
         if let Some(resume) = resume {
-            resume.ranges(&ranges)?;
+            resume.ranges(&ranges).await?;
         }
         let result = async {
             if ranges.len() > 1
@@ -98,7 +98,7 @@ impl Registry {
                     return Ok(());
                 }
                 if let Some(resume) = resume {
-                    resume.ranges(std::slice::from_ref(&(0..d.size)))?;
+                    resume.ranges(std::slice::from_ref(&(0..d.size))).await?;
                 }
                 return download.sequential(output, None).await;
             }
@@ -120,7 +120,7 @@ impl Registry {
                 }
             }
             if let Some(resume) = resume {
-                resume.ranges(std::slice::from_ref(&(0..d.size)))?;
+                resume.ranges(std::slice::from_ref(&(0..d.size))).await?;
             }
             download.sequential(output, first).await
         }
@@ -130,7 +130,7 @@ impl Registry {
             .is_err_and(|e| e.code == crate::error::Code::Integrity)
             && let Some(resume) = resume
         {
-            resume.reset()?;
+            resume.reset().await?;
         }
         result
     }
@@ -142,7 +142,7 @@ struct Download<'a> {
     descriptor: &'a Descriptor,
     progress: &'a dyn BlobProgress,
     slots: Arc<Semaphore>,
-    resume: Option<&'a crate::resume::Blob>,
+    resume: Option<&'a Arc<crate::resume::Blob>>,
 }
 
 impl Download<'_> {
@@ -203,7 +203,7 @@ impl Download<'_> {
             if let Some(resume) = self.resume {
                 file.flush().await?;
                 file.get_ref().sync_data().await?;
-                resume.checkpoint(0, count)?;
+                resume.checkpoint(0, count).await?;
             }
             match result {
                 Ok(()) => break,
@@ -234,10 +234,16 @@ impl Download<'_> {
             // Verify all received bytes even if a trailing transport error interrupted the response.
             return Ok(());
         }
-        let (mut response, _permit) = match first {
+        let mut response = match first {
             Some(response) => response,
             None => self.request((*count > 0).then_some(*count..d.size)).await?,
         };
+        if *count > 0 && range_unsupported(response.0.status()) {
+            // Range is optional. Release the failed request slot before restarting the full GET.
+            drop(response);
+            response = self.request(None).await?;
+        }
+        let (mut response, _permit) = response;
         match response.status() {
             StatusCode::OK => {
                 if *count > 0 {
@@ -248,7 +254,7 @@ impl Download<'_> {
                     *hasher = d.digest.hasher();
                     *count = 0;
                     if let Some(resume) = self.resume {
-                        resume.checkpoint(0, 0)?;
+                        resume.checkpoint(0, 0).await?;
                     }
                     progress.position(0);
                 }
@@ -273,6 +279,7 @@ impl Download<'_> {
                 "blob HTTP Content-Length does not match descriptor",
             ));
         }
+        let mut checkpointed = *count;
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
             let size = response
@@ -293,11 +300,12 @@ impl Download<'_> {
             *count = next;
             progress.position(*count);
             if let Some(resume) = self.resume
-                && *count - resume.offset(0) >= 4 * 1024 * 1024
+                && *count - checkpointed >= 4 * 1024 * 1024
             {
                 file.flush().await?;
                 file.get_ref().sync_data().await?;
-                resume.checkpoint(0, *count)?;
+                resume.checkpoint(0, *count).await?;
+                checkpointed = *count;
             }
         }
         if *count != d.size {
@@ -466,7 +474,7 @@ impl Download<'_> {
         file.flush().await?;
         if let Some(resume) = self.resume {
             file.get_ref().sync_data().await?;
-            resume.checkpoint(start, *offset)?;
+            resume.checkpoint(start, *offset).await?;
         }
         result
     }
@@ -480,6 +488,7 @@ impl Download<'_> {
         end: u64,
         completed: &Mutex<u64>,
     ) -> Result<bool> {
+        let mut checkpointed = *offset;
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
             let size = response
@@ -498,11 +507,12 @@ impl Download<'_> {
             file.write_all(&buffer[..size]).await?;
             *offset = next;
             if let Some(resume) = self.resume
-                && *offset - resume.offset(start) >= 4 * 1024 * 1024
+                && *offset - checkpointed >= 4 * 1024 * 1024
             {
                 file.flush().await?;
                 file.get_ref().sync_data().await?;
-                resume.checkpoint(start, *offset)?;
+                resume.checkpoint(start, *offset).await?;
+                checkpointed = *offset;
             }
             // Serialize callbacks so concurrent parts never report progress out of order.
             let mut count = completed.lock().expect("download progress lock poisoned");

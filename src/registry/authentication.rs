@@ -1,6 +1,6 @@
 use super::Registry;
 use super::transport::{
-    authority, client, is_connect, is_timeout, limited_body, retry_delay, same_origin, valid_url,
+    authority, client, limited_body, retry_delay, retryable_transport, same_origin, valid_url,
 };
 use crate::auth::Credential;
 use crate::config::duration;
@@ -140,7 +140,9 @@ impl Registry {
             let mut request = http
                 .inner
                 .request(Method::GET, url.as_str())
-                .total_timeout(duration(&self.inner.config.transfer.metadata_timeout)?);
+                .total_timeout(Some(duration(
+                    &self.inner.config.transfer.metadata_timeout,
+                )?));
             if let Some(credential) = &self.inner.credential {
                 request = request.header(header::AUTHORIZATION, basic_auth(credential)?);
             }
@@ -165,7 +167,8 @@ impl Registry {
             }
             match result {
                 Ok(r)
-                    if (r.status() == StatusCode::TOO_MANY_REQUESTS
+                    if (r.status() == StatusCode::REQUEST_TIMEOUT
+                        || r.status() == StatusCode::TOO_MANY_REQUESTS
                         || r.status().is_server_error())
                         && attempt < max_retries =>
                 {
@@ -174,11 +177,7 @@ impl Registry {
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(e)
-                    if crate::error::certificate_code(&e).is_none()
-                        && (is_timeout(&e) || is_connect(&e))
-                        && attempt < max_retries =>
-                {
+                Err(e) if retryable_transport(&e) && attempt < max_retries => {
                     tokio::time::sleep(retry_delay(None, attempt)).await;
                     attempt += 1;
                 }
@@ -263,6 +262,34 @@ mod tests {
                 matches,
                 "{allowed}: {realm}"
             );
+        }
+    }
+
+    #[test]
+    fn configured_auth_hosts_trust_literal_origins_not_registry_aliases() {
+        for (input, trusted, untrusted) in [
+            (
+                "REGISTRY-1.DOCKER.IO:443",
+                "https://registry-1.docker.io/token",
+                "https://docker.io/token",
+            ),
+            (
+                "INDEX.DOCKER.IO:8443",
+                "https://index.docker.io:8443/token",
+                "https://index.docker.io/token",
+            ),
+            (
+                "[0:0:0:0:0:0:0:1]:443",
+                "http://[::1]:443/token",
+                "http://[::1]/token",
+            ),
+        ] {
+            let allowed = crate::reference::authority_name(input).unwrap();
+            assert!(auth_host_matches(&allowed, &Url::parse(trusted).unwrap()));
+            assert!(!auth_host_matches(
+                &allowed,
+                &Url::parse(untrusted).unwrap()
+            ));
         }
     }
 }

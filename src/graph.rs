@@ -30,6 +30,20 @@ enum Task {
     Finish(Digest),
 }
 impl Graph {
+    fn check_shared_sizes(&self) -> Result<()> {
+        // A digest can be used as both manifest and blob, but still names the same bytes.
+        for (digest, blob) in &self.blobs {
+            if let Some(manifest) = self.manifests.get(digest)
+                && blob.size != manifest.raw.len() as u64
+            {
+                return Err(Error::integrity(format!(
+                    "conflicting manifest and blob sizes for {digest}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn merge_referrer(&mut self, other: Self, limits: &TransferConfig) -> Result<()> {
         let root = other.root.digest().clone();
         for digest in other.order {
@@ -62,6 +76,7 @@ impl Graph {
                 self.blobs.insert(digest, descriptor);
             }
         }
+        self.check_shared_sizes()?;
         if self.manifests.len() + self.blobs.len() > limits.max_objects
             || self
                 .manifests
@@ -91,6 +106,9 @@ impl Graph {
         F: FnMut(Descriptor) -> Fut,
         Fut: Future<Output = Result<Manifest>>,
     {
+        if !(1..=32).contains(&limits.concurrency) {
+            return Err(Error::input("concurrency must be between 1 and 32"));
+        }
         let mut graph = Self {
             root: root.clone(),
             manifests: BTreeMap::new(),
@@ -104,7 +122,7 @@ impl Graph {
         let mut subtree_depths = BTreeMap::<Digest, usize>::new();
         let mut metadata_size = graph.root.raw.len() as u64;
         let mut prefetched = BTreeMap::<Digest, Manifest>::new();
-        let concurrency = limits.concurrency.clamp(1, 32);
+        let concurrency = limits.concurrency;
         let max_metadata = parse_size(&limits.max_metadata_size)?;
         let max_manifest = parse_size(&limits.max_manifest_size)?;
         while let Some(task) = stack.pop() {
@@ -237,9 +255,30 @@ impl Graph {
                     {
                         return Err(Error::input("manifest graph object limit exceeded"));
                     }
+                    let mut unique: Vec<Descriptor> = Vec::new();
+                    let mut positions = BTreeMap::<Digest, usize>::new();
+                    for child in children {
+                        if let Some(&position) = positions.get(&child.digest) {
+                            let previous = &mut unique[position];
+                            if previous.size != child.size
+                                || previous.media_type != child.media_type
+                            {
+                                return Err(Error::integrity(
+                                    "conflicting child manifest descriptors",
+                                ));
+                            }
+                            child.embedded()?;
+                            if previous.data.is_none() {
+                                previous.data = child.data;
+                            }
+                        } else {
+                            positions.insert(child.digest.clone(), unique.len());
+                            unique.push(child);
+                        }
+                    }
                     graph.manifests.insert(digest.clone(), m);
                     stack.push(Task::Finish(digest));
-                    for child in children.into_iter().rev() {
+                    for child in unique.into_iter().rev() {
                         stack.push(Task::Fetch(child, depth + 1));
                     }
                     if stack.len() > limits.max_objects.saturating_mul(2) {
@@ -260,6 +299,7 @@ impl Graph {
                 }
             }
         }
+        graph.check_shared_sizes()?;
         Ok(graph)
     }
     /// Return sorted, deduplicated platform names advertised by manifests in the graph.
@@ -286,7 +326,7 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::OCI_INDEX;
+    use crate::model::{OCI_INDEX, OCI_MANIFEST};
     use bytes::Bytes;
     use serde_json::json;
     fn index(children: &[Descriptor], id: usize) -> Manifest {
@@ -302,6 +342,84 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn manifest_and_blob_roles_require_the_same_content_size() {
+        let limits = TransferConfig::default();
+        let shared = index(&[], 0);
+        for valid in [false, true] {
+            let artifact = Manifest::parse(
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+                    "config": Descriptor::new("application/example", shared.digest().clone(),
+                        if valid { shared.raw.len() as u64 } else { 0 }),
+                    "layers": [], "subject": shared.descriptor
+                }))
+                .unwrap()
+                .into(),
+                None,
+                None,
+            )
+            .unwrap();
+            for reversed in [false, true] {
+                let mut children = [shared.descriptor.clone(), artifact.descriptor.clone()];
+                if reversed {
+                    children.reverse();
+                }
+                let root = index(&children, 1);
+                let graph = Graph::build(root, &limits, |d| {
+                    std::future::ready(Ok(if d.digest == *shared.digest() {
+                        shared.clone()
+                    } else {
+                        artifact.clone()
+                    }))
+                })
+                .await;
+                if valid {
+                    assert_eq!(graph.unwrap().blobs.len(), 1);
+                } else {
+                    assert_eq!(graph.unwrap_err().code, crate::error::Code::Integrity);
+                }
+                let mut first = Graph::build(shared.clone(), &limits, |_| async {
+                    panic!("empty index has no dependencies")
+                })
+                .await
+                .unwrap();
+                let mut second = Graph::build(artifact.clone(), &limits, |_| async {
+                    panic!("subject is not a dependency")
+                })
+                .await
+                .unwrap();
+                if reversed {
+                    std::mem::swap(&mut first, &mut second);
+                }
+                let merged = first.merge_referrer(second, &limits);
+                if valid {
+                    merged.unwrap();
+                } else {
+                    assert_eq!(merged.unwrap_err().code, crate::error::Code::Integrity);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_concurrency_is_rejected_before_fetching() {
+        let child = index(&[], 1);
+        let root = index(std::slice::from_ref(&child.descriptor), 2);
+        for concurrency in [0, 33, usize::MAX] {
+            let limits = TransferConfig {
+                concurrency,
+                ..Default::default()
+            };
+            let error = Graph::build(root.clone(), &limits, |_| async {
+                panic!("invalid limits must not start a fetch")
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, crate::error::Code::InvalidInput);
+        }
     }
 
     #[tokio::test]
@@ -370,6 +488,55 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.message.contains("metadata limit"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_children_reuse_inline_content_before_fetching() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let inline = index(&[], 0);
+        let remote = index(&[], 1);
+        let mut embedded = inline.descriptor.clone();
+        embedded.data = Some(STANDARD.encode(&inline.raw));
+        let root = index(
+            &[
+                inline.descriptor.clone(),
+                remote.descriptor.clone(),
+                embedded,
+            ],
+            2,
+        );
+        for concurrency in [1, 4] {
+            let limits = TransferConfig {
+                concurrency,
+                max_objects: 3,
+                max_metadata_size: (root.raw.len() + inline.raw.len() + remote.raw.len())
+                    .to_string(),
+                ..Default::default()
+            };
+            let mut requests = Vec::new();
+            let graph = Graph::build(root.clone(), &limits, |descriptor| {
+                requests.push(descriptor.digest.clone());
+                std::future::ready(if descriptor.digest == *remote.digest() {
+                    Ok(remote.clone())
+                } else {
+                    Err(Error::new(
+                        crate::error::Code::NotFound,
+                        "inline-only manifest",
+                    ))
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(requests, vec![remote.digest().clone()]);
+            assert_eq!(
+                graph.order,
+                vec![
+                    inline.digest().clone(),
+                    remote.digest().clone(),
+                    root.digest().clone()
+                ]
+            );
+        }
     }
 
     #[tokio::test]

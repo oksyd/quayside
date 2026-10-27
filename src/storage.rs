@@ -13,6 +13,15 @@ pub fn parent(path: &Path) -> &Path {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
 }
+pub(crate) fn lock_path(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::input("storage path needs a filename"))?;
+    let mut lock = std::ffi::OsString::from(".");
+    lock.push(name);
+    lock.push(".lock");
+    Ok(parent(path).join(lock))
+}
 /// Reject a symlink at the supplied path while allowing a missing destination.
 pub fn reject_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -71,12 +80,8 @@ pub fn check_private_file(path: &Path) -> Result<()> {
 
 /// Run a storage update while holding the cooperating processes' sidecar file lock.
 pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock_path = lock_path(path)?;
     prepare_parent(path)?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| Error::input("configuration path needs a filename"))?
-        .to_string_lossy();
-    let lock_path: PathBuf = parent(path).join(format!(".{name}.lock"));
     reject_symlink(&lock_path)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
@@ -117,6 +122,39 @@ mod tests {
         with_lock(&path, || atomic_write(&path, b"{}\n")).unwrap();
         check_private_file(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{}\n");
+    }
+    #[test]
+    fn lock_names_preserve_non_utf8_filenames() {
+        use std::os::unix::ffi::OsStrExt;
+        let first = Path::new(std::ffi::OsStr::from_bytes(b"auth-\xff"));
+        let second = Path::new(std::ffi::OsStr::from_bytes(b"auth-\xfe"));
+        assert_eq!(
+            lock_path(first).unwrap().file_name().unwrap().as_bytes(),
+            b".auth-\xff.lock"
+        );
+        assert_ne!(lock_path(first).unwrap(), lock_path(second).unwrap());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_files_have_independent_locks() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"auth-\xff"));
+        let second = directory
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"auth-\xfe"));
+        with_lock(&first, || {
+            let other = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(lock_path(&second)?)?;
+            FileExt::try_lock_exclusive(&other)?;
+            Ok(())
+        })
+        .unwrap();
     }
     #[test]
     fn symlink_rejected() {

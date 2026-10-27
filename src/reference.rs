@@ -19,6 +19,17 @@ pub struct Reference {
 
 /// Validate and normalize a registry authority, including supported Docker Hub aliases.
 pub fn registry_name(input: &str) -> Result<String> {
+    let name = authority_name(input)?;
+    let host = name.split_once(':').map_or(name.as_str(), |(host, _)| host);
+    if matches!(host, "index.docker.io" | "registry-1.docker.io") {
+        Ok(name.replacen(host, "docker.io", 1))
+    } else {
+        Ok(name)
+    }
+}
+
+/// Normalize a literal server authority without applying registry aliases.
+pub(crate) fn authority_name(input: &str) -> Result<String> {
     if input.is_empty()
         || input.chars().any(char::is_whitespace)
         || input.contains(['/', '@', '?', '#', '%', '\\'])
@@ -47,9 +58,6 @@ pub fn registry_name(input: &str) -> Result<String> {
         })
         .transpose()?;
     let mut name = url[url::Position::BeforeHost..url::Position::AfterHost].to_ascii_lowercase();
-    if name == "index.docker.io" || name == "registry-1.docker.io" {
-        name = "docker.io".into();
-    }
     if let Some(port) = port {
         name.push_str(&format!(":{port}"));
     }
@@ -108,7 +116,6 @@ impl FromStr for Reference {
             }
             None => (name_tag, None),
         };
-        validate_repository(repository)?;
         let repository = if (registry == "docker.io" || registry.starts_with("docker.io:"))
             && !repository.contains('/')
         {
@@ -116,6 +123,7 @@ impl FromStr for Reference {
         } else {
             repository.to_owned()
         };
+        validate_repository(&repository)?;
         Ok(Self {
             registry,
             repository,
@@ -192,6 +200,17 @@ impl fmt::Display for Reference {
 mod tests {
     use super::*;
     #[test]
+    fn literal_authorities_preserve_hosts_ports_and_ipv6() {
+        for (input, expected) in [
+            ("REGISTRY-1.DOCKER.IO", "registry-1.docker.io"),
+            ("INDEX.DOCKER.IO:0443", "index.docker.io:443"),
+            ("[2001:DB8::1]:443", "[2001:db8::1]:443"),
+        ] {
+            assert_eq!(authority_name(input).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn explicit_ports_survive_transport_selection_and_docker_aliases() {
         assert_eq!(registry_name("EXAMPLE.COM:443").unwrap(), "example.com:443");
         assert_eq!(registry_name("[::1]:443").unwrap(), "[::1]:443");
@@ -217,6 +236,16 @@ mod tests {
         assert_eq!(
             "docker.io/alpine".parse::<Reference>().unwrap().repository,
             "library/alpine"
+        );
+    }
+    #[test]
+    fn docker_default_namespace_counts_toward_repository_length() {
+        assert!(Reference::parse_source(&"a".repeat(247)).is_ok());
+        assert!(Reference::parse_source(&"a".repeat(248)).is_err());
+        assert!(
+            format!("example.com/{}:tag", "a".repeat(255))
+                .parse::<Reference>()
+                .is_ok()
         );
     }
     #[test]

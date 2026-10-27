@@ -1,7 +1,7 @@
 use super::Registry;
 use super::transport::{http_error, limited_body, same_origin, valid_url};
 use crate::config::parse_size;
-use crate::reference::validate_repository;
+use crate::reference::{validate_repository, validate_tag};
 use crate::{Error, Result};
 use http::header::{self, HeaderMap};
 use http::{Method, StatusCode};
@@ -16,21 +16,39 @@ impl Registry {
             &format!("v2/{repo}/tags/list"),
             "tags",
             &Self::scope(repo, "pull"),
+            validate_tag,
         )
         .await
     }
     /// Fetch registry catalog pages when the server exposes that optional API.
     pub async fn list_repositories(&self) -> Result<Vec<String>> {
-        self.paginated("v2/_catalog", "repositories", "registry:catalog:*")
-            .await
+        self.paginated(
+            "v2/_catalog",
+            "repositories",
+            "registry:catalog:*",
+            validate_repository,
+        )
+        .await
     }
-    async fn paginated(&self, path: &str, field: &str, scope: &str) -> Result<Vec<String>> {
+    async fn paginated(
+        &self,
+        path: &str,
+        field: &str,
+        scope: &str,
+        validate: fn(&str) -> Result<()>,
+    ) -> Result<Vec<String>> {
         let base = self.url(path)?;
         let mut next = base.clone();
         next.query_pairs_mut().append_pair("n", "100");
         let mut visited = BTreeSet::new();
         let mut values = BTreeSet::new();
+        let page_limit = parse_size(&self.config().transfer.max_manifest_size)?;
+        let metadata_limit = parse_size(&self.config().transfer.max_metadata_size)?;
+        let mut bytes = 0;
         for _ in 0..1000 {
+            if bytes == metadata_limit {
+                return Err(Error::input("registry listing exceeds metadata limit"));
+            }
             if !visited.insert(next.as_str().to_string()) {
                 return Err(Error::input("registry pagination loop detected"));
             }
@@ -55,20 +73,18 @@ impl Registry {
                     break;
                 }
             }
-            let body: Value = serde_json::from_slice(
-                &limited_body(
-                    response,
-                    parse_size(&self.config().transfer.max_manifest_size)?,
-                )
-                .await?,
-            )?;
+            let raw = limited_body(response, page_limit.min(metadata_limit - bytes)).await?;
+            bytes += raw.len() as u64;
+            let body: Value = serde_json::from_slice(&raw)?;
             let list = match body.get(field) {
                 Some(Value::Array(a)) => a
                     .iter()
                     .map(|v| {
-                        v.as_str()
-                            .map(str::to_owned)
-                            .ok_or_else(|| Error::input("non-string item in registry listing"))
+                        let value = v
+                            .as_str()
+                            .ok_or_else(|| Error::input("non-string item in registry listing"))?;
+                        validate(value)?;
+                        Ok(value.to_owned())
                     })
                     .collect::<Result<Vec<_>>>()?,
                 Some(Value::Null) => vec![],

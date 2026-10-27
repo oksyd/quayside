@@ -124,6 +124,89 @@ fn registry() -> (Server, Manifests) {
 }
 
 #[test]
+fn oci_layout_aliases_select_one_manifest_and_validate_every_matching_descriptor() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    for mode in [
+        "file",
+        "inline",
+        "ambiguous",
+        "corrupt",
+        "size",
+        "media_type",
+    ] {
+        let (server, manifests) = registry();
+        let harness = Harness::new(&[(&server.host, true)]);
+        let image = support::image_layout(harness.root.path(), 0, 0);
+        let mut index: Value =
+            serde_json::from_slice(&fs::read(image.directory.join("index.json")).unwrap()).unwrap();
+        let mut first = index["manifests"][0].clone();
+        first["annotations"] = json!({"org.opencontainers.image.ref.name": "latest"});
+        let mut second = first.clone();
+        second["annotations"] = json!({"org.opencontainers.image.ref.name": "stable"});
+        match mode {
+            "inline" => {
+                second["data"] = json!(STANDARD.encode(&image.manifest));
+                fs::remove_file(quayside::layout::blob_path(
+                    &image.directory,
+                    &image.digest.parse().unwrap(),
+                ))
+                .unwrap();
+            }
+            "corrupt" => second["data"] = json!(STANDARD.encode(b"corrupt")),
+            "size" => second["size"] = json!(image.manifest.len() + 1),
+            "media_type" => second["mediaType"] = json!(quayside::model::OCI_INDEX),
+            _ => {}
+        }
+        index["manifests"] = json!([first, second]);
+        if mode == "ambiguous" {
+            let mut other = index["manifests"][0].clone();
+            other["digest"] = json!(Digest::sha256(b"another image"));
+            other["annotations"] = json!({"org.opencontainers.image.ref.name": "other"});
+            index["manifests"].as_array_mut().unwrap().push(other);
+        }
+        fs::write(
+            image.directory.join("index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let destination = format!("{}/app:v1", server.host);
+        for reference in [
+            None,
+            Some(image.digest.as_str()),
+            Some("latest"),
+            Some("stable"),
+        ] {
+            let mut arguments = vec![
+                "image",
+                "push",
+                image.directory.to_str().unwrap(),
+                &destination,
+            ];
+            if let Some(reference) = reference {
+                arguments.extend(["--ref", reference]);
+            }
+            if mode == "ambiguous" && reference.is_none() {
+                harness.json(&arguments, 2);
+                assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+                continue;
+            }
+            let valid = matches!(mode, "file" | "inline" | "ambiguous");
+            let result = harness.json(&arguments, if valid { 0 } else { 7 });
+            if valid {
+                assert_eq!(result["data"]["target_digest"], image.digest);
+                assert_eq!(
+                    manifests.lock().unwrap()["/v2/app/manifests/v1"],
+                    image.manifest
+                );
+            } else {
+                assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
+#[test]
 fn docker_archives_select_tags_verify_layers_and_publish_oci() {
     let (server, manifests) = registry();
     let harness = Harness::new(&[(&server.host, true)]);
@@ -354,12 +437,13 @@ fn oci_archives_ignore_docker_metadata_and_preserve_manifest_bytes() {
 }
 
 fn hybrid_archive(root: &Path, path: &Path, mode: &str) -> Vec<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use quayside::model::{Descriptor, OCI_INDEX};
     let mut blobs = BTreeMap::new();
     let mut children = Vec::new();
     let mut saved = Vec::new();
     let mut digests = Vec::new();
-    for arch in if mode == "multi" {
+    for arch in if matches!(mode, "multi" | "multi_inline_after_missing") {
         vec!["amd64", "arm64"]
     } else {
         vec!["amd64"]
@@ -382,9 +466,15 @@ fn hybrid_archive(root: &Path, path: &Path, mode: &str) -> Vec<String> {
         );
         child.platform =
             Some(serde_json::from_value(json!({"os":"linux","architecture":arch})).unwrap());
+        if matches!(mode, "inline_after_missing" | "multi_inline_after_missing") {
+            child.data = Some(STANDARD.encode(&image.manifest));
+        }
         children.push(child);
         blobs.extend(image.blobs);
-        if mode != "missing" {
+        if !matches!(
+            mode,
+            "missing" | "inline_after_missing" | "multi_inline_after_missing"
+        ) {
             blobs.insert(
                 image.digest,
                 if mode == "corrupt" {
@@ -403,6 +493,17 @@ fn hybrid_archive(root: &Path, path: &Path, mode: &str) -> Vec<String> {
     if mode == "duplicate_descriptor" {
         children.push(children[0].clone());
     }
+    if mode == "corrupt_inline_duplicate" {
+        let mut invalid = children[0].clone();
+        invalid.data = Some(STANDARD.encode(b"invalid manifest"));
+        // Traversal uses a stack, so the valid descriptor is visited before this duplicate.
+        children.insert(0, invalid);
+    }
+    if matches!(mode, "inline_after_missing" | "multi_inline_after_missing") {
+        let mut missing = children[0].clone();
+        missing.data = None;
+        children.push(missing);
+    }
     if mode == "conflicting_config" {
         let mut conflicting = saved[0].clone();
         conflicting["Layers"] = json!([]);
@@ -413,7 +514,7 @@ fn hybrid_archive(root: &Path, path: &Path, mode: &str) -> Vec<String> {
             .unwrap();
     let descriptor = Descriptor::new(OCI_INDEX, Digest::sha256(&nested), nested.len() as u64);
     blobs.insert(descriptor.digest.to_string(), nested);
-    let roots = if mode == "shared_depth" {
+    let roots = if matches!(mode, "shared_depth" | "inline_shared_depth") {
         let branch = serde_json::to_vec(
             &json!({"schemaVersion":2,"mediaType":OCI_INDEX,"manifests":[descriptor.clone()]}),
         )
@@ -421,8 +522,15 @@ fn hybrid_archive(root: &Path, path: &Path, mode: &str) -> Vec<String> {
         let branch_descriptor =
             Descriptor::new(OCI_INDEX, Digest::sha256(&branch), branch.len() as u64);
         blobs.insert(branch_descriptor.digest.to_string(), branch);
-        // The shared subtree is visited on the shallow path before the deeper branch.
-        vec![branch_descriptor, descriptor]
+        if mode == "inline_shared_depth" {
+            let mut inline = descriptor;
+            inline.data = Some(STANDARD.encode(blobs.remove(&inline.digest.to_string()).unwrap()));
+            // The deep branch is absent until the shallower descriptor supplies its content.
+            vec![inline, branch_descriptor]
+        } else {
+            // The shared subtree is visited on the shallow path before the deeper branch.
+            vec![branch_descriptor, descriptor]
+        }
     } else {
         vec![descriptor]
     };
@@ -463,12 +571,18 @@ fn docker_oci_archives_preserve_saved_platforms_and_reject_missing_selected_imag
         "missing",
         "corrupt",
         "conflicting_config",
+        "corrupt_inline_duplicate",
+        "inline_after_missing",
+        "multi_inline_after_missing",
     ] {
         let (server, manifests) = registry();
         let harness = Harness::new(&[(&server.host, true)]);
         let path = harness.root.path().join("docker.tar");
         let digests = hybrid_archive(harness.root.path(), &path, mode);
-        let bad = matches!(mode, "missing" | "corrupt" | "conflicting_config");
+        let bad = matches!(
+            mode,
+            "missing" | "corrupt" | "conflicting_config" | "corrupt_inline_duplicate"
+        );
         let result = harness.json(
             &[
                 "image",
@@ -482,7 +596,7 @@ fn docker_oci_archives_preserve_saved_platforms_and_reject_missing_selected_imag
         );
         if bad {
             assert_eq!(server.connections.load(Ordering::SeqCst), 0);
-        } else if mode == "single" {
+        } else if !matches!(mode, "multi" | "multi_inline_after_missing") {
             assert_eq!(result["data"]["target_digest"], digests[0]);
             assert_eq!(result["data"]["converted_from_docker_archive"], false);
         } else {
@@ -540,24 +654,26 @@ fn docker_oci_selection_counts_metadata_and_accepts_shared_descriptors_at_the_li
 
 #[test]
 fn docker_oci_shared_subtrees_obey_depth_limits_on_every_path() {
-    let (server, _) = registry();
-    let mut harness = Harness::new(&[(&server.host, true)]);
-    let path = harness.root.path().join("docker.tar");
-    hybrid_archive(harness.root.path(), &path, "shared_depth");
-    let destination = format!("{}/app:v1", server.host);
-    harness.config.transfer.max_depth = 2;
-    let error = harness.json(&["image", "push", path.to_str().unwrap(), &destination], 2);
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Docker archive manifest graph exceeds limits"),
-        "{error}"
-    );
-    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+    for mode in ["shared_depth", "inline_shared_depth"] {
+        let (server, _) = registry();
+        let mut harness = Harness::new(&[(&server.host, true)]);
+        let path = harness.root.path().join("docker.tar");
+        hybrid_archive(harness.root.path(), &path, mode);
+        let destination = format!("{}/app:v1", server.host);
+        harness.config.transfer.max_depth = 2;
+        let error = harness.json(&["image", "push", path.to_str().unwrap(), &destination], 2);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Docker archive manifest graph exceeds limits"),
+            "{error}"
+        );
+        assert_eq!(server.connections.load(Ordering::SeqCst), 0);
 
-    harness.config.transfer.max_depth = 3;
-    harness.json(&["image", "push", path.to_str().unwrap(), &destination], 0);
+        harness.config.transfer.max_depth = 3;
+        harness.json(&["image", "push", path.to_str().unwrap(), &destination], 0);
+    }
 }
 
 #[test]

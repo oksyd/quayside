@@ -24,6 +24,53 @@ fn source(image: Image) -> Server {
 }
 
 #[test]
+fn platform_selection_checks_inline_data_on_duplicate_descriptors() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use quayside::{
+        digest::Digest,
+        model::{Descriptor, OCI_INDEX},
+    };
+
+    for corrupt in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let image = support::image_layout_for(directory.path(), 0, 0, "amd64");
+        let mut descriptor = Descriptor::new(
+            OCI_MANIFEST,
+            Digest::sha256(&image.manifest),
+            image.manifest.len() as u64,
+        );
+        descriptor.platform = Some("linux/amd64".parse().unwrap());
+        let mut duplicate = descriptor.clone();
+        duplicate.data = Some(STANDARD.encode(if corrupt {
+            b"invalid manifest".as_slice()
+        } else {
+            &image.manifest
+        }));
+        let index = serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [descriptor, duplicate]
+        }))
+        .unwrap();
+        let digest = image.digest.clone();
+        let server = Server::new(move |request| {
+            assert!(request.path.ends_with("/manifests/latest"));
+            Response::new(200, index.clone()).header("Content-Type", OCI_INDEX)
+        });
+        let harness = Harness::new(&[(&server.host, true)]);
+        let reference = format!("{}/app:latest", server.host);
+        let result = harness.json(
+            &["image", "digest", &reference, "--platform", "linux/amd64"],
+            if corrupt { 7 } else { 0 },
+        );
+        if corrupt {
+            assert_eq!(result["error"]["code"], "INTEGRITY");
+        } else {
+            assert_eq!(result["data"]["digest"], digest);
+        }
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
 fn inspect_single_platform_uses_config_and_preserves_json_with_debug_logs() {
     let data = tempfile::tempdir().unwrap();
     let server = source(support::image_layout_for(data.path(), 2, 4096, "arm64"));

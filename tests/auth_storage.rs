@@ -3,6 +3,62 @@ use std::{fs, io::Write, process::Stdio};
 use support::{Harness, Response, Server, config_home, data_home};
 
 #[test]
+fn waiting_for_password_can_be_interrupted_without_storing_credentials() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::Command,
+        time::{Duration, Instant},
+    };
+    let harness = Harness::new(&[]);
+    let mut child = harness
+        .command(&[
+            "--json",
+            "--log-level",
+            "info",
+            "login",
+            "registry.example",
+            "-u",
+            "robot",
+            "--password-stdin",
+            "--save-unverified",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep the pipe open: wait_with_output would otherwise close stdin and unblock login.
+    let _input = child.stdin.take().unwrap();
+    let mut diagnostics = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    diagnostics.read_line(&mut line).unwrap();
+    assert!(line.contains("login: started"), "{line}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("login did not stop while waiting for password input");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "INTERRUPTED");
+    assert!(!harness.root.path().join("auth.json").exists());
+    assert!(!harness.root.path().join("keys/master.key").exists());
+}
+
+#[test]
 fn bearer_authentication_ignores_other_advertised_schemes() {
     let server = Server::new(|request| {
         if request.path.starts_with("/token?") {

@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, Write},
     path::{Component, Path, PathBuf},
@@ -236,9 +236,9 @@ impl LocalLayout {
         if index.kind != ManifestKind::Index {
             return Err(Error::input("layout index.json is not an OCI image index"));
         }
-        let candidates: Vec<_> = index
-            .children()?
-            .into_iter()
+        let descriptors = index.children()?;
+        let candidates: Vec<_> = descriptors
+            .iter()
             .filter(|d| {
                 if reference.is_none()
                     && d.annotations
@@ -255,15 +255,25 @@ impl LocalLayout {
                 })
             })
             .collect();
-        if candidates.len() != 1 {
+        let roots: BTreeSet<_> = candidates.iter().map(|d| &d.digest).collect();
+        if roots.len() != 1 {
             return Err(Error::input(format!(
-                "layout root matched {} descriptors; use --ref with an exact ref name or digest",
-                candidates.len()
+                "layout root matched {} manifests; use --ref with an exact ref name or digest",
+                roots.len()
             )));
         }
-        let descriptor = &candidates[0];
+        let selected = candidates[0];
+        let aliases = descriptors.iter().filter(|d| d.digest == selected.digest);
+        // Select by tag, but reuse and validate content across all aliases of the same digest.
+        let descriptor = aliases
+            .clone()
+            .find(|d| d.data.is_some())
+            .unwrap_or(selected);
         let mut m = read_manifest(&self.root, descriptor, limits)?;
-        m.descriptor.platform = descriptor.platform.clone();
+        for alias in aliases {
+            m.verify_descriptor(alias)?;
+        }
+        m.descriptor.platform = selected.platform.clone();
         Ok(m)
     }
     /// Build and verify the selected manifest dependency graph from local files.
@@ -274,12 +284,24 @@ impl LocalLayout {
             async move { blocking(move |_| read_manifest(&root, &d, &limits)).await }
         })
         .await?;
+        let metadata_limit = parse_size(&limits.max_metadata_size)?;
+        let mut metadata = graph
+            .manifests
+            .values()
+            .map(|m| m.raw.len() as u64)
+            .sum::<u64>();
         let path = checked_file(&self.root, Path::new("index.json"))?;
         let index = Manifest::parse(
-            read_limited(&path, parse_size(&limits.max_manifest_size)?)?.into(),
+            read_limited(
+                &path,
+                parse_size(&limits.max_manifest_size)?.min(metadata_limit.saturating_sub(metadata)),
+            )?
+            .into(),
             Some(OCI_INDEX),
             None,
         )?;
+        metadata += index.raw.len() as u64;
+        let mut manifests = graph.manifests.clone();
         let mut pending: Vec<_> = index
             .children()?
             .into_iter()
@@ -297,7 +319,25 @@ impl LocalLayout {
             let mut next = vec![];
             let mut added = false;
             for descriptor in pending {
-                let manifest = read_manifest(&self.root, &descriptor, limits)?;
+                let mut fetch = |descriptor: Descriptor| -> Result<Manifest> {
+                    if let Some(manifest) = manifests.get(&descriptor.digest) {
+                        manifest.verify_descriptor(&descriptor)?;
+                        return Ok(manifest.clone());
+                    }
+                    if manifests.len() + graph.blobs.len() >= limits.max_objects {
+                        return Err(Error::input("local referrer scan exceeds object limit"));
+                    }
+                    metadata = metadata
+                        .checked_add(descriptor.size)
+                        .ok_or_else(|| Error::input("local referrer metadata size overflow"))?;
+                    if metadata > metadata_limit {
+                        return Err(Error::input("local referrer scan exceeds metadata limit"));
+                    }
+                    let manifest = read_manifest(&self.root, &descriptor, limits)?;
+                    manifests.insert(descriptor.digest, manifest.clone());
+                    Ok(manifest)
+                };
+                let manifest = fetch(descriptor.clone())?;
                 let subject = manifest
                     .subject()?
                     .ok_or_else(|| Error::integrity("exported referrer has no subject"))?;
@@ -311,10 +351,30 @@ impl LocalLayout {
                 if depth == limits.max_depth {
                     return Err(Error::input("local referrers exceed depth limit"));
                 }
-                let associated = Graph::build(manifest, limits, |d| {
-                    std::future::ready(read_manifest(&self.root, &d, limits))
-                })
-                .await?;
+                let associated =
+                    Graph::build(manifest, limits, |d| std::future::ready(fetch(d))).await?;
+                // Graph::build decodes inline descendants without calling fetch.
+                for manifest in associated.manifests.values() {
+                    if let Some(existing) = manifests.get(manifest.digest()) {
+                        manifest.verify_descriptor(&existing.descriptor)?;
+                        continue;
+                    }
+                    metadata = metadata
+                        .checked_add(manifest.raw.len() as u64)
+                        .ok_or_else(|| Error::input("local referrer metadata size overflow"))?;
+                    if metadata > metadata_limit {
+                        return Err(Error::input("local referrer scan exceeds metadata limit"));
+                    }
+                    manifests.insert(manifest.digest().clone(), manifest.clone());
+                }
+                let new_blobs = associated
+                    .blobs
+                    .keys()
+                    .filter(|digest| !graph.blobs.contains_key(*digest))
+                    .count();
+                if manifests.len() + graph.blobs.len() + new_blobs > limits.max_objects {
+                    return Err(Error::input("local referrer scan exceeds object limit"));
+                }
                 graph.merge_referrer(associated, limits)?;
                 added = true;
             }
@@ -615,38 +675,66 @@ fn extract_archive(
     Ok((temporary, stored))
 }
 
-fn check_output(path: &Path, overwrite: bool) -> Result<()> {
+fn check_output(path: &Path, format: ArchiveFormat, overwrite: bool) -> Result<()> {
     if path.file_name().is_none() {
         return Err(Error::input("output must name a file or layout directory"));
     }
     storage::reject_symlink(path)?;
-    if path.exists() && !overwrite {
-        return Err(Error::conflict(format!(
-            "output {} already exists",
-            path.display()
-        )));
+    if path.try_exists()? {
+        if !overwrite {
+            return Err(Error::conflict(format!(
+                "output {} already exists",
+                path.display()
+            )));
+        }
+        let metadata = fs::metadata(path)?;
+        match format {
+            ArchiveFormat::OciArchive if !metadata.is_file() => {
+                return Err(Error::conflict("archive output must be a regular file"));
+            }
+            ArchiveFormat::OciLayout
+                if !metadata.is_dir() || !path.join("oci-layout").is_file() =>
+            {
+                return Err(Error::conflict(
+                    "directory overwrite is restricted to existing OCI layouts",
+                ));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
 fn commit_directory(temporary: &tempfile::TempDir, output: &Path, overwrite: bool) -> Result<()> {
-    check_output(output, overwrite)?;
+    check_output(output, ArchiveFormat::OciLayout, overwrite)?;
     if !output.exists() {
         fs::rename(temporary.path(), output)?;
         return Ok(());
-    }
-    if !output.is_dir() || !output.join("oci-layout").is_file() {
-        return Err(Error::conflict(
-            "directory overwrite is restricted to existing OCI layouts",
-        ));
     }
     let backup = tempfile::tempdir_in(storage::parent(output))?;
     let old = backup.path().join("old");
     fs::rename(output, &old)?;
     if let Err(e) = fs::rename(temporary.path(), output) {
-        let _ = fs::rename(&old, output);
-        return Err(e.into());
+        return Err(restore_directory(backup, output, e));
     }
     Ok(())
+}
+
+fn restore_directory(backup: tempfile::TempDir, output: &Path, cause: io::Error) -> Error {
+    let old = backup.path().join("old");
+    match fs::rename(&old, output) {
+        Ok(()) => cause.into(),
+        Err(restore) => {
+            // The only copy of the original layout must survive a failed rollback.
+            let preserved = backup.keep().join("old");
+            Error::new(
+                crate::error::Code::Execution,
+                format!(
+                    "cannot replace layout: {cause}; cannot restore original: {restore}; original layout preserved at {}",
+                    preserved.display()
+                ),
+            )
+        }
+    }
 }
 /// GNU tar file header, padded data, and optional GNU long-name entry.
 fn archive_entry_bytes(path: &Path, size: u64) -> Result<u64> {
@@ -660,17 +748,17 @@ fn archive_entry_bytes(path: &Path, size: u64) -> Result<u64> {
     data.and_then(|n| n.checked_add(512 + extra))
         .ok_or_else(|| Error::input("archive size overflow"))
 }
-fn export_temporary_bytes(files: &[(PathBuf, u64)], archive: bool) -> Result<u64> {
+fn export_bytes(files: &BTreeMap<PathBuf, u64>, archive: bool) -> Result<u64> {
     let mut total = if archive { 1024u64 } else { 0 };
     for (path, size) in files {
+        let bytes = if archive {
+            archive_entry_bytes(path, *size)?
+        } else {
+            *size
+        };
         total = total
-            .checked_add(*size)
-            .ok_or_else(|| Error::input("temporary storage size overflow"))?;
-        if archive {
-            total = total
-                .checked_add(archive_entry_bytes(path, *size)?)
-                .ok_or_else(|| Error::input("temporary storage size overflow"))?;
-        }
+            .checked_add(bytes)
+            .ok_or_else(|| Error::input("export size overflow"))?;
     }
     Ok(total)
 }
@@ -785,7 +873,7 @@ pub async fn pull_with_options(
     options: &crate::options::TransferOptions,
     observer: &dyn Observer,
 ) -> Result<PullResult> {
-    check_output(output, write.overwrite)?;
+    check_output(output, format, write.overwrite)?;
     let resolving = observer.begin(Phase::Resolving, 0);
     let resolved = transfer::associated::selected(source, reference, selection, options).await?;
     observer.selected_platforms(&resolved.platforms);
@@ -798,16 +886,6 @@ pub async fn pull_with_options(
         n.checked_add(d.size)
             .ok_or_else(|| Error::input("image size overflow"))
     })?;
-    let metadata_bytes = graph
-        .manifests
-        .values()
-        .map(|m| m.raw.len() as u64)
-        .sum::<u64>();
-    if blob_bytes.saturating_add(metadata_bytes)
-        > parse_size(&source.config().transfer.max_archive_size)?
-    {
-        return Err(Error::input("export exceeds configured archive size limit"));
-    }
     let mut root_descriptor = graph.root.descriptor.clone();
     root_descriptor.annotations.insert(
         "org.opencontainers.image.ref.name".into(),
@@ -828,10 +906,10 @@ pub async fn pull_with_options(
         return Err(Error::input("exported index exceeds manifest size limit"));
     }
     let layout_bytes = b"{\"imageLayoutVersion\":\"1.0.0\"}\n";
-    let mut staged = vec![
+    let mut staged = BTreeMap::from([
         (PathBuf::from("index.json"), index_bytes.len() as u64),
         (PathBuf::from("oci-layout"), layout_bytes.len() as u64),
-    ];
+    ]);
     staged.extend(
         graph
             .manifests
@@ -844,9 +922,20 @@ pub async fn pull_with_options(
             .values()
             .map(|d| (blob_path(Path::new(""), &d.digest), d.size)),
     );
-    let required = export_temporary_bytes(&staged, matches!(format, ArchiveFormat::OciArchive))?
-        .checked_add(if options.resume { blob_bytes } else { 0 })
-        .ok_or_else(|| Error::input("resume storage size overflow"))?;
+    let archive = matches!(format, ArchiveFormat::OciArchive);
+    let staging_bytes = export_bytes(&staged, false)?;
+    let output_bytes = if archive {
+        export_bytes(&staged, true)?
+    } else {
+        staging_bytes
+    };
+    if output_bytes > parse_size(&source.config().transfer.max_archive_size)? {
+        return Err(Error::input("export exceeds configured archive size limit"));
+    }
+    let required = staging_bytes
+        .checked_add(if archive { output_bytes } else { 0 })
+        .and_then(|bytes| bytes.checked_add(if options.resume { blob_bytes } else { 0 }))
+        .ok_or_else(|| Error::input("export storage size overflow"))?;
     if required > parse_size(&source.config().transfer.max_temp_size)? {
         return Err(Error::input(
             "export staging and archive exceed max_temp_size",
@@ -864,10 +953,13 @@ pub async fn pull_with_options(
             let mut limits = source.config().transfer.clone();
             limits.max_temp_size = blob_bytes.to_string();
             let absolute = std::path::absolute(output)?;
-            Some(crate::resume::Store::open(
-                &format!("pull\n{reference}\n{}", absolute.display()),
-                &limits,
-            )?)
+            Some(
+                crate::resume::Store::open(
+                    &format!("pull\n{reference}\n{}", absolute.display()),
+                    &limits,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -898,7 +990,7 @@ pub async fn pull_with_options(
                 async move {
                     let result = async {
                         if let Some(store) = resume {
-                            let blob = store.blob(&d)?;
+                            let blob = store.blob(&d).await?;
                             source
                                 .download_resumable(
                                     &repo,
@@ -947,7 +1039,7 @@ pub async fn pull_with_options(
                 let root = temp.path().to_path_buf();
                 let parent = storage::parent(output).to_path_buf();
                 let archive = blocking(move |flag| make_archive(&root, &parent, flag)).await?;
-                check_output(output, write.overwrite)?;
+                check_output(output, format, write.overwrite)?;
                 if write.overwrite {
                     archive.persist(output).map_err(|e| Error::from(e.error))?;
                 } else {
@@ -958,7 +1050,7 @@ pub async fn pull_with_options(
             }
         }
         if let Some(store) = resume {
-            store.clear()?;
+            store.clear().await?;
         }
     }
     Ok(PullResult {
@@ -1024,7 +1116,7 @@ async fn push_layout(
         .await?;
     drop(verifying);
     let checking = observer.begin(Phase::CheckingDestination, 0);
-    check_output_reference(target, destination, &graph, write).await?;
+    transfer::check_destination(target, destination, &graph.root, write.overwrite).await?;
     drop(checking);
     let available = parse_size(&target.config().transfer.max_temp_size)?
         .checked_sub(layout.temporary_bytes)
@@ -1144,16 +1236,6 @@ async fn push_layout(
         referrers: transfer::Referrers::outcome(!graph.referrers.is_empty(), write.dry_run),
     })
 }
-async fn check_output_reference(
-    target: &Registry,
-    destination: &Reference,
-    graph: &Graph,
-    write: &WriteOptions,
-) -> Result<()> {
-    transfer::check_destination(target, destination, &graph.root, write.overwrite).await?;
-    Ok(())
-}
-
 /// Export a local Docker image through the Docker CLI, then verify and push its selected graph.
 /// Only this explicit operation requires Docker; registry upload uses Quayside credentials.
 pub async fn push_docker(
@@ -1203,25 +1285,67 @@ pub async fn push_docker_with_observer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn tar_quota_includes_padding_and_sha512_long_names() {
+    fn failed_directory_commit_restores_the_original_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("image");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("oci-layout"), b"original layout").unwrap();
+        let staging = tempfile::tempdir_in(root.path()).unwrap();
+        fs::remove_dir(staging.path()).unwrap();
+
+        assert!(commit_directory(&staging, &output, true).is_err());
+        assert_eq!(
+            fs::read(output.join("oci-layout")).unwrap(),
+            b"original layout"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_directory_rollback_preserves_both_original_and_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("image");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("concurrent-write"), b"replacement").unwrap();
+        let backup = tempfile::tempdir_in(root.path()).unwrap();
+        let original = backup.path().join("old");
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("oci-layout"), b"original layout").unwrap();
+
+        let error = restore_directory(backup, &output, io::Error::other("commit failed"));
+        assert!(error.message.contains(&original.display().to_string()));
+        assert_eq!(
+            fs::read(original.join("oci-layout")).unwrap(),
+            b"original layout"
+        );
+        assert_eq!(
+            fs::read(output.join("concurrent-write")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn export_sizes_include_padding_and_sha512_long_names() {
         let root = tempfile::tempdir().unwrap();
         let name = PathBuf::from(format!("blobs/sha512/{}", "a".repeat(128)));
         fs::create_dir_all(root.path().join("blobs/sha512")).unwrap();
-        let files = vec![
+        let files = BTreeMap::from([
             (PathBuf::from("oci-layout"), 30),
             (PathBuf::from("index.json"), 100),
             (name, 513),
-        ];
+        ]);
         for (path, size) in &files {
             fs::write(root.path().join(path), vec![0; *size as usize]).unwrap();
         }
         let output =
             make_archive(root.path(), root.path(), Arc::new(AtomicBool::new(false))).unwrap();
-        let staged: u64 = files.iter().map(|(_, size)| *size).sum();
+        let staged: u64 = files.values().copied().sum();
+        assert_eq!(export_bytes(&files, false).unwrap(), staged);
         assert_eq!(
-            export_temporary_bytes(&files, true).unwrap(),
-            staged + output.as_file().metadata().unwrap().len()
+            export_bytes(&files, true).unwrap(),
+            output.as_file().metadata().unwrap().len()
         );
         let (extracted, stored) = extract_archive(
             output.path(),
@@ -1386,5 +1510,261 @@ mod tests {
             5,
         );
         assert!(verify_local_blob(temp.path(), &d).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unrelated_local_referrers_share_the_metadata_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Manifest::parse(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": []
+            }))
+            .unwrap()
+            .into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut candidates = Vec::new();
+        for marker in ["first", "second"] {
+            let manifest = Manifest::parse(
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [],
+                    "subject": Descriptor::new(OCI_INDEX, crate::digest::Digest::sha256(marker.as_bytes()), 100),
+                    "annotations": {"example.payload": "x".repeat(512)}
+                })).unwrap().into(), None, None,
+            ).unwrap();
+            let path = blob_path(directory.path(), manifest.digest());
+            fs::create_dir_all(storage::parent(&path)).unwrap();
+            fs::write(path, &manifest.raw).unwrap();
+            candidates.push(manifest);
+        }
+        let descriptors: Vec<_> = candidates
+            .iter()
+            .map(|manifest| {
+                let mut descriptor = manifest.descriptor.clone();
+                descriptor
+                    .annotations
+                    .insert(REFERRER_ANNOTATION.into(), "true".into());
+                descriptor
+            })
+            .collect();
+        let index = serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": descriptors
+        }))
+        .unwrap();
+        fs::write(directory.path().join("index.json"), &index).unwrap();
+        let limits = TransferConfig {
+            max_metadata_size: (root.raw.len() + index.len() + candidates[0].raw.len()).to_string(),
+            ..Default::default()
+        };
+        let layout = LocalLayout::open(directory.path(), &limits).await.unwrap();
+        let error = layout.graph(root, &limits).await.unwrap_err();
+        assert_eq!(error.code, crate::error::Code::InvalidInput);
+        assert_eq!(error.message, "local referrer scan exceeds metadata limit");
+    }
+
+    #[tokio::test]
+    async fn local_referrer_chains_deduplicate_metadata_and_check_every_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Manifest::parse(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": []
+            }))
+            .unwrap()
+            .into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut manifests = vec![root.clone()];
+        for _ in 0..2 {
+            let manifest = Manifest::parse(
+                serde_json::to_vec(&json!({
+                    "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [],
+                    "subject": manifests.last().unwrap().descriptor
+                }))
+                .unwrap()
+                .into(),
+                None,
+                None,
+            )
+            .unwrap();
+            let path = blob_path(directory.path(), manifest.digest());
+            fs::create_dir_all(storage::parent(&path)).unwrap();
+            fs::write(path, &manifest.raw).unwrap();
+            manifests.push(manifest);
+        }
+        for conflict in [false, true] {
+            let mut descriptors: Vec<_> = [2, 1, 1]
+                .map(|n| {
+                    let mut descriptor = manifests[n].descriptor.clone();
+                    descriptor
+                        .annotations
+                        .insert(REFERRER_ANNOTATION.into(), "true".into());
+                    descriptor
+                })
+                .into();
+            if conflict {
+                descriptors.last_mut().unwrap().size += 1;
+            }
+            let index = serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": descriptors
+            }))
+            .unwrap();
+            fs::write(directory.path().join("index.json"), &index).unwrap();
+            let limits = TransferConfig {
+                max_metadata_size: (index.len()
+                    + manifests.iter().map(|m| m.raw.len()).sum::<usize>())
+                .to_string(),
+                max_objects: 3,
+                ..Default::default()
+            };
+            let layout = LocalLayout::open(directory.path(), &limits).await.unwrap();
+            let result = layout.graph(root.clone(), &limits).await;
+            if conflict {
+                assert_eq!(result.unwrap_err().code, crate::error::Code::Integrity);
+            } else {
+                let graph = result.unwrap();
+                assert_eq!(graph.manifests.len(), 3);
+                assert_eq!(graph.referrers.len(), 2);
+                assert!(graph.referrers.contains(manifests[2].digest()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_referrer_descendants_share_the_budget_and_enter_the_cache() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let directory = tempfile::tempdir().unwrap();
+        let parse = |value: Value| {
+            Manifest::parse(serde_json::to_vec(&value).unwrap().into(), None, None).unwrap()
+        };
+        let root = parse(json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": []
+        }));
+        let child = parse(json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [],
+            "subject": root.descriptor,
+            "annotations": {"example.payload": "x".repeat(1024)}
+        }));
+        let mut embedded = child.descriptor.clone();
+        embedded.data = Some(STANDARD.encode(&child.raw));
+        let referrer = parse(json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [embedded],
+            "subject": root.descriptor
+        }));
+        let path = blob_path(directory.path(), referrer.digest());
+        fs::create_dir_all(storage::parent(&path)).unwrap();
+        fs::write(path, &referrer.raw).unwrap();
+
+        for exact_budget in [false, true] {
+            let mut descriptors = vec![root.descriptor.clone()];
+            for manifest in [&referrer, &child]
+                .into_iter()
+                .take(if exact_budget { 2 } else { 1 })
+            {
+                let mut descriptor = manifest.descriptor.clone();
+                descriptor
+                    .annotations
+                    .insert(REFERRER_ANNOTATION.into(), "true".into());
+                descriptors.push(descriptor);
+            }
+            let index = serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": descriptors
+            }))
+            .unwrap();
+            fs::write(directory.path().join("index.json"), &index).unwrap();
+            let total = index.len() + root.raw.len() + referrer.raw.len() + child.raw.len();
+            let limits = TransferConfig {
+                max_metadata_size: (total - usize::from(!exact_budget)).to_string(),
+                max_objects: 3,
+                ..Default::default()
+            };
+            let layout = LocalLayout::open(directory.path(), &limits).await.unwrap();
+            let result = layout.graph(root.clone(), &limits).await;
+            if exact_budget {
+                assert_eq!(result.unwrap().manifests.len(), 3);
+                assert!(!blob_path(directory.path(), child.digest()).exists());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, crate::error::Code::InvalidInput);
+                assert_eq!(error.message, "local referrer scan exceeds metadata limit");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_referrer_object_budget_includes_selected_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Manifest::parse(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": crate::model::OCI_MANIFEST,
+                "config": Descriptor::new("application/example", crate::digest::Digest::sha256(b"{}"), 2),
+                "layers": []
+            })).unwrap().into(), None, None,
+        ).unwrap();
+        let referrer = Manifest::parse(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [],
+                "subject": Descriptor::new(OCI_INDEX, crate::digest::Digest::sha256(b"unrelated"), 100)
+            })).unwrap().into(), None, None,
+        ).unwrap();
+        let path = blob_path(directory.path(), referrer.digest());
+        fs::create_dir_all(storage::parent(&path)).unwrap();
+        fs::write(path, &referrer.raw).unwrap();
+        let mut descriptor = referrer.descriptor.clone();
+        descriptor
+            .annotations
+            .insert(REFERRER_ANNOTATION.into(), "true".into());
+        fs::write(directory.path().join("index.json"), serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [root.descriptor, descriptor]
+        })).unwrap()).unwrap();
+        let limits = TransferConfig {
+            max_objects: 2,
+            ..Default::default()
+        };
+        let layout = LocalLayout::open(directory.path(), &limits).await.unwrap();
+        let error = layout.graph(root.clone(), &limits).await.unwrap_err();
+        assert_eq!(error.code, crate::error::Code::InvalidInput);
+        assert_eq!(error.message, "local referrer scan exceeds object limit");
+
+        // Newly merged payloads also share the limit with unrelated candidates kept in the cache.
+        let connected = Manifest::parse(
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": crate::model::OCI_MANIFEST,
+                "config": Descriptor::new("application/example", crate::digest::Digest::sha256(b"new-config"), 10),
+                "layers": [], "subject": root.descriptor
+            })).unwrap().into(), None, None,
+        ).unwrap();
+        fs::write(
+            blob_path(directory.path(), connected.digest()),
+            &connected.raw,
+        )
+        .unwrap();
+        let descriptors: Vec<_> = [&referrer, &connected]
+            .map(|manifest| {
+                let mut descriptor = manifest.descriptor.clone();
+                descriptor
+                    .annotations
+                    .insert(REFERRER_ANNOTATION.into(), "true".into());
+                descriptor
+            })
+            .into();
+        fs::write(
+            directory.path().join("index.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": descriptors
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let limits = TransferConfig {
+            max_objects: 4,
+            ..Default::default()
+        };
+        let error = layout.graph(root, &limits).await.unwrap_err();
+        assert_eq!(error.code, crate::error::Code::InvalidInput);
+        assert_eq!(error.message, "local referrer scan exceeds object limit");
     }
 }

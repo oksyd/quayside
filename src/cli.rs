@@ -151,7 +151,7 @@ pub struct Login {
     #[arg(long)]
     pub save_unverified: bool,
     /// Check pull access to a private repository instead of anonymous /v2/.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "save_unverified")]
     pub repository: Option<String>,
 }
 /// Registry connectivity and persisted policy operations.
@@ -221,6 +221,11 @@ impl TryFrom<&Selection> for crate::options::PlatformSelection {
     type Error = crate::Error;
 
     fn try_from(value: &Selection) -> crate::Result<Self> {
+        if value.all && value.platform.is_some() {
+            return Err(crate::Error::input(
+                "--all cannot be combined with --platform",
+            ));
+        }
         Ok(if value.all {
             Self::All
         } else if let Some(platform) = &value.platform {
@@ -486,6 +491,13 @@ mod tests {
                 "--platform",
                 "linux/amd64"
             ])
+            .is_err()
+        );
+        assert!(
+            crate::options::PlatformSelection::try_from(&Selection {
+                all: true,
+                platform: Some("linux/amd64".into()),
+            })
             .is_err()
         );
     }

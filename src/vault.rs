@@ -11,7 +11,6 @@ use ring::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -37,13 +36,6 @@ struct Envelope {
 fn invalid() -> Error {
     Error::input("invalid credential file")
 }
-fn empty() -> AuthFile {
-    AuthFile {
-        version: 1,
-        registries: BTreeMap::new(),
-    }
-}
-
 // Resolve existing ancestors too, so equivalent relative/symlinked parent paths cannot deadlock
 // the nested auth/key locks or overwrite the other file's lock.
 fn resolved(path: &Path) -> Result<PathBuf> {
@@ -56,6 +48,8 @@ fn resolved(path: &Path) -> Result<PathBuf> {
     Ok(resolved(storage::parent(path))?.join(name))
 }
 fn validate_paths(path: &Path, keyfile: &Path) -> Result<()> {
+    storage::lock_path(path)?;
+    storage::lock_path(keyfile)?;
     storage::reject_symlink(path)?;
     storage::reject_symlink(keyfile)?;
     for parent in [storage::parent(path), storage::parent(keyfile)] {
@@ -73,13 +67,7 @@ fn validate_paths(path: &Path, keyfile: &Path) -> Result<()> {
     }
     let auth = resolved(path)?;
     let key = resolved(keyfile)?;
-    let lock = |p: &Path| {
-        storage::parent(p).join(format!(
-            ".{}.lock",
-            p.file_name().unwrap().to_string_lossy()
-        ))
-    };
-    if auth == key || auth == lock(&key) || key == lock(&auth) {
+    if auth == key || auth == storage::lock_path(&key)? || key == storage::lock_path(&auth)? {
         return Err(Error::input(
             "credential file, master key and lock paths must be distinct",
         ));
@@ -199,7 +187,7 @@ fn save(path: &Path, auth: &AuthFile, key: &[u8]) -> Result<()> {
 pub(crate) fn load(path: &Path, keyfile: &Path) -> Result<AuthFile> {
     validate_paths(path, keyfile)?;
     if !path.try_exists()? {
-        return Ok(empty());
+        return Ok(AuthFile::default());
     }
     let bytes = read_private(path, MAX_ENVELOPE)?;
     match version(&bytes)? {
@@ -360,7 +348,7 @@ mod tests {
         storage::restrict(root.path(), true).unwrap();
         let auth = root.path().join("auth.json");
         let key = root.path().join("data/key");
-        let mut old = empty();
+        let mut old = AuthFile::default();
         old.registries.insert("a".into(), credential());
         let bytes = serde_json::to_vec(&old).unwrap();
         storage::atomic_write(&auth, &bytes).unwrap();
@@ -383,7 +371,7 @@ mod tests {
         storage::restrict(root.path(), true).unwrap();
         let auth = root.path().join("auth.json");
         let key = root.path().join("key");
-        let mut old = empty();
+        let mut old = AuthFile::default();
         old.registries.insert("a".into(), credential());
         let bytes = serde_json::to_vec(&old).unwrap();
         storage::atomic_write(&auth, &bytes).unwrap();
@@ -437,5 +425,38 @@ mod tests {
         let link = root.path().join("symlink");
         std::os::unix::fs::symlink(&key, &link).unwrap();
         assert!(put(&auth, &link, "a", credential()).is_err());
+    }
+
+    #[test]
+    fn credential_paths_require_filenames_before_directory_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let valid = root.path().join("auth.json");
+        for invalid in [
+            Path::new("/"),
+            Path::new("."),
+            Path::new(".."),
+            Path::new(""),
+        ] {
+            for (auth, key) in [(invalid, valid.as_path()), (valid.as_path(), invalid)] {
+                let error = validate_paths(auth, key).unwrap_err();
+                assert_eq!(error.code, crate::error::Code::InvalidInput);
+                assert_eq!(error.message, "storage path needs a filename");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_credential_and_key_paths_remain_distinct() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        storage::restrict(root.path(), true).unwrap();
+        let auth = root.path().join(std::ffi::OsStr::from_bytes(b"store-\xff"));
+        let key = root.path().join(std::ffi::OsStr::from_bytes(b"store-\xfe"));
+        put(&auth, &key, "example.com", credential()).unwrap();
+        assert_eq!(
+            load(&auth, &key).unwrap().registries["example.com"].secret,
+            "private-token"
+        );
     }
 }

@@ -659,6 +659,150 @@ fn selected_platform_keeps_only_its_attestations_when_requested() {
 }
 
 #[test]
+fn platform_selection_preserves_inline_manifests_when_keeping_attestations() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut image = attested_layout(root.path());
+    let mut index: Value = serde_json::from_slice(&image.manifest).unwrap();
+    let descriptor = index["manifests"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|d| d["platform"]["architecture"] == "amd64")
+        .unwrap();
+    let digest = descriptor["digest"].as_str().unwrap().to_owned();
+    let raw = image.blobs.remove(&digest).unwrap();
+    descriptor["data"] = json!(STANDARD.encode(&raw));
+    descriptor["annotations"] = json!({"example.description": "inline platform image"});
+    image.manifest = serde_json::to_vec(&index).unwrap();
+    image.digest = Digest::sha256(&image.manifest).to_string();
+    let manifests = image.blobs.clone();
+    let original = image.manifest.clone();
+    let original_digest = image.digest.clone();
+    let misses = Arc::new(AtomicUsize::new(0));
+    let observed = misses.clone();
+    let source = Server::new(move |request| {
+        assert_eq!(request.method, "GET");
+        let selector = request.path.rsplit('/').next().unwrap();
+        let body = if selector == "v1" || selector == original_digest {
+            &original
+        } else if let Some(body) = manifests.get(selector) {
+            body
+        } else {
+            observed.fetch_add(1, Ordering::SeqCst);
+            return Response::new(404, vec![]);
+        };
+        if request.path.contains("/manifests/") {
+            stored_response(body)
+        } else {
+            Response::new(200, body.clone())
+        }
+    });
+    let state = Arc::new(Mutex::new(State {
+        native: true,
+        ..Default::default()
+    }));
+    let target = registry(&image, state.clone());
+    let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+    let source_ref = format!("{}/app:v1", source.host);
+    let destination = format!("{}/app:v1", target.host);
+    harness.json(
+        &[
+            "image",
+            "copy",
+            &source_ref,
+            &destination,
+            "--platform",
+            "linux/amd64",
+            "--include-attestations",
+        ],
+        0,
+    );
+    let state = state.lock().unwrap();
+    let copied: Value = serde_json::from_slice(&state.manifests["v1"]).unwrap();
+    let selected = &copied["manifests"][0];
+    assert_eq!(selected["digest"], digest);
+    assert_eq!(selected["data"], STANDARD.encode(&raw));
+    assert_eq!(
+        selected["annotations"]["example.description"],
+        "inline platform image"
+    );
+    assert_eq!(state.manifests[&digest], raw);
+    assert_eq!(copied["manifests"].as_array().unwrap().len(), 3);
+    assert_eq!(misses.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn indexed_attestations_survive_duplicate_descriptors_without_annotations() {
+    for annotated_first in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut image = attested_layout(root.path());
+        let mut index = Manifest::parse(image.manifest.clone().into(), None, None)
+            .unwrap()
+            .value;
+        let descriptors = index["manifests"].as_array_mut().unwrap();
+        let mut descriptor = descriptors[0].clone();
+        let mut proof: Value =
+            serde_json::from_slice(&image.blobs[descriptor["digest"].as_str().unwrap()]).unwrap();
+        // Older BuildKit attestations associate their image through descriptor annotations.
+        proof.as_object_mut().unwrap().remove("subject");
+        let proof = serde_json::to_vec(&proof).unwrap();
+        let digest = Digest::sha256(&proof).to_string();
+        descriptor["digest"] = json!(digest);
+        descriptor["size"] = json!(proof.len());
+        let mut duplicate = descriptor.clone();
+        duplicate.as_object_mut().unwrap().remove("annotations");
+        descriptors[0] = descriptor;
+        if annotated_first {
+            descriptors.push(duplicate);
+        } else {
+            descriptors.insert(0, duplicate);
+        }
+        image.manifest = serde_json::to_vec(&index).unwrap();
+        image.digest = Digest::sha256(&image.manifest).to_string();
+        image.blobs.insert(digest.clone(), proof.clone());
+        let source = source(&image);
+        let state = Arc::new(Mutex::new(State {
+            native: true,
+            ..Default::default()
+        }));
+        let target = registry(&image, state.clone());
+        let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+        harness.json(
+            &[
+                "image",
+                "copy",
+                &format!("{}/app:v1", source.host),
+                &format!("{}/app:v1", target.host),
+                "--platform",
+                "linux/amd64",
+                "--include-attestations",
+            ],
+            0,
+        );
+        let state = state.lock().unwrap();
+        let copied: Value = serde_json::from_slice(&state.manifests["v1"]).unwrap();
+        let entries = copied["manifests"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "all selected attestations must survive deduplication"
+        );
+        let entry = entries
+            .iter()
+            .find(|entry| entry["digest"] == digest)
+            .unwrap();
+        assert_eq!(
+            entry["annotations"]["vnd.docker.reference.type"],
+            "attestation-manifest"
+        );
+        assert_eq!(state.manifests[&digest], proof);
+    }
+}
+
+#[test]
 fn native_copy_and_pull_skip_other_platforms_and_attestations() {
     let native = quayside::model::Platform::native().unwrap();
     let other = if native.architecture == "amd64" {

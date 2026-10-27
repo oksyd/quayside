@@ -23,6 +23,7 @@ pub mod layout;
 pub mod model;
 pub mod observer;
 pub mod options;
+mod password;
 mod progress;
 mod proxy;
 /// Registry, repository, tag and digest reference parsing.

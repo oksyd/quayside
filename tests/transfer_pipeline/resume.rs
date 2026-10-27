@@ -61,7 +61,15 @@ fn resumes_partial_download_in_a_new_process_and_checks_cached_bytes() {
             vec!["image", "copy", &src, &dst, "--resume"]
         };
         let output = harness.command(&args).output().unwrap();
-        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && (stderr.contains("HTTP response body read failed")
+                    || stderr.contains("blob download ended before the declared size")),
+            "expected the deliberately truncated blob response to fail; status={}\nstdout={}\nstderr={stderr}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
         let directory = fs::read_dir(harness.root.path().join("resume"))
             .unwrap()
             .next()

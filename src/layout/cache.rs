@@ -97,20 +97,25 @@ impl<'a> DockerCache<'a> {
             let mut input = tokio::fs::File::open(archive.file.path()).await?;
             input.seek(std::io::SeekFrom::Start(offset)).await?;
             let mut output = tokio::fs::File::create(output).await?;
-            let mut remaining = size;
-            let mut buffer = vec![0u8; 64 * 1024];
-            let mut hasher = descriptor.digest.hasher();
-            while remaining > 0 {
-                let length = remaining.min(buffer.len() as u64) as usize;
-                input.read_exact(&mut buffer[..length]).await?;
-                hasher.update(&buffer[..length]);
-                output.write_all(&buffer[..length]).await?;
-                remaining -= length as u64;
-                progress.position(size - remaining);
+            let copied = async {
+                let mut remaining = size;
+                let mut buffer = vec![0u8; 64 * 1024];
+                let mut hasher = descriptor.digest.hasher();
+                while remaining > 0 {
+                    let length = remaining.min(buffer.len() as u64) as usize;
+                    input.read_exact(&mut buffer[..length]).await?;
+                    hasher.update(&buffer[..length]);
+                    output.write_all(&buffer[..length]).await?;
+                    remaining -= length as u64;
+                    progress.position(size - remaining);
+                }
+                hasher.verify(&descriptor.digest)
             }
-            hasher.verify(&descriptor.digest)?;
+            .await;
+            // Failed cache reads and verification can leave a Tokio write in flight. Drain it
+            // before registry fallback truncates and reuses this same file.
             output.flush().await?;
-            Ok::<_, Error>(())
+            copied
         }
         .await;
         if result.is_err() {
@@ -254,4 +259,106 @@ async fn inspect(reference: &Reference, limits: &TransferConfig) -> Result<Optio
     .await;
     // A missing/unresponsive daemon is a cache miss, never a requirement for remote copy.
     result.unwrap_or(Ok(None))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::model::{Manifest, OCI_INDEX};
+    use rustix::fs::{Mode, OFlags};
+    use std::{fs::File, io::Read, sync::Mutex};
+
+    struct Written(Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+
+    impl BlobProgress for Written {
+        fn phase(&self, _: BlobPhase) {}
+        fn finish(&self) {}
+        fn position(&self, _: u64) {
+            if let Some(sender) = self.0.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_writes_finish_before_registry_fallback_can_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("blocked-output");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &output, Mode::RUSR | Mode::WUSR).unwrap();
+        let reader =
+            rustix::fs::open(&output, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty()).unwrap();
+        let writer =
+            rustix::fs::open(&output, OFlags::WRONLY | OFlags::NONBLOCK, Mode::empty()).unwrap();
+        let mut filled = 0;
+        for buffer in [&[0u8; 4096][..], &[0u8; 1][..]] {
+            loop {
+                match rustix::io::write(&writer, buffer) {
+                    Ok(count) => filled += count,
+                    Err(rustix::io::Errno::AGAIN) => break,
+                    Err(error) => panic!("cannot fill test FIFO: {error}"),
+                }
+            }
+        }
+        let flags = rustix::fs::fcntl_getfl(&reader).unwrap();
+        rustix::fs::fcntl_setfl(&reader, flags - OFlags::NONBLOCK).unwrap();
+
+        let limits = TransferConfig::default();
+        let root = Manifest::parse(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": []
+            }))
+            .unwrap()
+            .into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let graph = Graph::build(root, &limits, |_| async { unreachable!() })
+            .await
+            .unwrap();
+        let reference = "docker.io/library/example:latest".parse().unwrap();
+        let cache = DockerCache::new(&reference, &limits, &graph);
+        let descriptor = Descriptor::new("application/octet-stream", Digest::sha256(b"a"), 1);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"b").unwrap();
+        assert!(
+            cache
+                .archive
+                .set(Some(Archive {
+                    file,
+                    _reservation: Budget::new(1).reserve(1).await.unwrap(),
+                    blobs: BTreeMap::from([(descriptor.digest.clone(), (0, 1))]),
+                }))
+                .is_ok()
+        );
+        let (written, queued) = tokio::sync::oneshot::channel();
+        let progress = Written(Mutex::new(Some(written)));
+        let (finished, mut completion) = tokio::sync::oneshot::channel();
+        let ((), premature) = tokio::join!(
+            async {
+                finished
+                    .send(cache.stage(&descriptor, &output, &progress).await)
+                    .unwrap();
+            },
+            async {
+                queued.await.unwrap();
+                let premature = completion.try_recv().is_ok();
+                // Always drain the FIFO before asserting, so a failure cannot strand a writer.
+                tokio::task::spawn_blocking(move || {
+                    let mut bytes = vec![0; filled + 1];
+                    File::from(reader).read_exact(&mut bytes).unwrap();
+                    assert_eq!(bytes[filled], b'b');
+                })
+                .await
+                .unwrap();
+                premature
+            }
+        );
+        assert!(
+            !premature,
+            "cache fallback began while its last write was still pending"
+        );
+        assert!(!completion.await.unwrap());
+        drop(writer);
+    }
 }

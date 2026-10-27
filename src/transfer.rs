@@ -164,7 +164,7 @@ async fn upload_resumable(
     path: &Path,
     initial: Option<UploadStart>,
     progress: &dyn crate::observer::BlobProgress,
-    resume: Option<&crate::resume::Blob>,
+    resume: Option<&Arc<crate::resume::Blob>>,
 ) -> Result<bool> {
     let mut initial = initial;
     for attempt in 0..=target.config().transfer.max_retries {
@@ -180,7 +180,7 @@ async fn upload_resumable(
                 }
                 Ok(_) => {
                     if let Some(r) = resume {
-                        r.set_session(None)?;
+                        r.set_session(None).await?;
                     }
                     None
                 }
@@ -193,7 +193,7 @@ async fn upload_resumable(
                     ) =>
                 {
                     if let Some(r) = resume {
-                        r.set_session(None)?;
+                        r.set_session(None).await?;
                     }
                     None
                 }
@@ -220,7 +220,8 @@ async fn upload_resumable(
                     r.set_session(Some(crate::resume::Session {
                         url: url.to_string(),
                         minimum_chunk,
-                    }))?;
+                    }))
+                    .await?;
                 }
                 upload_session(
                     target,
@@ -264,7 +265,7 @@ async fn upload_session(
     path: &Path,
     session: (url::Url, u64, u64),
     progress: &dyn crate::observer::BlobProgress,
-    resume: Option<&crate::resume::Blob>,
+    resume: Option<&Arc<crate::resume::Blob>>,
 ) -> Result<()> {
     let (mut url, minimum_chunk, mut offset) = session;
     progress.phase(crate::observer::BlobPhase::Uploading);
@@ -343,7 +344,8 @@ async fn upload_session(
             r.set_session(Some(crate::resume::Session {
                 url: url.to_string(),
                 minimum_chunk,
-            }))?;
+            }))
+            .await?;
         }
     }
     progress.phase(crate::observer::BlobPhase::Committing);
@@ -594,8 +596,9 @@ async fn transfer_inputs<'a>(
                         .await
                         .inspect_err(|_| progress.fail())?;
                     // One verified temporary file per active worker, never a whole layer in RAM.
-                    let temporary =
-                        crate::resume::Staging::new(resume, &d).inspect_err(|_| progress.fail())?;
+                    let temporary = crate::resume::Staging::new(resume, &d)
+                        .await
+                        .inspect_err(|_| progress.fail())?;
                     let reused = match local {
                         Some(local) => local.stage(&d, temporary.path(), progress.as_ref()).await,
                         None => false,
@@ -655,6 +658,7 @@ async fn transfer_inputs<'a>(
         .inspect_err(|_| blob.progress.fail())?;
         blob.temporary
             .complete()
+            .await
             .inspect_err(|_| blob.progress.fail())?;
         blob.progress.finish_with(if blob.reused {
             crate::observer::BlobOutcome::Reused
@@ -737,10 +741,13 @@ pub async fn copy_with_options(
     }
     drop(resolving);
     let resume = if options.resume && !write.dry_run {
-        Some(crate::resume::Store::open(
-            &format!("copy\n{source_ref}\n{destination}"),
-            &target.config().transfer,
-        )?)
+        Some(
+            crate::resume::Store::open(
+                &format!("copy\n{source_ref}\n{destination}"),
+                &target.config().transfer,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -760,7 +767,7 @@ pub async fn copy_with_options(
         publish_children(target, destination, &graph).await?;
         publish_root(target, destination, &graph.root, write.overwrite).await?;
         if let Some(store) = resume {
-            store.clear()?;
+            store.clear().await?;
         }
     }
     let platforms = if resolved.platforms.is_empty() {

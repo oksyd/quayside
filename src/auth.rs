@@ -14,13 +14,21 @@ pub struct Credential {
 }
 
 /// Decrypted credential-store contents; use the storage methods to persist encryption.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthFile {
     /// Version of the serialized file format.
     pub version: u32,
     /// Credentials indexed by normalized registry authority.
     pub registries: BTreeMap<String, Credential>,
+}
+impl Default for AuthFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            registries: BTreeMap::new(),
+        }
+    }
 }
 impl AuthFile {
     /// Load and decrypt credentials using the separate key file; a missing store is empty.

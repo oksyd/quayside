@@ -23,11 +23,8 @@ impl Registry {
         if response_url.scheme() == "https" && url.scheme() != "https" {
             return Err(Error::input("refusing HTTPS upload endpoint downgrade"));
         }
-        self.validate_upload_url(&url)?;
+        self.validate_content_url(&url)?;
         Ok(url)
-    }
-    fn validate_upload_url(&self, url: &Url) -> Result<()> {
-        self.validate_content_url(url)
     }
     /// Check whether a blob exists and reject a reported length that conflicts with its descriptor.
     pub async fn blob_exists(&self, repo: &str, d: &Descriptor) -> Result<bool> {
@@ -185,84 +182,68 @@ impl Registry {
         if let Some(from) = from {
             validate_repository(from)?;
         }
-        let mut url = self.url(&format!("v2/{repo}/blobs/uploads/"))?;
-        if let Some(from) = from {
-            url.query_pairs_mut()
-                .append_pair("mount", digest.as_str())
-                .append_pair("from", from);
-        }
-        let scope = if let Some(from) = from {
-            format!(
-                "{} {}",
-                Self::scope(repo, "pull,push"),
-                Self::scope(from, "pull")
-            )
-        } else {
-            Self::scope(repo, "pull,push")
-        };
-        let attempted = self
-            .request(
-                Method::POST,
-                url,
-                &scope,
-                HeaderMap::new(),
-                None,
-                false,
-                false,
-            )
-            .await;
-        let mut response = match attempted {
-            Ok((response, _)) => response,
-            Err(e)
-                if from.is_some()
-                    && matches!(
-                        e.code,
-                        Code::Unauthorized | Code::Forbidden | Code::Unsupported
-                    ) =>
-            {
-                self.request(
-                    Method::POST,
-                    self.url(&format!("v2/{repo}/blobs/uploads/"))?,
-                    &Self::scope(repo, "pull,push"),
-                    HeaderMap::new(),
-                    None,
-                    false,
-                    false,
-                )
-                .await?
-                .0
+        let mut mount_from = from;
+        loop {
+            let mut url = self.url(&format!("v2/{repo}/blobs/uploads/"))?;
+            if let Some(from) = mount_from {
+                url.query_pairs_mut()
+                    .append_pair("mount", digest.as_str())
+                    .append_pair("from", from);
             }
-            Err(e) => return Err(e),
-        };
-        if from.is_some() && matches!(response.status().as_u16(), 400 | 401 | 403 | 404 | 405) {
-            response = self
+            let scope = if let Some(from) = mount_from {
+                format!(
+                    "{} {}",
+                    Self::scope(repo, "pull,push"),
+                    Self::scope(from, "pull")
+                )
+            } else {
+                Self::scope(repo, "pull,push")
+            };
+            let attempted = self
                 .request(
                     Method::POST,
-                    self.url(&format!("v2/{repo}/blobs/uploads/"))?,
-                    &Self::scope(repo, "pull,push"),
+                    url,
+                    &scope,
                     HeaderMap::new(),
                     None,
                     false,
                     false,
                 )
-                .await?
-                .0;
-        }
-        match response.status() {
-            StatusCode::CREATED if from.is_some() => Ok(UploadStart::Mounted),
-            StatusCode::ACCEPTED => {
-                let minimum_chunk = response
-                    .headers()
-                    .get("oci-chunk-min-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                Ok(UploadStart::Session {
-                    url: self.checked_location(&response)?,
-                    minimum_chunk,
-                })
+                .await;
+            let response = match attempted {
+                Ok((response, _)) => response,
+                Err(e)
+                    if mount_from.is_some()
+                        && matches!(
+                            e.code,
+                            Code::Unauthorized | Code::Forbidden | Code::Unsupported
+                        ) =>
+                {
+                    mount_from = None;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if mount_from.is_some() && matches!(response.status().as_u16(), 400 | 404 | 405) {
+                mount_from = None;
+                continue;
             }
-            _ => Err(http_error(&response)),
+            return match response.status() {
+                StatusCode::CREATED if mount_from.is_some() => Ok(UploadStart::Mounted),
+                StatusCode::ACCEPTED => {
+                    let minimum_chunk = response
+                        .headers()
+                        .get("oci-chunk-min-length")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    Ok(UploadStart::Session {
+                        url: self.checked_location(&response)?,
+                        minimum_chunk,
+                    })
+                }
+                _ => Err(http_error(&response)),
+            };
         }
     }
     /// Send one chunk at the expected offset and return the validated continuation URL.
@@ -274,13 +255,14 @@ impl Registry {
         chunk: Bytes,
     ) -> Result<Url> {
         validate_repository(repo)?;
-        self.validate_upload_url(&url)?;
+        self.validate_content_url(&url)?;
         if chunk.is_empty() {
             return Err(Error::input("empty PATCH chunk"));
         }
-        let end = offset
-            .checked_add(chunk.len() as u64 - 1)
+        let next_offset = offset
+            .checked_add(chunk.len() as u64)
             .ok_or_else(|| Error::input("upload offset overflow"))?;
+        let end = next_offset - 1;
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -312,7 +294,7 @@ impl Registry {
             .headers()
             .get(header::RANGE)
             .and_then(|v| v.to_str().ok())
-            && range_offset(range)? != end + 1
+            && range_offset(range)? != next_offset
         {
             return Err(Error::network(
                 "server acknowledged unexpected upload offset",
@@ -323,7 +305,7 @@ impl Registry {
     /// Query an upload session and return its continuation URL and acknowledged byte offset.
     pub async fn upload_status(&self, repo: &str, url: Url) -> Result<(Url, u64)> {
         validate_repository(repo)?;
-        self.validate_upload_url(&url)?;
+        self.validate_content_url(&url)?;
         let (response, _) = self
             .request(
                 Method::GET,
@@ -358,7 +340,7 @@ impl Registry {
         chunk: Bytes,
     ) -> Result<()> {
         validate_repository(repo)?;
-        self.validate_upload_url(&url)?;
+        self.validate_content_url(&url)?;
         if url.query_pairs().any(|(k, _)| k == "digest") {
             return Err(Error::input(
                 "upload URL unexpectedly already contains a digest parameter",
@@ -368,9 +350,10 @@ impl Registry {
         let mut headers = HeaderMap::new();
         let has_body = !chunk.is_empty();
         if has_body {
-            let end = offset
-                .checked_add(chunk.len() as u64 - 1)
+            let next_offset = offset
+                .checked_add(chunk.len() as u64)
                 .ok_or_else(|| Error::input("upload offset overflow"))?;
+            let end = next_offset - 1;
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),

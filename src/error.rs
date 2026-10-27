@@ -50,7 +50,17 @@ pub struct Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        use std::fmt::Write;
+        // Preserve diagnostic line breaks, but never execute controls from remote metadata.
+        // The JSON representation retains the original message with JSON escaping.
+        for c in self.message.chars() {
+            if c.is_control() && !matches!(c, '\n' | '\t') {
+                write!(f, "{}", c.escape_default())?;
+            } else {
+                f.write_char(c)?;
+            }
+        }
+        Ok(())
     }
 }
 

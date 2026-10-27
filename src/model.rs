@@ -1,7 +1,7 @@
 use crate::{Error, Result, digest::Digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
@@ -20,11 +20,17 @@ pub const ACCEPT_MANIFEST: &str = "application/vnd.oci.image.index.v1+json, appl
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Platform {
     /// Target operating system name.
+    #[serde(deserialize_with = "deserialize_platform_component")]
     pub os: String,
     /// Target CPU architecture name.
+    #[serde(deserialize_with = "deserialize_platform_component")]
     pub architecture: String,
     /// Optional architecture variant, such as arm v7 or arm64 v8.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_platform_variant"
+    )]
     pub variant: Option<String>,
     /// Optional operating-system version advertised by the image.
     #[serde(
@@ -56,38 +62,60 @@ impl Platform {
     }
     /// Parse platform metadata from an image configuration, requiring OS and architecture.
     pub fn from_config(config: &Value) -> Result<Self> {
-        let os = config
-            .get("os")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::input("image config has no operating system"))?;
-        let arch = config
-            .get("architecture")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::input("image config has no architecture"))?;
-        let mut p: Self = format!("{os}/{arch}").parse()?;
-        p.variant = config
-            .get("variant")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        p.os_version = config
-            .get("os.version")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        p.os_features = config
-            .get("os.features")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
+        for (field, name) in [("os", "operating system"), ("architecture", "architecture")] {
+            if !config
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            {
+                return Err(Error::input(format!("image config has no {name}")));
+            }
+        }
+        // Retain only platform metadata, rather than copying image layers, history or secrets.
+        // OCI config optional properties may be null, which is equivalent to absence.
+        let fields = ["os", "architecture", "variant", "os.version", "os.features"]
+            .into_iter()
+            .filter_map(|name| {
+                config
+                    .get(name)
+                    .filter(|value| !value.is_null())
+                    .map(|value| (name.to_owned(), value.clone()))
             })
-            .unwrap_or_default();
-        Ok(p)
+            .collect();
+        serde_json::from_value(Value::Object(fields)).map_err(Into::into)
     }
 }
+
+fn valid_platform_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn deserialize_platform_component<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if !valid_platform_component(&value) {
+        return Err(serde::de::Error::custom("invalid platform component"));
+    }
+    Ok(value)
+}
+
+fn deserialize_platform_variant<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_deref()
+        .is_some_and(|value| !valid_platform_component(value))
+    {
+        return Err(serde::de::Error::custom("invalid platform variant"));
+    }
+    Ok(value)
+}
+
 fn native_platform(os: &str, architecture: &str) -> Result<&'static str> {
     match (os, architecture) {
         ("linux", "x86_64") => Ok("linux/amd64"),
@@ -101,14 +129,7 @@ impl FromStr for Platform {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
         let parts: Vec<_> = s.split('/').collect();
-        if !(2..=3).contains(&parts.len())
-            || parts.iter().any(|s| {
-                s.is_empty()
-                    || !s
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
-            })
-        {
+        if !(2..=3).contains(&parts.len()) || parts.iter().any(|s| !valid_platform_component(s)) {
             return Err(Error::input("platform must be os/architecture[/variant]"));
         }
         Ok(Self {
@@ -234,7 +255,12 @@ impl Manifest {
         }
         let media_type = value
             .get("mediaType")
-            .and_then(Value::as_str)
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| Error::input("manifest mediaType must be a string"))
+            })
+            .transpose()?
             .or_else(|| content_type.map(|s| s.split(';').next().unwrap_or(s).trim()))
             .unwrap_or(if value.get("manifests").is_some() {
                 OCI_INDEX
@@ -261,6 +287,15 @@ impl Manifest {
             descriptor,
             kind,
         };
+        if result
+            .value
+            .get("artifactType")
+            .is_some_and(|value| !value.as_str().is_some_and(|value| !value.is_empty()))
+        {
+            return Err(Error::input(
+                "manifest artifactType must be a nonempty string",
+            ));
+        }
         // Validate all known required fields without serializing the original document again.
         match kind {
             ManifestKind::Index => {
@@ -413,7 +448,6 @@ mod tests {
                 "subject",
                 serde_json::json!({"mediaType": OCI_MANIFEST, "size": 7, "digest": "sha256:invalid"}),
             ),
-            ("artifactType", serde_json::json!(true)),
             ("annotations", serde_json::json!({"example.title": 1})),
         ] {
             let mut invalid_value = value.clone();
@@ -455,6 +489,76 @@ mod tests {
     }
 
     #[test]
+    fn malformed_media_types_cannot_fall_back_or_bypass_image_selection() {
+        let valid = serde_json::json!({
+            "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+            "config": Descriptor::new("application/vnd.oci.image.config.v1+json", Digest::sha256(b"{}"), 2),
+            "layers": []
+        });
+        for (field, invalid) in [
+            ("mediaType", serde_json::json!(false)),
+            ("mediaType", Value::Null),
+            ("artifactType", serde_json::json!(true)),
+            ("artifactType", serde_json::json!("")),
+            ("artifactType", serde_json::json!({"type": "proof"})),
+        ] {
+            let mut value = valid.clone();
+            value[field] = invalid;
+            assert!(
+                Manifest::parse(
+                    serde_json::to_vec(&value).unwrap().into(),
+                    Some(OCI_MANIFEST),
+                    None
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_type_validation_does_not_depend_on_subject_registration() {
+        let subject = Descriptor::new(OCI_MANIFEST, Digest::sha256(b"subject"), 7);
+        for media_type in [OCI_MANIFEST, OCI_INDEX] {
+            for with_subject in [false, true] {
+                let mut value = serde_json::json!({
+                    "schemaVersion": 2, "mediaType": media_type
+                });
+                if media_type == OCI_MANIFEST {
+                    value["config"] = serde_json::json!(Descriptor::new(
+                        "application/vnd.oci.image.config.v1+json",
+                        Digest::sha256(b"{}"),
+                        2,
+                    ));
+                    value["layers"] = serde_json::json!([]);
+                } else {
+                    value["manifests"] = serde_json::json!([]);
+                }
+                if with_subject {
+                    value["subject"] = serde_json::json!(subject);
+                }
+                for artifact_type in [None, Some(serde_json::json!("application/example"))] {
+                    if let Some(artifact_type) = artifact_type {
+                        value["artifactType"] = artifact_type;
+                    }
+                    let manifest =
+                        Manifest::parse(serde_json::to_vec(&value).unwrap().into(), None, None)
+                            .unwrap();
+                    manifest.check_transfer_supported().unwrap();
+                }
+                value["artifactType"] = Value::Null;
+                let error = Manifest::parse(serde_json::to_vec(&value).unwrap().into(), None, None)
+                    .unwrap_err();
+                assert_eq!(error.code, crate::error::Code::InvalidInput);
+                assert_eq!(
+                    error.message,
+                    "manifest artifactType must be a nonempty string"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_platform_maps_supported_container_hosts() {
         assert_eq!(native_platform("linux", "x86_64").unwrap(), "linux/amd64");
         assert_eq!(native_platform("linux", "aarch64").unwrap(), "linux/arm64");
@@ -468,6 +572,40 @@ mod tests {
         let p: Platform = "linux/arm64".parse().unwrap();
         assert!(full.matches(&p));
         assert!(!full.matches(&"linux/arm64/v9".parse().unwrap()));
+    }
+    #[test]
+    fn platform_metadata_rejects_malformed_components_and_types() {
+        for (field, invalid) in [
+            ("os", serde_json::json!("linux/amd64")),
+            ("architecture", serde_json::json!("amd64/v2")),
+            ("architecture", serde_json::json!("")),
+            ("variant", serde_json::json!("v8\nforged output")),
+            ("variant", serde_json::json!(true)),
+            ("os.version", serde_json::json!(42)),
+            ("os.features", serde_json::json!(["valid", false])),
+        ] {
+            let mut metadata = serde_json::json!({"os": "linux", "architecture": "amd64"});
+            metadata[field] = invalid;
+            assert!(Platform::from_config(&metadata).is_err(), "{field}");
+            assert!(
+                serde_json::from_value::<Platform>(metadata).is_err(),
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn config_platform_ignores_unrelated_fields_and_accepts_null_options() {
+        let config = serde_json::json!({
+            "os": "linux", "architecture": "arm64", "variant": "v8",
+            "os.version": null, "os.features": null,
+            "rootfs": {"diff_ids": ["unrelated"]},
+            "config": {"Env": ["SECRET=value"]}
+        });
+        let platform = Platform::from_config(&config).unwrap();
+        assert_eq!(platform, "linux/arm64/v8".parse().unwrap());
+        let mut missing_os = config.clone();
+        missing_os["os"] = Value::Null;
+        assert!(Platform::from_config(&missing_os).is_err());
     }
     #[test]
     fn embedded_data_checks_digest() {

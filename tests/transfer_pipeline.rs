@@ -412,6 +412,9 @@ fn lost_commit_response_checks_the_blob_before_reuploading() {
 fn interrupted_download(mode: &str, exit: i32) {
     let root = tempfile::tempdir().unwrap();
     let image = image_layout(root.path(), 1, 8192);
+    let rejected_status = mode
+        .strip_prefix("reject-")
+        .map(|status| status.parse::<u16>().unwrap());
     let mode = mode.to_owned();
     let ranges = Arc::new(Mutex::new(Vec::new()));
     let observed = ranges.clone();
@@ -431,6 +434,13 @@ fn interrupted_download(mode: &str, exit: i32) {
         if seen.fetch_add(1, Ordering::SeqCst) == 0 {
             return Response::new(200, bytes[..4096].to_vec()).header("Content-Length", "8192");
         }
+        if let Some(status) = rejected_status {
+            return if request.headers.contains_key("range") {
+                Response::new(status, vec![])
+            } else {
+                Response::new(200, bytes.clone())
+            };
+        }
         match mode.as_str() {
             "ignore" => Response::new(200, bytes.clone()),
             "invalid" => Response::new(206, bytes[4096..].to_vec())
@@ -449,11 +459,16 @@ fn interrupted_download(mode: &str, exit: i32) {
     harness.config.transfer.max_retries = 1;
     harness.config.transfer.concurrency = 1;
     let result = copy(&harness, &source, &target, exit);
-    assert_eq!(
-        *ranges.lock().unwrap(),
-        vec![None, Some("bytes=4096-8191".into())]
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    let mut expected = vec![None, Some("bytes=4096-8191".into())];
+    if let Some(status) = rejected_status {
+        if status >= 500 {
+            // The configured HTTP retry is exhausted before treating Range as unsupported.
+            expected.push(Some("bytes=4096-8191".into()));
+        }
+        expected.push(None);
+    }
+    assert_eq!(*ranges.lock().unwrap(), expected);
+    assert_eq!(requests.load(Ordering::SeqCst), expected.len());
     if exit == 7 {
         assert_eq!(result["error"]["code"], "INTEGRITY");
     }
@@ -467,6 +482,13 @@ fn interrupted_download_resumes_verified_bytes() {
 #[test]
 fn ignored_range_restarts_and_verifies_the_full_blob() {
     interrupted_download("ignore", 0);
+}
+
+#[test]
+fn rejected_resume_range_restarts_and_verifies_the_full_blob() {
+    for mode in ["reject-400", "reject-416", "reject-501"] {
+        interrupted_download(mode, 0);
+    }
 }
 
 #[test]

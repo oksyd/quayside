@@ -124,11 +124,15 @@ pub(super) async fn resolve_selection(
             if d.size > max_manifest {
                 return Err(Error::input("child manifest exceeds size limit"));
             }
-            if let Some(previous) = admitted.get(&d.digest) {
+            if let Some(previous) = admitted.get_mut(&d.digest) {
                 if previous.size != d.size || previous.media_type != d.media_type {
                     return Err(Error::integrity(
                         "conflicting descriptors during platform selection",
                     ));
+                }
+                d.embedded()?;
+                if previous.data.is_none() {
+                    previous.data = d.data;
                 }
                 continue;
             }
@@ -142,11 +146,11 @@ pub(super) async fn resolve_selection(
             if admitted.len() >= limits.max_objects {
                 return Err(Error::input("platform selection object limit exceeded"));
             }
-            admitted.insert(d.digest.clone(), d.clone());
-            batch.push(d);
+            batch.push(d.digest.clone());
+            admitted.insert(d.digest.clone(), d);
         }
         let mut fetched = stream::iter(batch)
-            .map(|descriptor| selected_child(source, reference, descriptor))
+            .map(|digest| selected_child(source, reference, admitted[&digest].clone()))
             .buffered(limits.concurrency);
         while let Some(child) = fetched.next().await {
             let (mut child, platform) = child?;
@@ -203,7 +207,7 @@ async fn selected_child(
     reference: &Reference,
     descriptor: Descriptor,
 ) -> Result<(Manifest, Option<Platform>)> {
-    let child = if let Some(raw) = descriptor.embedded()? {
+    let mut child = if let Some(raw) = descriptor.embedded()? {
         Manifest::parse(raw, Some(&descriptor.media_type), Some(&descriptor.digest))?
     } else {
         source
@@ -214,11 +218,12 @@ async fn selected_child(
     let platform = if child.kind == ManifestKind::Index || child.is_artifact()? {
         None
     } else {
-        Some(match descriptor.platform {
+        Some(match descriptor.platform.clone() {
             Some(platform) => platform,
             None => image_platform(source, &reference.repository, &child).await?,
         })
     };
+    child.descriptor = descriptor;
     Ok((child, platform))
 }
 

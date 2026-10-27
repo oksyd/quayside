@@ -13,6 +13,126 @@ use std::{
 use support::{Harness, Response, Server, image_layout};
 
 #[test]
+fn pull_rejects_incompatible_existing_output_before_network_requests() {
+    let server = Server::new(|_| Response::new(500, vec![]));
+    let harness = Harness::new(&[(&server.host, true)]);
+    let reference = format!("{}/app:v1", server.host);
+    let directory = harness.root.path().join("directory");
+    let file = harness.root.path().join("archive");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(&file, b"existing content").unwrap();
+    for (output, format) in [
+        (&file, "oci-layout"),
+        (&directory, "oci-layout"),
+        (&directory, "oci-archive"),
+    ] {
+        let result = harness.json(
+            &[
+                "image",
+                "pull",
+                &reference,
+                "-o",
+                output.to_str().unwrap(),
+                "--format",
+                format,
+                "--overwrite",
+            ],
+            8,
+        );
+        assert_eq!(result["error"]["code"], "CONFLICT");
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(file).unwrap(), b"existing content");
+    assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+}
+
+#[test]
+fn export_size_limits_cover_tar_overhead_and_layout_metadata_before_layer_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let image = image_layout(root.path(), 1, 64);
+    let config_digest = Manifest::parse(image.manifest.clone().into(), None, None)
+        .unwrap()
+        .config()
+        .unwrap()
+        .digest
+        .to_string();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let observed = reads.clone();
+    let server = Server::new(move |request| {
+        assert_eq!(request.method, "GET");
+        if request.path.contains("/manifests/") {
+            Response::new(200, image.manifest.clone()).header("Content-Type", OCI_MANIFEST)
+        } else {
+            if !request.path.ends_with(&config_digest) {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            Response::new(
+                200,
+                image.blobs[request.path.rsplit('/').next().unwrap()].clone(),
+            )
+        }
+    });
+    let mut harness = Harness::new(&[(&server.host, true)]);
+    let reference = format!("{}/app:v1", server.host);
+    let archive = harness.root.path().join("baseline.tar");
+    harness.json(
+        &[
+            "image",
+            "pull",
+            "--all",
+            &reference,
+            "-o",
+            archive.to_str().unwrap(),
+        ],
+        0,
+    );
+    let archive_bytes = std::fs::metadata(&archive).unwrap().len();
+    let layout_bytes: u64 = tar::Archive::new(std::fs::File::open(&archive).unwrap())
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().size())
+        .sum();
+    assert!(archive_bytes > layout_bytes);
+    for (format, size) in [("oci-archive", archive_bytes), ("oci-layout", layout_bytes)] {
+        let output = harness.root.path().join(format);
+        let mut arguments = vec![
+            "image",
+            "pull",
+            "--all",
+            &reference,
+            "-o",
+            output.to_str().unwrap(),
+            "--format",
+            format,
+        ];
+        harness.config.transfer.max_archive_size = (size - 1).to_string();
+        for dry_run in [false, true] {
+            let before = reads.load(Ordering::SeqCst);
+            if dry_run {
+                arguments.push("--dry-run");
+            }
+            let result = harness.json(&arguments, 2);
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("archive size limit")
+            );
+            assert!(!output.exists());
+            assert_eq!(reads.load(Ordering::SeqCst), before);
+        }
+        arguments.pop();
+        harness.config.transfer.max_archive_size = size.to_string();
+        harness.json(&arguments, 0);
+        if format == "oci-archive" {
+            assert_eq!(std::fs::metadata(output).unwrap().len(), size);
+        } else {
+            assert!(output.join("oci-layout").is_file());
+        }
+    }
+}
+
+#[test]
 fn digest_reads_only_manifest_and_inspect_reads_config_once() {
     let root = tempfile::tempdir().unwrap();
     let image = support::image_layout_for(root.path(), 1, 8192, "arm64");
@@ -375,6 +495,62 @@ fn ready_parent_does_not_wait_for_an_unrelated_slow_branch() {
         ],
         0,
     );
+}
+
+#[test]
+fn platform_selection_uses_inline_content_from_any_matching_duplicate() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    for inline_first in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let image = support::image_layout_for(directory.path(), 0, 0, "arm64");
+        let manifest = Manifest::parse(image.manifest.clone().into(), None, None).unwrap();
+        let mut ordinary = manifest.descriptor.clone();
+        ordinary.platform = Some("linux/arm64".parse().unwrap());
+        let mut inline = ordinary.clone();
+        inline.data = Some(STANDARD.encode(&image.manifest));
+        let children = if inline_first {
+            [inline, ordinary]
+        } else {
+            [ordinary, inline]
+        };
+        let index = serde_json::to_vec(&json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": children
+        }))
+        .unwrap();
+        let missing = Arc::new(AtomicUsize::new(0));
+        let observed = missing.clone();
+        let source = Server::new(move |request| {
+            assert_eq!(request.method, "GET");
+            if request.path == "/v2/app/manifests/v1" {
+                Response::new(200, index.clone()).header("Content-Type", OCI_INDEX)
+            } else {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Response::new(404, vec![])
+            }
+        });
+        let target = Server::new(|request| {
+            assert!(matches!(request.method.as_str(), "GET" | "HEAD"));
+            Response::new(404, vec![])
+        });
+        let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+        let result = harness.json(
+            &[
+                "image",
+                "copy",
+                &format!("{}/app:v1", source.host),
+                &format!("{}/app:v1", target.host),
+                "--platform",
+                "linux/arm64",
+                "--dry-run",
+            ],
+            0,
+        );
+        assert_eq!(result["data"]["target_digest"], image.digest);
+        assert_eq!(result["data"]["stats"]["planned_blobs"], 1);
+        assert_eq!(source.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(missing.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]

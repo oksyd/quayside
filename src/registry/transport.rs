@@ -68,7 +68,9 @@ pub(super) fn client(base: &Url, config: &Config, policy: &RegistryConfig) -> Re
         );
     if let Some(url) = &proxy.url {
         let uri = url.parse().map_err(|_| Error::input("invalid proxy URL"))?;
-        builder = builder.http_proxy(uri).no_proxy(proxy.transport_rules());
+        builder = builder.http_proxy(uri).no_proxy(proxy.transport_rules()).map_err(|_| {
+            Error::input("Invalid no_proxy rule: expected a hostname, IP address, CIDR, optional port, or wildcard")
+        })?;
     }
     if let Some(path) = &policy.ca_file {
         let bytes = std::fs::read(path)?;
@@ -93,10 +95,7 @@ pub(super) fn client(base: &Url, config: &Config, policy: &RegistryConfig) -> Re
             return Err(Error::input("CA file contains no PEM certificates"));
         }
     }
-    let inner = builder.build().map_err(|error| match error {
-        reqx::Error::InvalidNoProxyRule { .. } => Error::input("Invalid no_proxy rule: expected a hostname, IP address, CIDR, optional port, or wildcard"),
-        _ => error.into(),
-    })?;
+    let inner = builder.build()?;
     Ok(HttpClient { inner, proxy })
 }
 pub(super) fn is_connect(error: &reqx::Error) -> bool {
@@ -108,11 +107,14 @@ pub(super) fn is_connect(error: &reqx::Error) -> bool {
         }
     )
 }
-pub(super) fn is_timeout(error: &reqx::Error) -> bool {
-    matches!(
-        error,
-        reqx::Error::Timeout { .. } | reqx::Error::DeadlineExceeded { .. }
-    )
+pub(super) fn retryable_transport(error: &reqx::Error) -> bool {
+    crate::error::certificate_code(error).is_none()
+        && matches!(
+            error,
+            reqx::Error::Timeout { .. }
+                | reqx::Error::DeadlineExceeded { .. }
+                | reqx::Error::Transport { .. }
+        )
 }
 pub(super) fn authority(url: &Url) -> String {
     url[url::Position::BeforeHost..url::Position::AfterPort].to_string()
@@ -277,8 +279,9 @@ impl Registry {
                 request = request.header(name.clone(), value.clone());
             }
             if !streaming {
-                request =
-                    request.total_timeout(duration(&self.inner.config.transfer.metadata_timeout)?);
+                request = request.total_timeout(Some(duration(
+                    &self.inner.config.transfer.metadata_timeout,
+                )?));
             }
             if let Some(b) = &body {
                 request = request.body(b.clone());
@@ -334,12 +337,9 @@ impl Registry {
             let response = match response {
                 Ok(r) => r,
                 Err(e)
-                    if crate::error::certificate_code(&e).is_none()
-                        && retry_safe
+                    if retry_safe
                         && retries < self.inner.config.transfer.max_retries
-                        && (is_connect(&e)
-                            || is_timeout(&e)
-                            || matches!(e, reqx::Error::Transport { .. })) =>
+                        && retryable_transport(&e) =>
                 {
                     if mutation && !is_connect(&e) {
                         self.inner.changed.store(true, Ordering::SeqCst);

@@ -87,21 +87,7 @@ impl Registry {
                 return Err(Error::input("referrer listings exceed metadata limit"));
             }
             let index = Manifest::parse(raw, Some(OCI_INDEX), None)?;
-            for (digest, descriptor) in
-                referrer_entries(&index, self.config().transfer.max_objects)?
-            {
-                if let Some(old) = entries.get(&digest)
-                    && (old.size != descriptor.size || old.media_type != descriptor.media_type)
-                {
-                    return Err(Error::integrity(
-                        "conflicting referrer descriptor across pages",
-                    ));
-                }
-                entries.entry(digest).or_insert(descriptor);
-            }
-            if entries.len() > self.config().transfer.max_objects {
-                return Err(Error::input("referrers exceed object limit"));
-            }
+            extend_referrers(&mut entries, &index, self.config().transfer.max_objects)?;
             let Some(link) = link else {
                 return Ok(entries.into_values().collect());
             };
@@ -209,6 +195,16 @@ impl Registry {
 }
 
 fn referrer_entries(index: &Manifest, max_objects: usize) -> Result<BTreeMap<Digest, Descriptor>> {
+    let mut entries = BTreeMap::new();
+    extend_referrers(&mut entries, index, max_objects)?;
+    Ok(entries)
+}
+
+fn extend_referrers(
+    unique: &mut BTreeMap<Digest, Descriptor>,
+    index: &Manifest,
+    max_objects: usize,
+) -> Result<()> {
     if index.descriptor.media_type != OCI_INDEX || index.subject()?.is_some() {
         return Err(Error::conflict(
             "referrers tag does not contain a valid OCI referrers index",
@@ -220,14 +216,21 @@ fn referrer_entries(index: &Manifest, max_objects: usize) -> Result<BTreeMap<Dig
             "referrers index exceeds configured object limit",
         ));
     }
-    let mut unique: BTreeMap<Digest, Descriptor> = BTreeMap::new();
     for entry in entries {
-        if let Some(previous) = unique.get(&entry.digest)
-            && (previous.size != entry.size || previous.media_type != entry.media_type)
-        {
-            return Err(Error::integrity("conflicting referrer descriptor"));
+        entry.embedded()?;
+        if let Some(previous) = unique.get_mut(&entry.digest) {
+            if previous.size != entry.size || previous.media_type != entry.media_type {
+                return Err(Error::integrity("conflicting referrer descriptor"));
+            }
+            if previous.data.is_none() {
+                previous.data = entry.data;
+            }
+        } else {
+            unique.insert(entry.digest.clone(), entry);
         }
-        unique.entry(entry.digest.clone()).or_insert(entry);
+        if unique.len() > max_objects {
+            return Err(Error::input("referrers exceed object limit"));
+        }
     }
-    Ok(unique)
+    Ok(())
 }

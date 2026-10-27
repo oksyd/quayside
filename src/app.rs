@@ -7,7 +7,7 @@ use crate::{
     layout,
     model::{Manifest, ManifestKind, OCI_INDEX},
     observer::Phase,
-    reference::{Reference, registry_name, validate_repository},
+    reference::{Reference, authority_name, registry_name, validate_repository},
     registry::Registry,
     transfer::{self, TransferStats},
 };
@@ -15,7 +15,7 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{IsTerminal, Read, Write},
+    io::{IsTerminal, Write},
     path::PathBuf,
     sync::{Arc, Mutex, atomic::AtomicBool},
 };
@@ -171,9 +171,9 @@ pub fn local_command(cli: &Cli) -> Result<Option<Output>> {
             )))
         }
         Command::Version => Ok(Some(Output::new(
-            json!({"version":env!("CARGO_PKG_VERSION"),"toolchain":"1.98.1"}),
+            json!({"version":env!("CARGO_PKG_VERSION"),"toolchain":"1.99.1"}),
             format!(
-                "quayside {} (toolchain target: Rust 1.98.1)",
+                "quayside {} (toolchain target: Rust 1.99.1)",
                 env!("CARGO_PKG_VERSION")
             ),
         ))),
@@ -272,7 +272,7 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
             let hosts = options
                 .auth_hosts
                 .iter()
-                .map(|h| registry_name(h))
+                .map(|h| authority_name(h))
                 .collect::<Result<Vec<_>>>()?;
             Config::save_registry(&ctx.config_path, &name, |entry| {
                 if options.clear_ca {
@@ -361,36 +361,24 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
 
 async fn login(ctx: &Context, options: &Login) -> Result<Output> {
     let name = registry_name(&options.registry)?;
-    if options.username.is_empty() || options.username.contains([':', '\r', '\n']) {
+    if options.username.is_empty()
+        || options.username.contains(':')
+        || options.username.chars().any(char::is_control)
+    {
         return Err(Error::input("invalid login username"));
     }
-    let mut secret = if options.password_stdin {
-        let mut secret = String::new();
-        std::io::stdin().take(65_537).read_to_string(&mut secret)?;
-        if secret.len() > 65_536 {
-            return Err(Error::input("password input exceeds 64KiB"));
-        }
-        if secret.ends_with('\n') {
-            secret.pop();
-            if secret.ends_with('\r') {
-                secret.pop();
-            }
-        }
-        secret
-    } else {
-        if !std::io::stdin().is_terminal() {
-            return Err(Error::input(
-                "non-interactive login requires --password-stdin",
-            ));
-        }
-        rpassword::prompt_password("Password / token: ")?
-    };
-    if secret.is_empty() {
-        return Err(Error::input("empty password/token"));
+    if options.save_unverified && options.repository.is_some() {
+        return Err(Error::input(
+            "--repository cannot be combined with --save-unverified",
+        ));
     }
+    if let Some(repo) = &options.repository {
+        validate_repository(repo)?;
+    }
+    let mut secret = crate::password::read(options.password_stdin).await?;
     let credential = Credential {
         username: options.username.clone(),
-        secret: std::mem::take(&mut secret),
+        secret: std::mem::take(&mut *secret),
     };
     ctx.connection_warnings(&name);
     let verified = if options.save_unverified {
@@ -403,7 +391,6 @@ async fn login(ctx: &Context, options: &Login) -> Result<Output> {
             ctx.changed.clone(),
         )?;
         let authenticated = if let Some(repo) = &options.repository {
-            validate_repository(repo)?;
             registry.verify_repository(repo).await?
         } else {
             registry.ping().await?

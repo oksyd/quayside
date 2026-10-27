@@ -9,6 +9,78 @@ use std::{collections::BTreeMap, ffi::OsString, fs, sync::atomic::Ordering};
 use support::{Harness, Response, Server};
 
 #[test]
+fn remote_metadata_cannot_execute_terminal_controls_in_error_output() {
+    let media_type = "application/\u{1b}[2J\r\u{7}\u{9b}forged";
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2, "mediaType": media_type
+    }))
+    .unwrap();
+    let server = Server::new(move |_| Response::new(200, body.clone()));
+    let harness = Harness::new(&[(&server.host, true)]);
+    let reference = format!("{}/app:v1", server.host);
+    let output = harness
+        .command(&["manifest", "get", &reference])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unsupported manifest media type"));
+    assert!(
+        stderr
+            .chars()
+            .all(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+    );
+    let result = harness.json(&["manifest", "get", &reference], 5);
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(media_type)
+    );
+}
+
+#[test]
+fn invalid_login_options_fail_before_reading_a_password_or_contacting_the_registry() {
+    let server = Server::new(|_| panic!("invalid login options must not start a request"));
+    let harness = Harness::new(&[(&server.host, true)]);
+    for (username, options, message) in [
+        (
+            "robot",
+            vec!["--repository", "../private"],
+            "invalid repository path",
+        ),
+        ("robot\tadmin", vec![], "invalid login username"),
+        ("robot\u{1b}[2J", vec![], "invalid login username"),
+    ] {
+        let mut args = vec!["login", &server.host, "-u", username, "--password-stdin"];
+        args.extend(options);
+        let result = harness.json(&args, 2);
+        assert_eq!(result["error"]["code"], "INVALID_INPUT");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(message)
+        );
+    }
+    harness.json(
+        &[
+            "login",
+            &server.host,
+            "-u",
+            "robot",
+            "--repository",
+            "private",
+            "--save-unverified",
+        ],
+        2,
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+    assert!(!harness.root.path().join("auth.json").exists());
+    assert!(!harness.root.path().join("keys/master.key").exists());
+}
+
+#[test]
 fn copy_resolves_short_sources_to_docker_hub() {
     let root = tempfile::tempdir().unwrap();
     let image = support::image_layout(root.path(), 1, 32);
@@ -105,6 +177,40 @@ fn copy_resolves_short_sources_to_docker_hub() {
     ] {
         harness.json(&args, 0);
     }
+}
+
+#[test]
+fn auth_host_configuration_preserves_literal_hosts_and_explicit_ports() {
+    let harness = Harness::new(&[]);
+    let result = harness.json(
+        &[
+            "registry",
+            "set",
+            "REGISTRY-1.DOCKER.IO:443",
+            "--auth-host",
+            "REGISTRY-1.DOCKER.IO:443",
+            "--auth-host",
+            "INDEX.DOCKER.IO:0443",
+            "--auth-host",
+            "[2001:DB8::1]:443",
+            "--auth-host",
+            "REGISTRY-1.DOCKER.IO:443",
+        ],
+        0,
+    );
+    let expected = [
+        "[2001:db8::1]:443",
+        "index.docker.io:443",
+        "registry-1.docker.io:443",
+    ];
+    assert_eq!(result["data"]["registry"], "docker.io:443");
+    assert_eq!(
+        result["data"]["config"]["auth_hosts"],
+        serde_json::json!(expected)
+    );
+    let config = quayside::config::Config::load(&harness.root.path().join("config.toml")).unwrap();
+    assert_eq!(config.registries.len(), 1);
+    assert_eq!(config.registries["docker.io:443"].auth_hosts, expected);
 }
 
 #[test]

@@ -4,7 +4,7 @@ use super::{
 use crate::{
     Error, Result,
     digest::Digest,
-    model::OCI_INDEX,
+    model::{Descriptor, OCI_INDEX},
     options::{PlatformSelection, TransferOptions},
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,54 +28,54 @@ pub(crate) async fn selected(
         .get_manifest(&reference.pinned(&resolved.source_digest))
         .await?;
     let full = remote_graph(source, reference, original).await?;
-    let mut links = BTreeMap::new();
+    let mut related = BTreeMap::<Digest, Vec<Descriptor>>::new();
     for manifest in full.manifests.values() {
         for descriptor in manifest.children()? {
-            links.insert(descriptor.digest.clone(), descriptor);
-        }
-    }
-    let mut related = BTreeMap::<Digest, Vec<Digest>>::new();
-    for (digest, descriptor) in &links {
-        let subject = full.manifests[digest]
-            .subject()?
-            .map(|d| d.digest)
-            .or_else(|| {
-                (descriptor
-                    .annotations
-                    .get("vnd.docker.reference.type")
-                    .map(String::as_str)
-                    == Some("attestation-manifest"))
-                .then(|| {
-                    descriptor
+            let subject = full.manifests[&descriptor.digest]
+                .subject()?
+                .map(|d| d.digest)
+                .or_else(|| {
+                    (descriptor
                         .annotations
-                        .get("vnd.docker.reference.digest")
-                        .and_then(|d| d.parse::<Digest>().ok())
-                })
-                .flatten()
-            });
-        if let Some(subject) = subject {
-            related.entry(subject).or_default().push(digest.clone());
+                        .get("vnd.docker.reference.type")
+                        .map(String::as_str)
+                        == Some("attestation-manifest"))
+                    .then(|| {
+                        descriptor
+                            .annotations
+                            .get("vnd.docker.reference.digest")
+                            .and_then(|d| d.parse::<Digest>().ok())
+                    })
+                    .flatten()
+                });
+            if let Some(subject) = subject {
+                // Association annotations belong to each edge, not just its content digest.
+                related.entry(subject).or_default().push(descriptor);
+            }
         }
     }
-    let mut keep = BTreeSet::from([resolved.manifest.digest().clone()]);
+    let mut keep = BTreeMap::from([(
+        resolved.manifest.digest().clone(),
+        resolved.manifest.descriptor.clone(),
+    )]);
     let mut queue = VecDeque::from([(resolved.manifest.digest().clone(), 0usize)]);
     while let Some((subject, depth)) = queue.pop_front() {
-        for digest in related.remove(&subject).unwrap_or_default() {
-            if keep.insert(digest.clone()) {
+        for descriptor in related.remove(&subject).unwrap_or_default() {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                keep.entry(descriptor.digest.clone())
+            {
                 if depth >= source.config().transfer.max_depth {
                     return Err(Error::input("attestations exceed depth limit"));
                 }
-                queue.push_back((digest, depth + 1));
+                queue.push_back((descriptor.digest.clone(), depth + 1));
+                entry.insert(descriptor);
             }
         }
     }
     if keep.len() > 1 {
         let mut descriptors = vec![resolved.manifest.descriptor.clone()];
-        descriptors.extend(
-            keep.iter()
-                .filter(|d| *d != resolved.manifest.digest())
-                .map(|d| links[d].clone()),
-        );
+        keep.remove(resolved.manifest.digest());
+        descriptors.extend(keep.into_values());
         let raw = serde_json::to_vec(
             &serde_json::json!({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": descriptors}),
         )?;

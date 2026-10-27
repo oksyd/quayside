@@ -370,31 +370,13 @@ pub(super) fn selected_oci_root(
         Some(OCI_INDEX),
         None,
     )?;
-    enum Task {
-        Visit(Box<Descriptor>, usize),
-        Finish(Digest, Vec<Digest>),
-    }
-    let mut pending: Vec<_> = index
-        .children()?
-        .into_iter()
-        .map(|d| Task::Visit(Box::new(d), 1))
-        .collect();
+    let roots = index.children()?;
+    let mut pending: Vec<_> = roots.iter().cloned().map(|d| (d, 1)).collect();
     let mut seen = BTreeMap::new();
-    let mut subtree_depths = BTreeMap::<Digest, usize>::new();
+    let mut missing = BTreeSet::new();
+    let mut dependencies = BTreeMap::<Digest, Vec<Digest>>::new();
     let mut found = BTreeMap::new();
-    while let Some(task) = pending.pop() {
-        let (descriptor, depth) = match task {
-            Task::Visit(descriptor, depth) => (*descriptor, depth),
-            Task::Finish(digest, children) => {
-                let depth = children
-                    .iter()
-                    .map(|child| subtree_depths[child] + 1)
-                    .max()
-                    .unwrap_or(0);
-                subtree_depths.insert(digest, depth);
-                continue;
-            }
-        };
+    while let Some((descriptor, depth)) = pending.pop() {
         if depth > limits.max_depth || pending.len() >= limits.max_objects.saturating_mul(2) {
             return Err(Error::input("Docker archive manifest graph exceeds limits"));
         }
@@ -404,24 +386,23 @@ pub(super) fn selected_oci_root(
                     "conflicting Docker archive manifest descriptors",
                 ));
             }
-            let height = subtree_depths
-                .get(&descriptor.digest)
-                .ok_or_else(|| Error::integrity("cyclic Docker archive manifest graph"))?;
-            if depth.saturating_add(*height) > limits.max_depth {
+            // Every descriptor must verify, even when its content was visited before.
+            descriptor.embedded()?;
+            if descriptor.data.is_none() || !missing.remove(&descriptor.digest) {
+                continue;
+            }
+        } else {
+            if seen.len() >= limits.max_objects {
                 return Err(Error::input("Docker archive manifest graph exceeds limits"));
             }
-            continue;
+            seen.insert(
+                descriptor.digest.clone(),
+                (descriptor.size, descriptor.media_type.clone()),
+            );
         }
-        if seen.len() >= limits.max_objects {
-            return Err(Error::input("Docker archive manifest graph exceeds limits"));
-        }
-        seen.insert(
-            descriptor.digest.clone(),
-            (descriptor.size, descriptor.media_type.clone()),
-        );
         // Only absent index branches may be skipped; present objects must verify normally.
         if descriptor.data.is_none() && !blob_path(root, &descriptor.digest).try_exists()? {
-            subtree_depths.insert(descriptor.digest, 0);
+            missing.insert(descriptor.digest);
             continue;
         }
         metadata = metadata
@@ -431,21 +412,16 @@ pub(super) fn selected_oci_root(
             return Err(Error::input("Docker archive metadata exceeds limit"));
         }
         let mut manifest = super::read_manifest(root, &descriptor, limits)?;
-        manifest.descriptor.platform = descriptor.platform;
+        manifest.descriptor = descriptor.clone();
         if manifest.kind == ManifestKind::Index {
             let children = manifest.children()?;
-            pending.push(Task::Finish(
+            dependencies.insert(
                 descriptor.digest,
                 children.iter().map(|child| child.digest.clone()).collect(),
-            ));
-            pending.extend(
-                children
-                    .into_iter()
-                    .map(|d| Task::Visit(Box::new(d), depth + 1)),
             );
+            pending.extend(children.into_iter().map(|d| (d, depth + 1)));
             continue;
         }
-        subtree_depths.insert(descriptor.digest, 0);
         if let Some(image) = wanted.get(&manifest.config()?.digest) {
             let blobs = manifest.blobs()?;
             if blobs.len() != image.layers.len() + 1 {
@@ -469,6 +445,25 @@ pub(super) fn selected_oci_root(
                     "Docker archive has ambiguous manifests for one config",
                 ));
             }
+        }
+    }
+    // Validate every path after discovery: a later inline descriptor can fill a branch that
+    // was absent when its deeper parent was first visited.
+    let mut pending: Vec<_> = roots.into_iter().map(|d| (d.digest, 1)).collect();
+    let mut depths = BTreeMap::<Digest, usize>::new();
+    while let Some((digest, depth)) = pending.pop() {
+        if depth > limits.max_depth {
+            return Err(Error::input("Docker archive manifest graph exceeds limits"));
+        }
+        if depths
+            .get(&digest)
+            .is_some_and(|previous| *previous >= depth)
+        {
+            continue;
+        }
+        depths.insert(digest.clone(), depth);
+        if let Some(children) = dependencies.get(&digest) {
+            pending.extend(children.iter().map(|child| (child.clone(), depth + 1)));
         }
     }
     if found.len() != wanted.len() {
