@@ -41,6 +41,52 @@ fn rejected<T>(result: Result<T>, expected: Code) {
 }
 
 #[tokio::test]
+async fn latest_tags_compare_complete_versions_across_all_pages_and_exact_variants() {
+    let server = Server::new(|request| {
+        assert_eq!(request.method, "GET");
+        match request.path.as_str() {
+            "/v2/team/image/tags/list?n=100" => Response::new(
+                200,
+                serde_json::to_vec(&serde_json::json!({"tags": [
+                    "latest", "stable", "9.99.99", "10.0.99", "10.1.9", "v10.1.10",
+                    "11.0.0-rc.1", "11.0.0-rc.1-alpine", "11.0.0-alpine3.22",
+                    "10.1.9-alpine", "10.1.10-bookworm-slim"
+                ]}))
+                .unwrap(),
+            )
+            .header("Link", "</v2/team/image/tags/list?page=2>; rel=\"next\""),
+            "/v2/team/image/tags/list?page=2" => Response::new(
+                200,
+                serde_json::to_vec(&serde_json::json!({"tags": [
+                    "10.1.10", "v10.1.10-alpine", "12", "12.1", "12.1.2.3",
+                    "012.1.2", "12.01.2", "12.1.02", "12..2", "V12.1.2",
+                    "18446744073709551616.1.2"
+                ]}))
+                .unwrap(),
+            ),
+            _ => panic!("unexpected request: {}", request.path),
+        }
+    });
+    let (registry, changed) = client(&server);
+    for (variant, expected) in [
+        (None, "10.1.10"),
+        (Some("alpine"), "v10.1.10-alpine"),
+        (Some("bookworm-slim"), "10.1.10-bookworm-slim"),
+    ] {
+        assert_eq!(
+            registry.latest_tag("team/image", variant).await.unwrap(),
+            expected
+        );
+    }
+    rejected(
+        registry.latest_tag("team/image", Some("missing")).await,
+        Code::NotFound,
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 8);
+    assert!(!changed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn listings_reject_invalid_names_before_exposing_them_to_callers() {
     for (field, invalid) in [
         ("tags", "v1\nforged output"),

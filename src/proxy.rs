@@ -1,28 +1,5 @@
-//! Read only Docker daemon proxy settings; never contact Docker or read its credentials.
-use crate::diagnostics::{self, Level};
-use serde::Deserialize;
-use std::{
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
-use zeroize::Zeroizing;
-
-#[derive(Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-struct DockerProxies {
-    #[serde(skip)]
-    source: Option<String>,
-    http_proxy: Option<String>,
-    https_proxy: Option<String>,
-    no_proxy: Option<String>,
-}
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct DaemonConfig {
-    proxies: DockerProxies,
-}
+//! Resolve proxy settings and describe routing without exposing proxy credentials.
+use crate::docker_config::DaemonConfig;
 
 pub(crate) struct Proxy {
     pub url: Option<String>,
@@ -30,61 +7,7 @@ pub(crate) struct Proxy {
     pub source: Option<String>,
 }
 
-fn read(path: &Path) -> Result<Option<DockerProxies>, &'static str> {
-    match std::fs::metadata(path) {
-        Ok(metadata) if !metadata.is_file() => return Err("not a regular file"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("cannot read metadata"),
-        _ => {}
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("cannot read file"),
-    };
-    if !file
-        .metadata()
-        .map_err(|_| "cannot read metadata")?
-        .is_file()
-    {
-        return Err("not a regular file");
-    }
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "cannot read file")?;
-    if bytes.len() > 1024 * 1024 {
-        return Err("file exceeds 1MiB");
-    }
-    // Ignore every unrelated field. Never include parser diagnostics or proxy URLs in logs.
-    serde_json::from_slice::<DaemonConfig>(&bytes)
-        .map(|c| Some(c.proxies))
-        .map_err(|_| "invalid JSON or proxy field types")
-}
-fn load(paths: &[PathBuf]) -> DockerProxies {
-    for path in paths {
-        match read(path) {
-            Ok(Some(mut proxies)) => {
-                proxies.source = Some(path.display().to_string());
-                diagnostics::log(
-                    Level::Debug,
-                    format_args!("Docker proxy defaults loaded from {}", path.display()),
-                );
-                return proxies;
-            }
-            Ok(None) => {}
-            Err(reason) => diagnostics::log(
-                Level::Warn,
-                format_args!(
-                    "Ignoring Docker proxy configuration {}: {reason}",
-                    path.display()
-                ),
-            ),
-        }
-    }
-    DockerProxies::default()
-}
-fn choose(scheme: &str, docker: &DockerProxies, get: impl Fn(&str) -> Option<String>) -> Proxy {
+fn choose(scheme: &str, docker: &DaemonConfig, get: impl Fn(&str) -> Option<String>) -> Proxy {
     let names = if scheme == "https" {
         ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
     } else {
@@ -99,9 +22,9 @@ fn choose(scheme: &str, docker: &DockerProxies, get: impl Fn(&str) -> Option<Str
         .or_else(|| docker.source.clone());
     let url = env.map(|(value, _)| value).or_else(|| {
         if scheme == "https" {
-            docker.https_proxy.clone()
+            docker.proxies.https_proxy.clone()
         } else {
-            docker.http_proxy.clone()
+            docker.proxies.http_proxy.clone()
         }
     });
     // An explicitly empty environment variable overrides the daemon default too.
@@ -111,20 +34,13 @@ fn choose(scheme: &str, docker: &DockerProxies, get: impl Fn(&str) -> Option<Str
         no_proxy: ["no_proxy", "NO_PROXY"]
             .iter()
             .find_map(|key| get(key))
-            .or_else(|| docker.no_proxy.clone()),
+            .or_else(|| docker.proxies.no_proxy.clone()),
     }
 }
 pub(crate) fn for_scheme(scheme: &str) -> Proxy {
-    static DOCKER: OnceLock<DockerProxies> = OnceLock::new();
-    let defaults = DOCKER.get_or_init(|| {
-        let mut paths = Vec::new();
-        if let Some(config) = dirs::config_dir() {
-            paths.push(config.join("docker/daemon.json"));
-        }
-        paths.push(PathBuf::from("/etc/docker/daemon.json"));
-        load(&paths)
-    });
-    choose(scheme, defaults, |key| std::env::var(key).ok())
+    choose(scheme, crate::docker_config::defaults(), |key| {
+        std::env::var(key).ok()
+    })
 }
 
 // Diagnostic matching only: reqx owns routing but does not expose its bypass matcher.
@@ -314,31 +230,14 @@ mod tests {
         }
     }
     #[test]
-    fn reads_only_proxy_fields_and_uses_first_valid_file() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user.json");
-        let system = root.path().join("system.json");
-        std::fs::write(&user, br#"{"proxies":{"http-proxy":"http://user:1","https-proxy":"http://user:2","no-proxy":".example.com"},"insecure-registries":["anything"],"registry-mirrors":["https://ignored"],"credsStore":"never-execute"}"#).unwrap();
-        std::fs::write(&system, br#"{"proxies":{"http-proxy":"http://system:1"}}"#).unwrap();
-        let proxies = load(&[user.clone(), system.clone()]);
-        assert_eq!(proxies.http_proxy.as_deref(), Some("http://user:1"));
-        assert_eq!(proxies.https_proxy.as_deref(), Some("http://user:2"));
-        assert_eq!(proxies.no_proxy.as_deref(), Some(".example.com"));
-        std::fs::write(&user, b"{}").unwrap();
-        assert!(load(&[user.clone(), system.clone()]).http_proxy.is_none());
-        std::fs::remove_file(&user).unwrap();
-        assert_eq!(
-            load(&[user, system]).http_proxy.as_deref(),
-            Some("http://system:1")
-        );
-    }
-    #[test]
     fn environment_precedence_and_empty_overrides() {
-        let docker = DockerProxies {
-            source: None,
-            http_proxy: Some("http://docker:1".into()),
-            https_proxy: Some("http://docker:2".into()),
-            no_proxy: Some("docker.local".into()),
+        let docker = DaemonConfig {
+            proxies: crate::docker_config::Proxies {
+                http_proxy: Some("http://docker:1".into()),
+                https_proxy: Some("http://docker:2".into()),
+                no_proxy: Some("docker.local".into()),
+            },
+            ..Default::default()
         };
         let p = choose("https", &docker, |_| None);
         assert_eq!(p.url.as_deref(), Some("http://docker:2"));
@@ -359,23 +258,5 @@ mod tests {
             (key == "ALL_PROXY").then(|| "http://all:1".into())
         });
         assert_eq!(p.url.as_deref(), Some("http://all:1"));
-    }
-    #[test]
-    fn optional_bad_files_are_bounded_and_errors_do_not_expose_contents() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("daemon.json");
-        for bytes in [
-            br#"{"proxies":{"http-proxy":123},"secret":"password"}"#.as_slice(),
-            b"not-json password",
-        ] {
-            std::fs::write(&path, bytes).unwrap();
-            let error = read(&path).err().unwrap();
-            assert!(!error.contains("password"));
-            assert!(load(std::slice::from_ref(&path)).http_proxy.is_none());
-        }
-        let file = File::create(&path).unwrap();
-        file.set_len(1024 * 1024 + 2).unwrap();
-        assert_eq!(read(&path).err(), Some("file exceeds 1MiB"));
-        assert!(load(&[root.path().join("missing")]).http_proxy.is_none());
     }
 }

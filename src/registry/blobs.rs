@@ -83,12 +83,19 @@ impl Registry {
         if let Some(data) = d.embedded()?.or(self.cached_blob(repo, d).await?) {
             return Ok(data);
         }
-        let response = self.blob_response(repo, d, HeaderMap::new(), false).await?;
-        if response.status() != StatusCode::OK {
-            return Err(http_error(&response));
-        }
-        let raw = limited_body(response, limit).await?;
-        d.verify(&raw)?;
+        let raw = self
+            .read(|registry| async move {
+                let response = registry
+                    .blob_response(repo, d, HeaderMap::new(), false)
+                    .await?;
+                if response.status() != StatusCode::OK {
+                    return Err(http_error(&response));
+                }
+                let raw = limited_body(response, limit).await?;
+                d.verify(&raw)?;
+                Ok(raw)
+            })
+            .await?;
         let limit = crate::config::parse_size(&self.config().transfer.max_metadata_size)?
             .min(8 * 1024 * 1024) as usize;
         let mut cache = self.inner.blobs.lock().await;

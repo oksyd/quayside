@@ -14,6 +14,7 @@ pub mod config;
 pub mod diagnostics;
 /// Validated content digests and incremental payload verification.
 pub mod digest;
+mod docker_config;
 /// Sanitized operation errors, stable codes and exit-status mapping.
 pub mod error;
 /// Bounded traversal and deduplication of OCI dependency graphs.

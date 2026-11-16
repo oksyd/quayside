@@ -1,10 +1,16 @@
 #[path = "transfer_pipeline/docker_cache.rs"]
 mod docker_cache;
+#[path = "transfer_pipeline/latest.rs"]
+mod latest;
+#[path = "transfer_pipeline/mirrors.rs"]
+mod mirrors;
 #[path = "transfer_pipeline/progress.rs"]
 mod progress;
 #[path = "transfer_pipeline/resume.rs"]
 mod resume;
 mod support;
+#[path = "transfer_pipeline/terminal.rs"]
+mod terminal;
 
 use quayside::digest::Digest;
 use serde_json::{Value, json};

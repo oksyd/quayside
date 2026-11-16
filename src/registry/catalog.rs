@@ -1,6 +1,7 @@
 use super::Registry;
 use super::transport::{http_error, limited_body, same_origin, valid_url};
 use crate::config::parse_size;
+use crate::error::Code;
 use crate::reference::{validate_repository, validate_tag};
 use crate::{Error, Result};
 use http::header::{self, HeaderMap};
@@ -19,6 +20,46 @@ impl Registry {
             validate_tag,
         )
         .await
+    }
+    /// Find the highest numeric x.y.z tag, allowing an optional lowercase v prefix.
+    ///
+    /// Only unsuffixed versions match by default. A variant selects an exact suffix
+    /// after a hyphen, such as `alpine` or `bookworm-slim`. Floating aliases and
+    /// other suffixes are excluded; a plain version wins ties with a v-prefixed one.
+    /// This compares versions, not push dates or a publisher's stable channel.
+    pub async fn latest_tag(&self, repo: &str, variant: Option<&str>) -> Result<String> {
+        if let Some(variant) = variant {
+            validate_tag(variant).map_err(|_| {
+                Error::input("variant must be a nonempty tag suffix, such as alpine")
+            })?;
+        }
+        self.list_tags(repo)
+            .await?
+            .into_iter()
+            .filter_map(|tag| {
+                let (version, suffix) = tag
+                    .split_once('-')
+                    .map_or((tag.as_str(), None), |(v, suffix)| (v, Some(suffix)));
+                if suffix != variant {
+                    return None;
+                }
+                release_version(version).map(|version| (version, tag))
+            })
+            .max_by_key(|(version, tag)| (*version, !tag.starts_with('v')))
+            .map(|(_, tag)| tag)
+            .ok_or_else(|| {
+                let pattern = match variant {
+                    Some(variant) => format!("x.y.z-{variant}"),
+                    None => "x.y.z".into(),
+                };
+                Error::new(
+                    Code::NotFound,
+                    format!(
+                        "no {pattern} version tag found in {}/{repo}; use `tag ls` to list available tags",
+                        self.name(),
+                    ),
+                )
+            })
     }
     /// Fetch registry catalog pages when the server exposes that optional API.
     pub async fn list_repositories(&self) -> Result<Vec<String>> {
@@ -119,6 +160,23 @@ impl Registry {
         Err(Error::input("pagination page limit exceeded"))
     }
 }
+
+fn release_version(tag: &str) -> Option<[u64; 3]> {
+    let mut parts = tag.strip_prefix('v').unwrap_or(tag).split('.');
+    let mut version = [0; 3];
+    for component in &mut version {
+        let part = parts.next()?;
+        if part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        *component = part.parse().ok()?;
+    }
+    parts.next().is_none().then_some(version)
+}
+
 pub(super) fn next_link(header: &str) -> Option<String> {
     // Split only after closing angle bracket so a comma in a URI is preserved.
     let mut rest = header;

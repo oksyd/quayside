@@ -24,6 +24,7 @@ use url::Url;
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Inner>,
+    mirrors: Option<Arc<mirrors::Mirrors>>,
 }
 struct Inner {
     name: String,
@@ -59,6 +60,7 @@ mod catalog;
 mod diagnostics;
 mod download;
 mod manifests;
+mod mirrors;
 mod referrers;
 mod transport;
 
@@ -83,6 +85,7 @@ impl Registry {
             if policy.plain_http { "http" } else { "https" }
         ))?;
         Ok(Self {
+            mirrors: None,
             inner: Arc::new(Inner {
                 client: client(&base, &config, &policy)?,
                 content_clients: Mutex::new(BTreeMap::new()),
@@ -172,6 +175,26 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_futures_can_be_spawned_on_multithreaded_runtimes() {
+        fn assert_send<T: Send>(_: T) {}
+        let registry = Registry::new(
+            "example.com",
+            Arc::new(Config::default()),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let reference: Reference = "example.com/app:latest".parse().unwrap();
+        let descriptor = crate::model::Descriptor::new(
+            "application/octet-stream",
+            crate::digest::Digest::sha256(b""),
+            0,
+        );
+        assert_send(registry.get_manifest(&reference));
+        assert_send(registry.get_blob_bytes("app", &descriptor, 0));
+        assert_send(registry.download_blob("app", &descriptor, std::path::Path::new("unused")));
+    }
     #[test]
     fn constructor_validates_limits_before_allocating_clients() {
         for concurrency in [0, 33, usize::MAX] {

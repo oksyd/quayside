@@ -104,11 +104,11 @@ fn resumes_partial_download_in_a_new_process_and_checks_cached_bytes() {
         }
         harness.json(&args, 0);
         assert_eq!(ranges.lock().unwrap()[0], "bytes=131072-524287");
-        assert!(
-            fs::read_dir(directory)
-                .unwrap()
-                .all(|e| e.unwrap().file_name() == "lock")
-        );
+        let remaining: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining, ["lock"], "corrupt={corrupt}, pull={pull}");
     }
 }
 

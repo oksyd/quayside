@@ -31,7 +31,7 @@ pub struct Cli {
     /// Disable interactive progress display.
     #[arg(long, global = true)]
     pub no_progress: bool,
-    /// Disable color; current output styles already avoid colors.
+    /// Disable colors while retaining interactive progress (also respects NO_COLOR).
     #[arg(long, global = true)]
     pub no_color: bool,
     /// Operation to execute within this command group.
@@ -66,7 +66,7 @@ pub enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
-    /// List tags belonging to a repository.
+    /// List repository tags or find the highest release version.
     Tag {
         /// Operation to execute within this command group.
         #[command(subcommand)]
@@ -206,6 +206,14 @@ pub enum TagCommand {
         /// Repository reference, optionally including a registry, without a tag or digest.
         repository: String,
     },
+    /// Print the full image reference with the highest x.y.z version (optional v prefix).
+    Latest {
+        /// Repository reference, optionally including a registry, without a tag or digest.
+        repository: String,
+        /// Match an exact variant suffix, such as alpine or bookworm-slim.
+        #[arg(long)]
+        variant: Option<String>,
+    },
 }
 /// Platform filtering; omitted flags select the local container platform.
 #[derive(Debug, Clone, Default, Args)]
@@ -238,6 +246,9 @@ impl TryFrom<&Selection> for crate::options::PlatformSelection {
 /// Additional transfer behavior for remote sources.
 #[derive(Debug, Clone, Default, Args)]
 pub struct TransferOptions {
+    /// Read directly from Docker Hub, ignoring Docker's configured registry mirrors.
+    #[arg(long)]
+    pub no_mirrors: bool,
     /// Discover and copy independent signatures, SBOMs and other referrers.
     #[arg(long, value_enum, default_value = "none")]
     pub referrers: ReferrerMode,
@@ -307,8 +318,14 @@ pub enum ImageCommand {
     Copy {
         /// Source image reference; unqualified names default to Docker Hub.
         source: String,
-        /// Fully qualified destination reference with an explicit tag or digest.
+        /// Fully qualified destination with a tag or digest; --latest can inherit the tag.
         destination: String,
+        /// Select the highest x.y.z version (optional v prefix); source must be a repository.
+        #[arg(long)]
+        latest: bool,
+        /// Match an exact version suffix, such as alpine or bookworm-slim.
+        #[arg(long, requires = "latest")]
+        variant: Option<String>,
         /// Platform selection options.
         #[command(flatten)]
         selection: Selection,
@@ -408,7 +425,10 @@ impl Command {
                 command: RegistryCommand::Set(_),
             } => "registry set",
             Self::Repo { .. } => "repo ls",
-            Self::Tag { .. } => "tag ls",
+            Self::Tag { command } => match command {
+                TagCommand::Ls { .. } => "tag ls",
+                TagCommand::Latest { .. } => "tag latest",
+            },
             Self::Image { command } => match command {
                 ImageCommand::Digest { .. } => "image digest",
                 ImageCommand::Inspect { .. } => "image inspect",

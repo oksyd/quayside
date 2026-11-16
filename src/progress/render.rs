@@ -1,6 +1,6 @@
 use super::{BlobOutcome, BlobPhase, Phase, Row, State, Status};
-use console::{measure_text_width as width, truncate_str};
-use std::time::Instant;
+use console::{Style, measure_text_width as width, truncate_str};
+use std::{ops::Range, time::Instant};
 
 const SPINNERS: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const BLOCKS: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
@@ -28,16 +28,50 @@ fn elapsed(start: Instant, stop: Option<Instant>, now: Instant) -> String {
             .as_secs_f64()
     )
 }
-fn line(left: &str, right: &str, columns: usize) -> String {
-    if right.is_empty() || columns < width(right) + 16 {
-        return truncate_str(left, columns, "…").into_owned();
-    }
-    let available = columns.saturating_sub(width(right) + 1);
+fn line(
+    left: &str,
+    right: &str,
+    columns: usize,
+    color: bool,
+    styles: &[(Range<usize>, Style)],
+) -> String {
+    let right = if columns < width(right) + 16 {
+        ""
+    } else {
+        right
+    };
+    let available = columns.saturating_sub(width(right) + usize::from(!right.is_empty()));
+    let truncated = width(left) > available;
     let left = truncate_str(left, available, "…");
-    format!(
-        "{left}{}{right}",
-        " ".repeat(columns.saturating_sub(width(&left) + width(right)))
-    )
+    let padding = columns.saturating_sub(width(&left) + width(right));
+    // All offsets refer to plain UTF-8 text. Fit the line first, then style only retained
+    // segments, leaving the ellipsis, padding and elapsed time outside the color spans.
+    let mut result = String::new();
+    let mut cursor = 0;
+    if color {
+        let end = left.len() - if truncated { "…".len() } else { 0 };
+        for (range, style) in styles {
+            if range.start >= end {
+                break;
+            }
+            let stop = range.end.min(end);
+            result.push_str(&left[cursor..range.start]);
+            result.push_str(
+                &style
+                    .clone()
+                    .force_styling(true)
+                    .apply_to(&left[range.start..stop])
+                    .to_string(),
+            );
+            cursor = stop;
+        }
+    }
+    result.push_str(&left[cursor..]);
+    if !right.is_empty() {
+        result.push_str(&" ".repeat(padding));
+        result.push_str(right);
+    }
+    result
 }
 fn bytes(value: u64) -> String {
     indicatif::HumanBytes(value).to_string()
@@ -53,7 +87,14 @@ fn outcome(value: BlobOutcome) -> &'static str {
         BlobOutcome::Planned => "Would transfer",
     }
 }
-fn row_line(row: &Row, state: &State, columns: usize, now: Instant, spinner: &str) -> String {
+fn row_line(
+    row: &Row,
+    state: &State,
+    columns: usize,
+    now: Instant,
+    spinner: &str,
+    color: bool,
+) -> String {
     let status = if let Some(value) = row.outcome {
         outcome(value)
     } else if row.failed {
@@ -77,11 +118,12 @@ fn row_line(row: &Row, state: &State, columns: usize, now: Instant, spinner: &st
             Some(BlobPhase::Waiting) => "Waiting",
         }
     };
+    let waiting = row.started.is_none() || row.phase == Some(BlobPhase::Waiting);
     let icon = if row.failed {
         "✘"
     } else if row.outcome.is_some() {
         "✔"
-    } else if state.status != Status::Running || row.started.is_none() {
+    } else if state.status != Status::Running || waiting {
         "-"
     } else {
         spinner
@@ -94,10 +136,32 @@ fn row_line(row: &Row, state: &State, columns: usize, now: Instant, spinner: &st
         .chars()
         .take(if columns < 40 { 8 } else { 12 })
         .collect();
-    let mut text = if columns < 6 + width(&digest) + width(status) {
-        format!("   {icon} {status}")
+    let compact = columns < 6 + width(&digest) + width(status);
+    let prefix = if compact {
+        format!("   {icon} ")
     } else {
-        format!("   {icon} {digest} {status:<11}")
+        format!("   {icon} {digest} ")
+    };
+    let mut text = if compact {
+        format!("{prefix}{status}")
+    } else {
+        format!("{prefix}{status:<11}")
+    };
+    let (icon_style, status_style) = if row.failed {
+        (Style::new().red(), Style::new().red())
+    } else if matches!(
+        row.outcome,
+        Some(BlobOutcome::AlreadyExists | BlobOutcome::Planned)
+    ) {
+        (Style::new().dim(), Style::new().dim())
+    } else if row.outcome.is_some() {
+        (Style::new().green(), Style::new())
+    } else if state.status == Status::Interrupted {
+        (Style::new().yellow(), Style::new().yellow())
+    } else if state.status != Status::Running || waiting {
+        (Style::new().dim(), Style::new().dim())
+    } else {
+        (Style::new().cyan(), Style::new())
     };
     let mut timing = row
         .started
@@ -137,7 +201,16 @@ fn row_line(row: &Row, state: &State, columns: usize, now: Instant, spinner: &st
             text.push_str(&format!(" {amount}"));
         }
     }
-    line(text.trim_end(), &timing, columns)
+    line(
+        text.trim_end(),
+        &timing,
+        columns,
+        color,
+        &[
+            (3..3 + icon.len(), icon_style),
+            (prefix.len()..prefix.len() + status.len(), status_style),
+        ],
+    )
 }
 
 fn hidden_summary(state: &State, hidden: &[usize]) -> String {
@@ -182,7 +255,13 @@ fn hidden_summary(state: &State, hidden: &[usize]) -> String {
     format!("   … {} hidden ({counts})", hidden.len())
 }
 
-pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) -> String {
+pub(super) fn frame(
+    state: &State,
+    columns: usize,
+    height: usize,
+    now: Instant,
+    color: bool,
+) -> String {
     let columns = columns.max(1);
     let limit = height.saturating_sub(2).max(1);
     let done = state
@@ -215,10 +294,23 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
         Status::Interrupted => "Interrupted",
         Status::Running => label(state.phase),
     };
+    let (icon_style, status_style) = match state.status {
+        Status::Running => (Style::new().cyan(), Style::new()),
+        Status::Complete if state.planning => (Style::new().dim(), Style::new()),
+        Status::Complete => (Style::new().green(), Style::new()),
+        Status::Failed => (Style::new().red(), Style::new().red()),
+        Status::Interrupted => (Style::new().yellow(), Style::new().yellow()),
+    };
     if limit == 1 {
-        return line(&format!("{status}: {}", state.image), "", columns);
+        return line(
+            &format!("{status}: {}", state.image),
+            "",
+            columns,
+            color,
+            &[(0..status.len(), status_style)],
+        );
     }
-    let mut lines = vec![line(&heading, "", columns)];
+    let mut lines = vec![line(&heading, "", columns, false, &[])];
     let icon = match state.status {
         Status::Running => spinner,
         Status::Complete => "✔",
@@ -252,7 +344,9 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
     }
     let mut timing = elapsed(state.started, state.stopped, now);
     let name_space = columns.saturating_sub(width(&details) + width(&timing) + 5);
+    let status_start;
     let parent = if columns < 40 || name_space < 8 {
+        status_start = 2 + icon.len();
         let prefix = format!(" {icon} {status}");
         if columns < width(&prefix) + width(&timing) + 1 {
             timing.clear();
@@ -270,16 +364,27 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
         }
     } else {
         let name = truncate_str(&state.image, name_space, "…");
-        format!(" {icon} {name} {details}")
+        let text = format!(" {icon} {name} {details}");
+        status_start = text.len() - status.len();
+        text
     };
-    lines.push(line(&parent, &timing, columns));
+    lines.push(line(
+        &parent,
+        &timing,
+        columns,
+        color,
+        &[
+            (1..1 + icon.len(), icon_style),
+            (status_start..status_start + status.len(), status_style),
+        ],
+    ));
     let capacity = limit.saturating_sub(2);
     if state.rows.len() <= capacity {
         lines.extend(
             state
                 .rows
                 .iter()
-                .map(|row| row_line(row, state, columns, now, spinner)),
+                .map(|row| row_line(row, state, columns, now, spinner, color)),
         );
     } else if capacity > 0 {
         // Fold only when the terminal cannot fit all rows. Visible rows retain graph order.
@@ -307,10 +412,10 @@ pub(super) fn frame(state: &State, columns: usize, height: usize, now: Instant) 
         lines.extend(
             indices
                 .iter()
-                .map(|i| row_line(&state.rows[*i], state, columns, now, spinner)),
+                .map(|i| row_line(&state.rows[*i], state, columns, now, spinner, color)),
         );
         if let Some(summary) = summary {
-            lines.push(line(&summary, "", columns));
+            lines.push(line(&summary, "", columns, false, &[]));
         }
     }
     lines.join("\n")

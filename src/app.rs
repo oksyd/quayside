@@ -25,7 +25,17 @@ pub fn init_diagnostics(level: crate::diagnostics::Level, quiet: bool) {
     crate::diagnostics::init(level, quiet);
     crate::diagnostics::set_writer(|level, message| {
         crate::progress::suspend(|| {
-            let _ = writeln!(std::io::stderr().lock(), "{level:?}: {message}");
+            let style = console::Style::new().for_stderr();
+            let style = match level {
+                crate::diagnostics::Level::Warn => style.yellow(),
+                crate::diagnostics::Level::Error => style.red(),
+                _ => style,
+            };
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "{}: {message}",
+                style.apply_to(format!("{level:?}"))
+            );
         });
     });
 }
@@ -49,6 +59,13 @@ pub struct Context {
     /// Whether ordinary human-readable status notices are enabled.
     pub notices: bool,
 }
+
+enum MirrorPolicy {
+    Disabled,
+    ContentOnly,
+    TagsAndContent,
+}
+
 impl Context {
     /// Load command configuration and determine terminal capabilities; credentials are read on demand.
     pub fn new(cli: &Cli) -> Result<Self> {
@@ -118,6 +135,60 @@ impl Context {
             registries.insert(name, registry.clone());
         }
         Ok(registry)
+    }
+
+    fn source_registry(&self, name: &str, mirrors: MirrorPolicy) -> Result<Registry> {
+        let origin = self.registry(name)?;
+        if matches!(mirrors, MirrorPolicy::Disabled)
+            || !matches!(origin.name(), "docker.io" | "docker.io:443")
+        {
+            return Ok(origin);
+        }
+        let resolve_tags = matches!(mirrors, MirrorPolicy::TagsAndContent);
+        let docker = crate::docker_config::defaults();
+        if docker.mirrors.is_empty() {
+            return Ok(origin);
+        }
+        let endpoints = docker.mirror_endpoints()?;
+        let auth = AuthFile::load(&self.auth_path, &self.key_path)?;
+        let mut seen = BTreeSet::from([origin.endpoint().origin().ascii_serialization()]);
+        let mut mirrors = Vec::new();
+        for (name, endpoint) in endpoints {
+            let mut config = (*self.config).clone();
+            // The explicitly configured URL determines this mirror's scheme, never Docker's
+            // insecure-registries setting. CA and auth-host policy belong to the mirror host.
+            config
+                .registries
+                .entry(name.clone())
+                .or_default()
+                .plain_http = endpoint.scheme() == "http";
+            // Fail over promptly; the origin retains the user's configured retry budget.
+            config.transfer.max_retries = 0;
+            let mirror = Registry::new(
+                &name,
+                Arc::new(config),
+                auth.registries.get(&name).cloned(),
+                self.changed.clone(),
+            )?;
+            if seen.insert(mirror.endpoint().origin().ascii_serialization()) {
+                mirrors.push(mirror);
+            }
+        }
+        let notices = self.notices;
+        let source = docker.source.clone().unwrap_or_default();
+        Ok(origin.with_mirrors(mirrors, resolve_tags, move |message| {
+            let text: String = format!("{message} (from {source})")
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect();
+            if notices {
+                crate::progress::suspend(|| {
+                    let _ = writeln!(std::io::stderr().lock(), "Info: {text}");
+                });
+            } else {
+                crate::diagnostics::log(crate::diagnostics::Level::Debug, format_args!("{text}"));
+            }
+        }))
     }
 
     fn forget_registry(&self, name: &str) -> Result<()> {
@@ -329,6 +400,26 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
                 text,
             ))
         }
+        Command::Tag {
+            command:
+                TagCommand::Latest {
+                    repository,
+                    variant,
+                },
+        } => {
+            let mut r = Reference::parse_source(repository)?;
+            r.require_repository()?;
+            r.selector = ctx
+                .registry(&r.registry)?
+                .latest_tag(&r.repository, variant.as_deref())
+                .await?;
+            r.explicit = true;
+            let reference = r.to_string();
+            Ok(Output::new(
+                json!({"repository":r.repository_ref(),"tag":r.selector,"reference":reference}),
+                reference,
+            ))
+        }
         Command::Manifest {
             command: ManifestCommand::Get { reference, raw },
         } => {
@@ -468,31 +559,72 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         ImageCommand::Copy {
             source,
             destination,
+            latest,
+            variant,
             selection,
             transfer,
             write,
         } => {
-            let src = Reference::parse_source(source)?;
-            let dst = parse_destination(destination)?;
+            let mut src = Reference::parse_source(source)?;
+            let mut dst: Reference = destination.parse()?;
+            if *latest {
+                src.require_repository()?;
+            } else {
+                dst.require_destination()?;
+                if variant.is_some() {
+                    return Err(Error::input("--variant requires --latest"));
+                }
+            }
             let selection = selection.try_into()?;
-            let source = ctx.registry(&src.registry)?;
+            let mirrors = if transfer.no_mirrors {
+                MirrorPolicy::Disabled
+            } else if *latest {
+                MirrorPolicy::ContentOnly
+            } else {
+                MirrorPolicy::TagsAndContent
+            };
+            let source = ctx.source_registry(&src.registry, mirrors)?;
             let target = ctx.registry(&dst.registry)?;
             let observer = crate::progress::TerminalObserver::new(
                 ctx.progress,
-                src.to_string(),
+                if *latest {
+                    src.repository_ref()
+                } else {
+                    src.to_string()
+                },
                 crate::observer::Phase::Copying,
             )
             .with_platform_notice(ctx.notices);
-            let result = transfer::copy_with_options(
-                &source,
-                &src,
-                &target,
-                &dst,
-                &selection,
-                &write.into(),
-                &transfer.into(),
-                &observer,
-            )
+            let result = async {
+                if *latest {
+                    src.selector = source
+                        .latest_tag(&src.repository, variant.as_deref())
+                        .await?;
+                    src.explicit = true;
+                    if !dst.explicit {
+                        dst.selector = src.selector.clone();
+                        dst.explicit = true;
+                    }
+                    observer.set_image(src.to_string());
+                    if ctx.notices {
+                        crate::progress::suspend(|| {
+                            let _ =
+                                writeln!(std::io::stderr().lock(), "Info: Selected {src} -> {dst}");
+                        });
+                    }
+                }
+                transfer::copy_with_options(
+                    &source,
+                    &src,
+                    &target,
+                    &dst,
+                    &selection,
+                    &write.into(),
+                    &transfer.into(),
+                    &observer,
+                )
+                .await
+            }
             .await;
             observer.complete(&result);
             let data = result?;
@@ -514,7 +646,12 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         } => {
             let r = Reference::parse_source(reference)?;
             let selection = selection.try_into()?;
-            let source = ctx.registry(&r.registry)?;
+            let mirrors = if transfer.no_mirrors {
+                MirrorPolicy::Disabled
+            } else {
+                MirrorPolicy::TagsAndContent
+            };
+            let source = ctx.source_registry(&r.registry, mirrors)?;
             let observer = crate::progress::TerminalObserver::new(
                 ctx.progress,
                 r.to_string(),

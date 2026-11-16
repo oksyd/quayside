@@ -25,6 +25,23 @@ quayside image copy nginx:latest \
 
 Source names default to Docker Hub: `nginx:latest` resolves to `docker.io/library/nginx:latest`, and `apache/skywalking-banyandb:0.11.0` to `docker.io/apache/skywalking-banyandb:0.11.0`.
 
+Copy the highest numeric `x.y.z` version, keeping its exact tag at the destination:
+
+```bash
+quayside image copy nginx registry.example.com/team/nginx --latest
+quayside image copy nginx registry.example.com/team/nginx --latest --variant alpine
+```
+
+With `--latest`, the source must have no tag or digest. Versions allow an optional `v` prefix; aliases and prereleases are excluded by default. `--variant` matches an exact suffix. An explicit destination tag is preserved. Selection and tag resolution use the source registry; the transfer retains the resolved digest even if the tag changes. No matching version is an error.
+
+For daily updates, add one command per task to your crontab (use the same user that logged in):
+
+```cron
+0 3 * * * /usr/local/bin/quayside image copy nginx registry.example.com/team/nginx --latest --no-progress >> /var/log/quayside-nginx.log 2>&1
+```
+
+Use your installed binary path and a writable log path. Repeated runs skip existing content. New versions get new destination tags; replacing different content under an existing tag still requires `--overwrite`.
+
 Copy and pull select the local container platform by default: `linux/amd64` on Linux x86_64, or `linux/arm64` on Linux ARM64 and macOS Apple Silicon. The selected platform is displayed before transfer; a missing match is an error. Optional flags:
 
 - `--platform linux/amd64`: select a different platform explicitly.
@@ -32,6 +49,7 @@ Copy and pull select the local container platform by default: `linux/amd64` on L
 - `--include-attestations`: retain that platform's indexed attestations in a new OCI index.
 - `--referrers all`: discover and recursively copy associated signatures and SBOMs.
 - `--resume`: retain partial downloads and upload sessions for the next run.
+- `--no-mirrors`: read directly from Docker Hub, ignoring configured registry mirrors.
 - `--dry-run`: preview changes.
 - `--overwrite`: replace a different destination manifest.
 - `--no-progress`: hide progress bars.
@@ -45,6 +63,15 @@ Missing content is downloaded from the source registry; the original digests and
 Cache preparation has a two-second budget before falling back to downloads. Set `transfer.docker_cache_timeout` to adjust it, or `"0s"` to disable reuse.
 
 ## Inspect images
+
+Find the highest release version without opening Docker Hub:
+
+```bash
+quayside tag latest nginx
+quayside tag latest nginx --variant alpine
+```
+
+The result is a full image reference, ready for `image copy`. By default, only `x.y.z` tags (optional `v` prefix) are compared numerically; `--variant` selects an exact suffix. This finds the highest version, not the newest push or the publisher's stable channel. No matching version is an error. Use a full repository name for other registries.
 
 ```bash
 quayside tag ls registry.example.com/team/nginx
@@ -95,6 +122,8 @@ Repeat the same `copy` or `pull` command with `--resume` after an interruption. 
 
 Copy, pull, and push show an image summary with per-blob progress through completion. Rows stay in order, with extra rows folded to fit the terminal; completed and failed results remain visible. Use `--no-progress` to hide it.
 
+Color-capable terminals use cyan activity icons and green completion marks, with muted waiting and existing layers. Failures are red; interruptions and warning labels are yellow. `--no-color` or `NO_COLOR` disables colors while keeping progress. JSON and redirected stderr remain uncolored.
+
 ## Configuration
 
 No configuration file is required. See [config.example.toml](config.example.toml) for optional settings; use `--config <path>` to select a file.
@@ -113,6 +142,10 @@ export NO_PROXY=localhost,127.0.0.1,.example.com
 ```
 
 Docker `daemon.json` proxy settings are used as defaults when environment variables are absent.
+
+For Docker Hub sources, `image copy` and `image pull` also use that file's `registry-mirrors` in order, then Docker Hub. Each mirror is announced once on stderr with its configuration source. Missing content, denied access and network failures try the next source; certificate, content-integrity and configuration errors stop the operation. Quiet and JSON modes suppress these notices.
+
+Configured mirrors are trusted to resolve tags and may serve older content. `image copy --latest` resolves tags at the origin and uses mirrors only for content identified by digest; use `--no-mirrors` to bypass mirrors entirely. Tag queries, inspection, referrer discovery and destination writes always use their original registries. Downloads retain digest verification and resume support; mirror credentials are isolated from Docker Hub credentials. Mirror URLs must be HTTP(S) origins without paths or embedded credentials; an explicit HTTP URL uses unencrypted transport. Other Docker settings, including `insecure-registries`, remain ignored.
 
 Delegated uploads and missing blobs advertised through descriptor URLs support HTTPS content hosts. Registry credentials stay on the registry origin. Private content hosts can use their own `ca_file`; HTTP delegation requires both the registry and the content host to be explicitly configured with `plain_http`. HTTPS transfers never downgrade to HTTP.
 

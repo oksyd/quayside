@@ -95,7 +95,7 @@ fn copy_resolves_short_sources_to_docker_hub() {
             match resource.split('?').next().unwrap() {
                 "tags/list" => Response::new(
                     200,
-                    br#"{"name":"library/nginx","tags":["latest"]}"#.to_vec(),
+                    br#"{"name":"library/nginx","tags":["latest","1.2.3"]}"#.to_vec(),
                 ),
                 "manifests/0.11.0" | "manifests/latest" => {
                     Response::new(200, image.manifest.clone())
@@ -177,6 +177,91 @@ fn copy_resolves_short_sources_to_docker_hub() {
     ] {
         harness.json(&args, 0);
     }
+    let latest = harness.json(&["tag", "latest", "nginx"], 0);
+    assert_eq!(latest["command"], "tag latest");
+    assert_eq!(latest["data"]["reference"], "docker.io/library/nginx:1.2.3");
+}
+
+#[test]
+fn latest_tag_prints_a_copyable_reference_and_reports_missing_versions() {
+    let server = Server::new(|request| {
+        assert_eq!(request.method, "GET");
+        let tags = match request.path.as_str() {
+            "/v2/app/tags/list?n=100" => vec!["1.9.0", "1.10.0", "1.10.0-alpine"],
+            "/v2/aliases/tags/list?n=100" => vec!["latest", "stable", "2", "2.1", "3.0.0-rc.1"],
+            "/v2/empty/tags/list?n=100" => vec![],
+            _ => panic!("unexpected request: {}", request.path),
+        };
+        Response::new(
+            200,
+            serde_json::to_vec(&serde_json::json!({"tags": tags})).unwrap(),
+        )
+    });
+    let harness = Harness::new(&[(&server.host, true)]);
+    let repository = format!("{}/app", server.host);
+    let expected = format!("{repository}:1.10.0");
+    let output = harness.output(&["tag", "latest", &repository], 0);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{expected}\n")
+    );
+    let latest = harness.json(&["tag", "latest", &repository, "--variant", "alpine"], 0);
+    assert_eq!(latest["command"], "tag latest");
+    assert_eq!(
+        latest["data"],
+        serde_json::json!({
+            "repository": repository, "tag": "1.10.0-alpine", "reference": format!("{expected}-alpine")
+        })
+    );
+    for repository in ["aliases", "empty"] {
+        let reference = format!("{}/{repository}", server.host);
+        let result = harness.json(&["tag", "latest", &reference], 4);
+        assert_eq!(result["command"], "tag latest");
+        assert_eq!(result["error"]["code"], "NOT_FOUND");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no x.y.z version tag")
+        );
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tag ls")
+        );
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn latest_tag_rejects_selectors_and_invalid_variants_before_network_requests() {
+    let server = Server::new(|_| panic!("invalid latest options must not start a request"));
+    let harness = Harness::new(&[(&server.host, true)]);
+    let repository = format!("{}/app", server.host);
+    for variant in ["", "../alpine", "alpine\nforged", "-alpine"] {
+        let result = harness.json(
+            &[
+                "tag",
+                "latest",
+                &repository,
+                &format!("--variant={variant}"),
+            ],
+            2,
+        );
+        assert_eq!(result["error"]["code"], "INVALID_INPUT");
+    }
+    for reference in [
+        format!("{repository}:latest"),
+        format!(
+            "{repository}@{}",
+            quayside::digest::Digest::sha256(b"manifest")
+        ),
+    ] {
+        let result = harness.json(&["tag", "latest", &reference], 2);
+        assert_eq!(result["error"]["code"], "INVALID_INPUT");
+    }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
 }
 
 #[test]

@@ -8,6 +8,7 @@ fn display(total: usize) -> (TerminalObserver, Box<dyn Operation>) {
         Phase::Copying,
         ProgressDrawTarget::hidden(),
         Box::new(|| (24, 100)),
+        false,
     );
     let stage = observer.begin(Phase::Copying, total);
     (observer, stage)
@@ -19,6 +20,7 @@ fn snapshot(observer: &TerminalObserver, width: usize, height: usize) -> String 
         width,
         height,
         state.started + Duration::from_secs(3),
+        false,
     )
 }
 
@@ -107,6 +109,7 @@ fn byte_progress_is_only_shown_during_payload_transfer() {
             action,
             ProgressDrawTarget::hidden(),
             Box::new(|| (24, 100)),
+            false,
         );
         let stage = observer.begin(action, 1);
         stage
@@ -274,7 +277,7 @@ fn image_names_cannot_inject_terminal_controls_and_unicode_is_bounded() {
     let mut state = State::new("image\n\x1b[31m\r\t🦀界".into(), Phase::Copying);
     state.status = Status::Failed;
     for columns in [1, 20, 40, 60] {
-        let screen = render::frame(&state, columns, 24, Instant::now());
+        let screen = render::frame(&state, columns, 24, Instant::now(), false);
         assert!(
             screen
                 .lines()
@@ -282,6 +285,102 @@ fn image_names_cannot_inject_terminal_controls_and_unicode_is_bounded() {
         );
         assert!(!screen.contains(['\x1b', '\r', '\t']));
         assert_eq!(screen.lines().count(), 2);
+    }
+}
+
+#[test]
+fn colors_highlight_status_without_coloring_names_or_payload_details() {
+    let (observer, stage) = display(5);
+    let active = stage.blob("sha256:active".into(), 1024);
+    active.phase(BlobPhase::Downloading);
+    active.position(512);
+    stage
+        .blob("sha256:copied".into(), 1024)
+        .finish_with(BlobOutcome::Copied);
+    stage
+        .blob("sha256:exists".into(), 1024)
+        .finish_with(BlobOutcome::AlreadyExists);
+    stage.register_blob("sha256:waiting".into(), 1024);
+    stage.blob("sha256:failed".into(), 1024).fail();
+    let state = observer.display.as_ref().unwrap().state.lock().unwrap();
+    let now = state.started + Duration::from_secs(3);
+    let screen = render::frame(&state, 100, 24, now, true);
+    assert!(
+        screen.contains("\x1b[36m⠋\x1b[0m active Downloading"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("\x1b[32m✔\x1b[0m copied Copied"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("\x1b[2m✔\x1b[0m exists \x1b[2mAlready exists\x1b[0m"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("\x1b[2m-\x1b[0m waiting \x1b[2mWaiting\x1b[0m"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("\x1b[31m✘\x1b[0m failed \x1b[31mFailed\x1b[0m"),
+        "{screen}"
+    );
+    assert!(screen.contains("512 B/1.00 KiB"));
+    assert_eq!(
+        console::strip_ansi_codes(&screen),
+        render::frame(&state, 100, 24, now, false)
+    );
+}
+
+#[test]
+fn colors_preserve_layout_and_reset_before_padding_at_every_terminal_size() {
+    for action in [Phase::Copying, Phase::Pulling, Phase::Pushing] {
+        let mut state = State::new("docker.io/界/Failed:Interrupted".into(), action);
+        for i in 0..12 {
+            state.register(format!("sha256:{i:012}"), 1024);
+        }
+        state.rows[0].failed = true;
+        state.rows[1].outcome = Some(BlobOutcome::Copied);
+        state.rows[2].outcome = Some(BlobOutcome::AlreadyExists);
+        state.rows[3].started = Some(state.started);
+        state.rows[3].phase = Some(BlobPhase::Downloading);
+        state.rows[3].position = 512;
+        let now = state.started + Duration::from_secs(3);
+        for status in [
+            Status::Running,
+            Status::Complete,
+            Status::Failed,
+            Status::Interrupted,
+        ] {
+            state.status = status;
+            for height in [1, 3, 5, 8, 24] {
+                for width in 1..=140 {
+                    let colored = render::frame(&state, width, height, now, true);
+                    let plain = render::frame(&state, width, height, now, false);
+                    assert_eq!(console::strip_ansi_codes(&colored), plain);
+                    assert!(
+                        colored
+                            .lines()
+                            .all(|line| console::measure_text_width(line) <= width)
+                    );
+                    for line in colored.lines() {
+                        let mut styled = false;
+                        for (segment, ansi) in console::AnsiCodeIterator::new(line) {
+                            if ansi {
+                                styled = segment != "\x1b[0m";
+                            } else if segment.contains("3.0s") || segment.contains("docker.io") {
+                                assert!(!styled, "metadata must retain default color: {line}");
+                            }
+                        }
+                        assert!(!styled, "style must end on the same line: {line}");
+                    }
+                }
+            }
+        }
+        state.status = Status::Interrupted;
+        let screen = render::frame(&state, 120, 24, now, true);
+        assert!(screen.contains("\x1b[33mInterrupted\x1b[0m"));
+        assert!(screen.contains("docker.io/界/Failed:Interrupted"));
     }
 }
 
@@ -336,6 +435,7 @@ fn terminal_diagnostics_resize_and_final_frame_survive_rendering() {
         Phase::Copying,
         ProgressDrawTarget::term_like(Box::new(terminal.clone())),
         Box::new(move || (24, dimensions.load(Ordering::Relaxed))),
+        false,
     );
     let stage = observer.begin(Phase::Copying, 1);
     let blob = stage.blob("sha256:123456789abc".into(), 1024);

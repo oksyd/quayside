@@ -170,11 +170,14 @@ impl Store {
                 return Err(Error::conflict("cannot clear active transfer checkpoints"));
             }
             for entry in fs::read_dir(&store.root)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "blob" || e == "json") {
-                    storage::check_private_file(&path)?;
-                    remove(&path)?;
+                let entry = entry?;
+                if entry.file_name() == "lock" {
+                    continue;
                 }
+                // This transfer owns the directory, including atomic-write files left by exit.
+                let path = entry.path();
+                storage::check_private_file(&path)?;
+                remove(&path)?;
             }
             store.files.lock().expect("resume files lock").sizes.clear();
             Ok(())
@@ -481,7 +484,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[tokio::test]
-    async fn successful_cleanup_removes_orphaned_session_checkpoints() {
+    async fn successful_cleanup_removes_orphaned_checkpoints_and_atomic_writes() {
         let directory = tempfile::tempdir().unwrap();
         let config = TransferConfig {
             resume_dir: Some(directory.path().to_owned()),
@@ -496,6 +499,14 @@ mod tests {
         }))
         .await
         .unwrap();
+        // A failed process can exit while a cancelled worker is replacing a checkpoint.
+        // Keep an actual atomic-write temporary file to reproduce that on-disk state.
+        let (mut partial, partial_path) = tempfile::NamedTempFile::new_in(&store.root)
+            .unwrap()
+            .keep()
+            .unwrap();
+        std::io::Write::write_all(&mut partial, b"{\"version\":").unwrap();
+        drop(partial);
         fs::remove_file(&blob.path).unwrap();
         let checkpoint = blob.state_path.clone();
         drop(blob);
@@ -504,8 +515,10 @@ mod tests {
         let store = Store::open("orphaned-session", &config).await.unwrap();
         store.clear().await.unwrap();
         assert!(!checkpoint.exists());
+        assert!(!partial_path.exists());
         assert!(store.root.join("lock").is_file());
         assert_eq!(fs::read_dir(&store.root).unwrap().count(), 1);
+        assert!(Store::open("orphaned-session", &config).await.is_err());
     }
 
     #[tokio::test]

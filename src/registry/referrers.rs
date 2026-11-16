@@ -58,7 +58,12 @@ impl Registry {
                     selector: format!("{}-{}", digest.algorithm(), &digest.encoded()[..64]),
                     ..reference.clone()
                 };
-                return match self.manifest_optional(&fallback).await? {
+                // Discovery must use the origin: a mirror's cached fallback tag may be incomplete.
+                let origin = Registry {
+                    inner: self.inner.clone(),
+                    mirrors: None,
+                };
+                return match origin.manifest_optional(&fallback).await? {
                     None => Ok(vec![]),
                     Some(index) => Ok(referrer_entries(
                         &index,

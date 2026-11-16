@@ -72,6 +72,28 @@ impl Registry {
             progress.position(d.size);
             return Ok(());
         }
+        self.read(|registry| {
+            let slots = slots.clone();
+            async move {
+                progress.phase(BlobPhase::Downloading);
+                progress.position(0);
+                registry
+                    .download_from(repo, d, output, progress, slots, resume)
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn download_from(
+        &self,
+        repo: &str,
+        d: &Descriptor,
+        output: &Path,
+        progress: &dyn BlobProgress,
+        slots: Arc<Semaphore>,
+        resume: Option<&Arc<crate::resume::Blob>>,
+    ) -> Result<()> {
         let download = Download {
             registry: self,
             repo,
@@ -200,8 +222,9 @@ impl Download<'_> {
             let result = self
                 .download_once(&mut file, &mut hasher, &mut count, first.take())
                 .await;
+            // A mirror fallback may reopen this path; finish outstanding writes before returning.
+            file.flush().await?;
             if let Some(resume) = self.resume {
-                file.flush().await?;
                 file.get_ref().sync_data().await?;
                 resume.checkpoint(0, count).await?;
             }
@@ -210,7 +233,6 @@ impl Download<'_> {
                 Err(e)
                     if e.retryable() && attempt < self.registry.config().transfer.max_retries =>
                 {
-                    file.flush().await?;
                     tokio::time::sleep(retry_delay(None, attempt)).await;
                     attempt += 1;
                 }
@@ -351,7 +373,13 @@ impl Download<'_> {
             match result {
                 Ok(value) => supported &= value,
                 Err(error) => {
-                    failure.get_or_insert(error);
+                    // A network failure in another range must not hide an integrity/policy error.
+                    if failure.as_ref().is_none_or(|previous: &Error| {
+                        super::mirrors::can_fallback(previous.code)
+                            && !super::mirrors::can_fallback(error.code)
+                    }) {
+                        failure = Some(error);
+                    }
                 }
             }
         }

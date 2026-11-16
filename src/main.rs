@@ -7,7 +7,7 @@ use quayside::{
 };
 use serde_json::json;
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     sync::atomic::Ordering,
 };
 
@@ -58,10 +58,18 @@ fn emit_error(
         let _ = serde_json::to_writer(&mut stdout, &envelope);
         let _ = writeln!(stdout);
     } else {
-        eprintln!("error [{:?}]: {error}", error.code);
+        let label = format!("error [{:?}]:", error.code);
+        let style = console::Style::new().for_stderr();
+        let style = if error.code == Code::Interrupted {
+            style.yellow()
+        } else {
+            style.red()
+        };
+        eprintln!("{} {error}", style.apply_to(label));
         if partial {
             eprintln!(
-                "warning: remote writes may have occurred; no remote objects were automatically deleted."
+                "{} remote writes may have occurred; no remote objects were automatically deleted.",
+                console::style("warning:").for_stderr().yellow(),
             );
         }
         for warning in warnings {
@@ -90,6 +98,14 @@ async fn main() {
             e.exit();
         }
     };
+    console::set_colors_enabled_stderr(
+        !cli.no_color
+            && !cli.json
+            && io::stderr().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
+            && console::colors_enabled_stderr(),
+    );
     app::init_diagnostics(cli.log_level, cli.quiet);
     let label = cli.command.label();
     quayside::diagnostics::log(

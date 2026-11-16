@@ -124,6 +124,7 @@ struct Display {
     bar: ProgressBar,
     state: Mutex<State>,
     dimensions: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
+    color: bool,
 }
 impl Display {
     fn draw(&self) {
@@ -137,6 +138,7 @@ impl Display {
             width as usize,
             height as usize,
             Instant::now(),
+            self.color,
         ));
     }
     fn finish(&self, status: Status) {
@@ -147,7 +149,13 @@ impl Display {
         state.status = status;
         state.stopped = Some(Instant::now());
         let (height, width) = (self.dimensions)();
-        let frame = render::frame(&state, width as usize, height as usize, Instant::now());
+        let frame = render::frame(
+            &state,
+            width as usize,
+            height as usize,
+            Instant::now(),
+            self.color,
+        );
         // Finish once with the final frame; stage guards never clear the screen.
         self.bar.finish_with_message(frame);
     }
@@ -160,6 +168,16 @@ pub(crate) struct TerminalObserver {
     platform_notice: bool,
 }
 impl TerminalObserver {
+    pub(crate) fn set_image(&self, image: String) {
+        if let Some(display) = &self.display {
+            display.state.lock().expect("progress state lock").image = image
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect();
+            display.draw();
+        }
+    }
+
     pub(crate) fn new(enabled: bool, image: String, action: Phase) -> Self {
         if !enabled
             || !std::io::stderr().is_terminal()
@@ -177,6 +195,7 @@ impl TerminalObserver {
             action,
             ProgressDrawTarget::stderr_with_hz(10),
             Box::new(move || terminal.size()),
+            console::colors_enabled_stderr(),
         );
         let display = observer.display.as_ref().expect("initialized display");
         *ACTIVE.lock().expect("active progress lock") = Arc::downgrade(display);
@@ -198,6 +217,7 @@ impl TerminalObserver {
         action: Phase,
         target: ProgressDrawTarget,
         dimensions: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
+        color: bool,
     ) -> Self {
         let bar = ProgressBar::with_draw_target(None, target);
         bar.set_style(
@@ -208,6 +228,7 @@ impl TerminalObserver {
                 bar,
                 state: Mutex::new(State::new(image, action)),
                 dimensions,
+                color,
             })),
             task: None,
             platform_notice: false,

@@ -12,9 +12,26 @@ use http::{Method, StatusCode};
 impl Registry {
     /// Fetch and parse a manifest while preserving its original bytes and checking a pinned digest.
     pub async fn get_manifest(&self, reference: &Reference) -> Result<Manifest> {
-        self.manifest_with_etag(reference)
-            .await
-            .map(|(manifest, _)| manifest)
+        self.validate_reference(reference)?;
+        // Version discovery must resolve the selected tag at the origin. All subsequent
+        // graph reads use digests, so mirrors can serve content without choosing its version.
+        if reference.digest().is_none() && self.mirrors.as_ref().is_some_and(|m| !m.resolve_tags) {
+            return self
+                .manifest_with_etag(reference)
+                .await
+                .map(|(manifest, _)| manifest);
+        }
+        self.read(|registry| async move {
+            let reference = Reference {
+                registry: registry.name().to_owned(),
+                ..reference.clone()
+            };
+            registry
+                .manifest_with_etag(&reference)
+                .await
+                .map(|(manifest, _)| manifest)
+        })
+        .await
     }
 
     pub(super) async fn manifest_with_etag(
