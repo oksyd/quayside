@@ -1,9 +1,18 @@
+## [0.1.16] - 2026-11-16
+
+### 🚀 Features
+
+- Add latest version copy, Docker mirrors, and colored progress
 ## [0.1.15] - 2026-10-27
 
 ### 🐛 Bug Fixes
 
 - Correct transfer progress states and compact terminal display
 - Preserve manifest metadata and correct transfer recovery
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.15
 ## [0.1.14] - 2026-10-10
 
 ### 🐛 Bug Fixes
