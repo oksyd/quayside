@@ -1,8 +1,17 @@
+## [0.1.17] - 2026-11-17
+
+### 🚀 Features
+
+- Support numeric tag patterns for latest image selection
 ## [0.1.16] - 2026-11-16
 
 ### 🚀 Features
 
 - Add latest version copy, Docker mirrors, and colored progress
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.16
 ## [0.1.15] - 2026-10-27
 
 ### 🐛 Bug Fixes
