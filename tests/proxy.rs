@@ -81,35 +81,38 @@ fn docker_proxy_is_used_env_overrides_and_no_proxy_bypasses() {
 
 #[test]
 fn unrelated_docker_fields_are_ignored_and_proxy_secrets_are_not_logged() {
-    let server = Server::new(|_| Response::new(200, b"{}".to_vec()));
-    let mut harness = Harness::new(&[(&server.host, false)]);
+    use std::{io::Read, net::TcpListener, thread};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    let handshake = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        support::configure_connection(&stream).unwrap();
+        let mut prefix = [0; 3];
+        stream.read_exact(&mut prefix).unwrap();
+        assert_eq!(
+            &prefix[..2],
+            &[0x16, 0x03],
+            "expected a TLS handshake record"
+        );
+        // Close immediately: this test checks protocol selection, not handshake timeouts.
+    });
+    let mut harness = Harness::new(&[(&host, false)]);
     let daemon = harness.daemon_config();
     fs::write(
         &daemon,
         serde_json::to_vec(&json!({
-            "insecure-registries":[server.host],"registry-mirrors":["http://ignored.invalid"],
+            "insecure-registries":[host],"registry-mirrors":["http://ignored.invalid"],
             "proxies":{"http-proxy":"invalid proxy secret-password"}
         }))
         .unwrap(),
     )
     .unwrap();
-    // Docker insecure-registries must not enable HTTP: a TLS request to this HTTP server fails.
-    harness.json(&["registry", "ping", &server.host], 6);
-    harness
-        .config
-        .registries
-        .get_mut(&server.host)
-        .unwrap()
-        .plain_http = true;
+    // Docker insecure-registries must not turn this HTTPS endpoint into plain HTTP.
+    harness.json(&["registry", "ping", &host], 6);
+    handshake.join().unwrap();
+    harness.config.registries.get_mut(&host).unwrap().plain_http = true;
     let output = harness.output(
-        &[
-            "--json",
-            "--log-level",
-            "debug",
-            "registry",
-            "ping",
-            &server.host,
-        ],
+        &["--json", "--log-level", "debug", "registry", "ping", &host],
         2,
     );
     let text = format!(

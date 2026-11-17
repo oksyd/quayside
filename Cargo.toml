@@ -62,6 +62,10 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# Large transfer fixtures exercise real digests without slowing tests with debug SHA rounds.
+[profile.test.package.sha2]
+opt-level = 3
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

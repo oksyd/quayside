@@ -257,6 +257,19 @@ fn parse_destination(s: &str) -> Result<Reference> {
     r.require_destination()?;
     Ok(r)
 }
+
+async fn latest_tag(
+    registry: &Registry,
+    repository: &str,
+    variant: Option<&str>,
+    pattern: Option<&str>,
+) -> Result<String> {
+    match (variant, pattern) {
+        (_, None) => registry.latest_tag(repository, variant).await,
+        (None, Some(pattern)) => registry.latest_matching_tag(repository, pattern).await,
+        (Some(_), Some(_)) => Err(Error::input("--match cannot be combined with --variant")),
+    }
+}
 fn transfer_summary(
     action: Phase,
     digest: Option<&crate::digest::Digest>,
@@ -405,14 +418,18 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
                 TagCommand::Latest {
                     repository,
                     variant,
+                    pattern,
                 },
         } => {
             let mut r = Reference::parse_source(repository)?;
             r.require_repository()?;
-            r.selector = ctx
-                .registry(&r.registry)?
-                .latest_tag(&r.repository, variant.as_deref())
-                .await?;
+            r.selector = latest_tag(
+                &ctx.registry(&r.registry)?,
+                &r.repository,
+                variant.as_deref(),
+                pattern.as_deref(),
+            )
+            .await?;
             r.explicit = true;
             let reference = r.to_string();
             Ok(Output::new(
@@ -561,6 +578,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             destination,
             latest,
             variant,
+            pattern,
             selection,
             transfer,
             write,
@@ -571,8 +589,8 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                 src.require_repository()?;
             } else {
                 dst.require_destination()?;
-                if variant.is_some() {
-                    return Err(Error::input("--variant requires --latest"));
+                if variant.is_some() || pattern.is_some() {
+                    return Err(Error::input("--variant and --match require --latest"));
                 }
             }
             let selection = selection.try_into()?;
@@ -597,9 +615,13 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             .with_platform_notice(ctx.notices);
             let result = async {
                 if *latest {
-                    src.selector = source
-                        .latest_tag(&src.repository, variant.as_deref())
-                        .await?;
+                    src.selector = latest_tag(
+                        &source,
+                        &src.repository,
+                        variant.as_deref(),
+                        pattern.as_deref(),
+                    )
+                    .await?;
                     src.explicit = true;
                     if !dst.explicit {
                         dst.selector = src.selector.clone();

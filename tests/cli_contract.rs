@@ -187,7 +187,13 @@ fn latest_tag_prints_a_copyable_reference_and_reports_missing_versions() {
     let server = Server::new(|request| {
         assert_eq!(request.method, "GET");
         let tags = match request.path.as_str() {
-            "/v2/app/tags/list?n=100" => vec!["1.9.0", "1.10.0", "1.10.0-alpine"],
+            "/v2/app/tags/list?n=100" => vec![
+                "1.9.0",
+                "1.10.0",
+                "1.10.0-alpine",
+                "1.10.0-alpine3.9-slim",
+                "1.10.0-alpine3.24-slim",
+            ],
             "/v2/aliases/tags/list?n=100" => vec!["latest", "stable", "2", "2.1", "3.0.0-rc.1"],
             "/v2/empty/tags/list?n=100" => vec![],
             _ => panic!("unexpected request: {}", request.path),
@@ -222,7 +228,7 @@ fn latest_tag_prints_a_copyable_reference_and_reports_missing_versions() {
             result["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("no x.y.z version tag")
+                .contains("no version tag matching *.*.*")
         );
         assert!(
             result["error"]["message"]
@@ -231,7 +237,21 @@ fn latest_tag_prints_a_copyable_reference_and_reports_missing_versions() {
                 .contains("tag ls")
         );
     }
-    assert_eq!(server.connections.load(Ordering::SeqCst), 4);
+    let output = harness.output(
+        &[
+            "tag",
+            "latest",
+            &repository,
+            "--match",
+            "*.*.*-alpine*.*-slim",
+        ],
+        0,
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{expected}-alpine3.24-slim\n")
+    );
+    assert_eq!(server.connections.load(Ordering::SeqCst), 5);
 }
 
 #[test]
@@ -261,6 +281,55 @@ fn latest_tag_rejects_selectors_and_invalid_variants_before_network_requests() {
         let result = harness.json(&["tag", "latest", &reference], 2);
         assert_eq!(result["error"]["code"], "INVALID_INPUT");
     }
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn latest_tag_patterns_reject_invalid_options_without_network_requests() {
+    let server = Server::new(|_| panic!("invalid pattern options must not start a request"));
+    let harness = Harness::new(&[(&server.host, true)]);
+    let repository = format!("{}/app", server.host);
+    let destination = format!("{}/target:v1", server.host);
+    for mut args in [
+        vec!["tag", "latest", &repository],
+        vec!["image", "copy", &repository, &destination, "--latest"],
+    ] {
+        args.push("--match");
+        for pattern in [
+            "",
+            "../*",
+            "*.*.*-alpine?",
+            "*.*.*-alpine[0-9]",
+            "*.*.*\n",
+            "**.*.*",
+        ] {
+            let result = harness.json(&[&args[..], &[pattern]].concat(), 2);
+            assert_eq!(result["error"]["code"], "INVALID_INPUT");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--match")
+            );
+        }
+        let output = harness.output(&[&args[..], &["*.*.*", "--variant", "alpine"]].concat(), 2);
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("cannot be used")
+        );
+    }
+    harness.output(
+        &[
+            "image",
+            "copy",
+            &repository,
+            &destination,
+            "--match",
+            "*.*.*",
+        ],
+        2,
+    );
     assert_eq!(server.connections.load(Ordering::SeqCst), 0);
 }
 

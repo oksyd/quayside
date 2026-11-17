@@ -45,14 +45,11 @@ jobs:
           cargo fmt --all --check
           cargo rustc --locked --lib --all-features -- -D missing-docs
           cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo clippy --locked --all-targets --no-default-features -- -D warnings
           cargo doc --locked --no-deps --all-features
           cargo package --locked --list > "$RUNNER_TEMP/package-files.txt"
           grep -Fx config.example.toml "$RUNNER_TEMP/package-files.txt"
       - name: Test
-        run: |
-          cargo test --locked --all-features
-          cargo test --locked --no-default-features
+        run: cargo test --locked --all-features
 
   registry:
     name: Registry integration

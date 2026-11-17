@@ -491,10 +491,18 @@ fn ignored_range_restarts_and_verifies_the_full_blob() {
 }
 
 #[test]
-fn rejected_resume_range_restarts_and_verifies_the_full_blob() {
-    for mode in ["reject-400", "reject-416", "reject-501"] {
-        interrupted_download(mode, 0);
-    }
+fn bad_resume_range_restarts_and_verifies_the_full_blob() {
+    interrupted_download("reject-400", 0);
+}
+
+#[test]
+fn unsatisfiable_resume_range_restarts_and_verifies_the_full_blob() {
+    interrupted_download("reject-416", 0);
+}
+
+#[test]
+fn unsupported_resume_range_exhausts_retries_before_restarting() {
+    interrupted_download("reject-501", 0);
 }
 
 #[test]
@@ -626,9 +634,10 @@ fn range_copy(mode: &'static str, layers: usize, chunk_delay: Duration) -> Durat
     let mut manifest: Value = serde_json::from_slice(&image.manifest).unwrap();
     let size = 32 * 1024 * 1024;
     for layer in 0..layers {
-        let body: Vec<_> = (0..size)
-            .map(|i| ((i / 65536 + layer) % 251) as u8)
-            .collect();
+        let mut body = vec![0; size];
+        for (block, bytes) in body.chunks_mut(65536).enumerate() {
+            bytes.fill(((block + layer) % 251) as u8);
+        }
         let d = Descriptor::new(
             "application/vnd.oci.image.layer.v1.tar",
             Digest::sha256(&body),
@@ -776,17 +785,28 @@ fn parallel_ranges_resume_only_the_missing_part_bytes() {
 }
 
 #[test]
-fn parallel_ranges_fall_back_without_duplicate_full_downloads() {
-    for mode in ["ignore", "reject", "mixed"] {
-        range_copy(mode, 1, Duration::ZERO);
-    }
+fn ignored_parallel_ranges_reuse_the_full_response() {
+    range_copy("ignore", 1, Duration::ZERO);
 }
 
 #[test]
-fn parallel_ranges_verify_full_digest_and_response_boundaries_before_upload() {
-    for mode in ["corrupt", "invalid"] {
-        range_copy(mode, 1, Duration::ZERO);
-    }
+fn rejected_parallel_ranges_download_the_full_blob_once() {
+    range_copy("reject", 1, Duration::ZERO);
+}
+
+#[test]
+fn mixed_range_support_restarts_without_duplicate_full_downloads() {
+    range_copy("mixed", 1, Duration::ZERO);
+}
+
+#[test]
+fn parallel_ranges_verify_full_digest_before_upload() {
+    range_copy("corrupt", 1, Duration::ZERO);
+}
+
+#[test]
+fn parallel_ranges_verify_response_boundaries_before_upload() {
+    range_copy("invalid", 1, Duration::ZERO);
 }
 
 #[test]

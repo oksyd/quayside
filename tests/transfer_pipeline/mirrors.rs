@@ -441,8 +441,7 @@ fn referrer_discovery_and_fallback_tags_bypass_mirrors() {
     assert_eq!(origin.connections.load(Ordering::SeqCst), 2);
 }
 
-#[test]
-fn parallel_mirror_failover_flushes_writers_and_never_hides_integrity_errors() {
+fn parallel_mirror_failover(resume: bool, corrupt: bool) {
     fn response(image: &Image, request: &Request, broken: bool, corrupt: bool) -> Response {
         let Some(range) = request.headers.get("range") else {
             return serve_image(image, request);
@@ -466,43 +465,56 @@ fn parallel_mirror_failover_flushes_writers_and_never_hides_integrity_errors() {
             &format!("bytes {start}-{end}/{}", raw.len()),
         )
     }
-    for (resume, corrupt) in [(false, false), (true, false), (false, true)] {
-        let root = tempfile::tempdir().unwrap();
-        let image = Arc::new(image_layout(root.path(), 1, 32 * 1024 * 1024));
-        let original = image.clone();
-        let origin = Server::new(move |request| response(&original, &request, false, false));
-        let cached = image.clone();
-        let mirror = Server::new(move |request| response(&cached, &request, true, corrupt));
-        let harness = harness(&origin, &[format!("http://{}", mirror.host)]);
-        let result = pull(
-            &harness,
-            if resume { &["--resume"] } else { &[] },
-            if corrupt { 7 } else { 0 },
+    let root = tempfile::tempdir().unwrap();
+    let image = Arc::new(image_layout(root.path(), 1, 32 * 1024 * 1024));
+    let original = image.clone();
+    let origin = Server::new(move |request| response(&original, &request, false, false));
+    let cached = image.clone();
+    let mirror = Server::new(move |request| response(&cached, &request, true, corrupt));
+    let harness = harness(&origin, &[format!("http://{}", mirror.host)]);
+    let result = pull(
+        &harness,
+        if resume { &["--resume"] } else { &[] },
+        if corrupt { 7 } else { 0 },
+    );
+    if corrupt {
+        assert_eq!(result["error"]["code"], "INTEGRITY");
+        assert_eq!(origin.connections.load(Ordering::SeqCst), 0);
+    } else {
+        assert_eq!(
+            origin.connections.load(Ordering::SeqCst),
+            if resume { 1 } else { 4 }
         );
-        if corrupt {
-            assert_eq!(result["error"]["code"], "INTEGRITY");
-            assert_eq!(origin.connections.load(Ordering::SeqCst), 0);
-        } else {
-            assert_eq!(
-                origin.connections.load(Ordering::SeqCst),
-                if resume { 1 } else { 4 }
-            );
-            let (digest, raw) = image
-                .blobs
-                .iter()
-                .find(|(_, raw)| raw.len() == 32 * 1024 * 1024)
-                .unwrap();
-            assert_eq!(
-                fs::read(
-                    harness
-                        .root
-                        .path()
-                        .join("image/blobs/sha256")
-                        .join(digest.strip_prefix("sha256:").unwrap())
-                )
-                .unwrap(),
-                *raw
-            );
-        }
+        let (digest, raw) = image
+            .blobs
+            .iter()
+            .find(|(_, raw)| raw.len() == 32 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            fs::read(
+                harness
+                    .root
+                    .path()
+                    .join("image/blobs/sha256")
+                    .join(digest.strip_prefix("sha256:").unwrap())
+            )
+            .unwrap(),
+            *raw
+        );
     }
+}
+
+#[test]
+fn parallel_mirror_failover_flushes_writers_before_restarting() {
+    parallel_mirror_failover(false, false);
+}
+
+#[test]
+fn parallel_mirror_failover_preserves_resume_offsets() {
+    parallel_mirror_failover(true, false);
+}
+
+#[test]
+fn parallel_mirror_failover_never_hides_integrity_errors() {
+    parallel_mirror_failover(false, true);
 }

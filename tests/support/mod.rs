@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -170,15 +170,14 @@ impl Response {
         self
     }
 }
-fn serve<S: Read + Write>(
-    mut stream: S,
-    handler: &dyn Fn(Request) -> Response,
-) -> std::io::Result<()> {
+fn serve<S: Read + Write>(stream: S, handler: &dyn Fn(Request) -> Response) -> std::io::Result<()> {
+    let mut input = BufReader::new(stream);
     let mut head = Vec::new();
+    let mut bounded = input.by_ref().take(65537);
     while !head.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        stream.read_exact(&mut byte)?;
-        head.push(byte[0]);
+        if bounded.read_until(b'\n', &mut head)? == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
         if head.len() > 65536 {
             return Ok(());
         }
@@ -200,15 +199,17 @@ fn serve<S: Read + Write>(
         return Ok(());
     }
     let mut body = vec![0; length];
-    stream.read_exact(&mut body)?;
+    input.read_exact(&mut body)?;
+    let mut stream = input.into_inner();
     let response = handler(Request {
         method: method.clone(),
         path,
         headers,
         body,
     });
+    let mut response_head = Vec::new();
     write!(
-        stream,
+        response_head,
         "HTTP/1.1 {} Test\r\nConnection: close\r\n",
         response.status
     )?;
@@ -217,12 +218,13 @@ fn serve<S: Read + Write>(
         .iter()
         .any(|(key, _)| key.eq_ignore_ascii_case("content-length"))
     {
-        write!(stream, "Content-Length: {}\r\n", response.body.len())?;
+        write!(response_head, "Content-Length: {}\r\n", response.body.len())?;
     }
     for (k, v) in response.headers {
-        write!(stream, "{k}: {v}\r\n")?;
+        write!(response_head, "{k}: {v}\r\n")?;
     }
-    write!(stream, "\r\n")?;
+    response_head.extend_from_slice(b"\r\n");
+    stream.write_all(&response_head)?;
     stream.flush()?;
     thread::sleep(response.delay);
     if method != "HEAD" {

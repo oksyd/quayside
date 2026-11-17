@@ -87,6 +87,73 @@ async fn latest_tags_compare_complete_versions_across_all_pages_and_exact_varian
 }
 
 #[tokio::test]
+async fn latest_tag_patterns_compare_every_numeric_component_across_pages() {
+    let server = Server::new(|request| {
+        assert_eq!(request.method, "GET");
+        let tags = if request.path.ends_with("?n=100") {
+            vec![
+                "1.31.8-alpine3.9-slim",
+                "1.31.8-alpine3.23-slim",
+                "1.31.7-alpine99.0-slim",
+                "1.32.0-alpine-slim",
+                "1.32.0-alpine3.25",
+                "1.32.0-rc.1-alpine99.0-slim",
+                "1.31.8-alpine3.024-slim",
+                "1.31.8-alpine03.99-slim",
+                "1.31.8-alpine3..99-slim",
+                "1.31.8-alpine3.99-rc.1-slim",
+                "1.31.8-alpinenext-slim",
+                "1.31.8-alpine3.18446744073709551616-slim",
+                "1.31.8-alpine3.25-slim-extra",
+                "2.0.0-ubuntu24.4",
+                "2.0.0-ubuntu24.10",
+                "2.0.0-ubuntu22.99",
+            ]
+        } else {
+            assert!(request.path.ends_with("?page=2"));
+            vec![
+                "v1.31.8-alpine3.24-slim",
+                "1.31.8-alpine3.24-slim",
+                "1.31.8-alpine3.10-slim",
+            ]
+        };
+        let response = Response::new(
+            200,
+            serde_json::to_vec(&serde_json::json!({"tags":tags})).unwrap(),
+        );
+        if request.path.ends_with("?n=100") {
+            response.header("Link", "</v2/app/tags/list?page=2>; rel=\"next\"")
+        } else {
+            response
+        }
+    });
+    let (registry, changed) = client(&server);
+    for (pattern, expected) in [
+        ("*.*.*-alpine*.*-slim", "1.31.8-alpine3.24-slim"),
+        ("1.*.*-alpine3.*-slim", "1.31.8-alpine3.24-slim"),
+        ("v*.*.*-alpine*.*-slim", "v1.31.8-alpine3.24-slim"),
+        ("1.31.8-alpine3.9-slim", "1.31.8-alpine3.9-slim"),
+        ("*.*.*-ubuntu*.*", "2.0.0-ubuntu24.10"),
+    ] {
+        assert_eq!(
+            registry.latest_matching_tag("app", pattern).await.unwrap(),
+            expected
+        );
+    }
+    for pattern in [
+        "*.*.*-alpine*.*.*-slim",
+        "*.*.*-alpine*-slim",
+        "*.*.*-missing*.*",
+    ] {
+        rejected(
+            registry.latest_matching_tag("app", pattern).await,
+            Code::NotFound,
+        );
+    }
+    assert!(!changed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn listings_reject_invalid_names_before_exposing_them_to_callers() {
     for (field, invalid) in [
         ("tags", "v1\nforged output"),

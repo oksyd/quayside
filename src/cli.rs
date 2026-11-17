@@ -213,6 +213,9 @@ pub enum TagCommand {
         /// Match an exact variant suffix, such as alpine or bookworm-slim.
         #[arg(long)]
         variant: Option<String>,
+        /// Match a full tag pattern; each * matches one numeric component (quote the pattern).
+        #[arg(long = "match", conflicts_with = "variant")]
+        pattern: Option<String>,
     },
 }
 /// Platform filtering; omitted flags select the local container platform.
@@ -326,6 +329,9 @@ pub enum ImageCommand {
         /// Match an exact version suffix, such as alpine or bookworm-slim.
         #[arg(long, requires = "latest")]
         variant: Option<String>,
+        /// Match a full tag pattern; each * matches one numeric component (quote the pattern).
+        #[arg(long = "match", requires = "latest", conflicts_with = "variant")]
+        pattern: Option<String>,
         /// Platform selection options.
         #[command(flatten)]
         selection: Selection,

@@ -30,9 +30,12 @@ Copy the highest numeric `x.y.z` version, keeping its exact tag at the destinati
 ```bash
 quayside image copy nginx registry.example.com/team/nginx --latest
 quayside image copy nginx registry.example.com/team/nginx --latest --variant alpine
+quayside image copy nginx registry.example.com/team/nginx --latest --match '*.*.*-alpine*.*-slim'
 ```
 
 With `--latest`, the source must have no tag or digest. Versions allow an optional `v` prefix; aliases and prereleases are excluded by default. `--variant` matches an exact suffix. An explicit destination tag is preserved. Selection and tag resolution use the source registry; the transfer retains the resolved digest even if the tag changes. No matching version is an error.
+
+Use `--match` instead of `--variant` to match a full version tag. Each `*` matches one numeric component; other characters are literal. Versions are compared numerically, starting with the image's `x.y.z`, then wildcard components in order. For example, `'*.*.*-alpine*.*-slim'` tracks both nginx and Alpine updates while preserving tags such as `1.31.8-alpine3.24-slim`; it excludes the floating `alpine-slim` alias. Quote patterns to prevent shell expansion. The number of components is explicit: `alpine*.*` matches `alpine3.24`, while `alpine*.*.*` matches `alpine3.24.1`.
 
 For daily updates, add one command per task to your crontab (use the same user that logged in):
 
@@ -59,7 +62,7 @@ OCI artifacts such as Trivy databases are copied intact without platform filteri
 If the destination rejects build attestations, use the default platform or `--platform` without `--include-attestations` or `--referrers all`. Preserving attestations with `--all` or `--include-attestations` requires destination support for those manifests.
 
 `image copy` automatically reuses matching blobs from Docker's current context when available.
-Missing content is downloaded from the source registry; the original digests and platform selection are preserved.
+Quayside does not maintain a persistent image cache. Destination blobs are checked first and skipped when already present. Docker reuse requires blobs matching the source's original digest and size; unavailable or incompatible content is downloaded from the registry. Temporary transfer files are removed afterward; digests and platform selection are preserved.
 Cache preparation has a two-second budget before falling back to downloads. Set `transfer.docker_cache_timeout` to adjust it, or `"0s"` to disable reuse.
 
 ## Inspect images
@@ -69,6 +72,7 @@ Find the highest release version without opening Docker Hub:
 ```bash
 quayside tag latest nginx
 quayside tag latest nginx --variant alpine
+quayside tag latest nginx --match '*.*.*-alpine*.*-slim'
 ```
 
 The result is a full image reference, ready for `image copy`. By default, only `x.y.z` tags (optional `v` prefix) are compared numerically; `--variant` selects an exact suffix. This finds the highest version, not the newest push or the publisher's stable channel. No matching version is an error. Use a full repository name for other registries.
@@ -118,7 +122,7 @@ Legacy Docker archives are converted to OCI; the original registry manifest dige
 
 `image pull` also accepts `--referrers all`, `--include-attestations`, and `--resume`. Associated artifacts exported with `--referrers all` are preserved by `image push`.
 
-Repeat the same `copy` or `pull` command with `--resume` after an interruption. Cached bytes are verified; expired upload sessions restart automatically. Resume data is private to your user, stored under the system cache directory in `quayside/transfers`, and removed after success. Set `transfer.resume_dir` to choose another directory. Interrupted caches can be deleted when no transfer is running. `transfer.max_temp_size` bounds each operation's payload storage, including resume data; resumable exports require room for both cached blobs and the output staging. Resume mode uses its own cache instead of exporting Docker's local cache.
+Repeat the same `copy` or `pull` command with `--resume` after an interruption. Cached bytes are verified; expired upload sessions restart automatically. Resume data is private to your user, stored under the system cache directory in `quayside/transfers`, and removed after success. Set `transfer.resume_dir` to choose another directory. Interrupted caches can be deleted when no transfer is running. `transfer.max_temp_size` bounds each operation's payload storage, including resume data; resumable exports require room for both cached blobs and the output staging. Resume mode retains only transfer checkpoints and partial downloads, rather than a reusable image cache, and skips Docker exports.
 
 Copy, pull, and push show an image summary with per-blob progress through completion. Rows stay in order, with extra rows folded to fit the terminal; completed and failed results remain visible. Use `--no-progress` to hide it.
 

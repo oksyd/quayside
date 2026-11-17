@@ -74,6 +74,67 @@ fn latest_copy_inherits_versions_and_repeated_runs_skip_existing_content() {
 }
 
 #[test]
+fn latest_copy_tracks_image_and_base_versions_without_replacing_old_version_tags() {
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let images: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| image_layout(root.path(), i + 1, 1024))
+        .collect();
+    let digests: Vec<_> = images.iter().map(|image| image.digest.clone()).collect();
+    let versions = [
+        "1.31.8-alpine3.24-slim",
+        "1.31.8-alpine3.25-slim",
+        "1.32.0-alpine3.24-slim",
+    ];
+    let current = Arc::new(AtomicUsize::new(0));
+    let published = current.clone();
+    let source = Server::new(move |request| {
+        let index = published.load(Ordering::SeqCst);
+        if request.path.contains("/tags/list") {
+            let mut tags = versions[..=index].to_vec();
+            tags.extend(["1.31.8-alpine3.9-slim", "9.99.99-alpine-slim", "latest"]);
+            return Response::new(200, serde_json::to_vec(&json!({"tags":tags})).unwrap());
+        }
+        if request.path.contains("/manifests/") {
+            assert_eq!(
+                request.path,
+                format!("/v2/app/manifests/{}", versions[index])
+            );
+        }
+        serve_image(&images[index], &request)
+    });
+    let target = destination(|_| true);
+    let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+    let src = format!("{}/app", source.host);
+    let dst = format!("{}/app", target.host);
+    let args = [
+        "image",
+        "copy",
+        &src,
+        &dst,
+        "--latest",
+        "--match",
+        "*.*.*-alpine*.*-slim",
+    ];
+    for (i, version) in versions.iter().enumerate() {
+        current.store(i, Ordering::SeqCst);
+        let result = harness.json(&args, 0);
+        assert_eq!(result["data"]["source"], format!("{src}:{version}"));
+        assert_eq!(result["data"]["destination"], format!("{dst}:{version}"));
+        assert_eq!(result["data"]["target_digest"], digests[i]);
+        assert_eq!(result["data"]["already_present"], false);
+        let repeat = harness.json(&args, 0);
+        assert_eq!(repeat["data"]["already_present"], true);
+        assert_eq!(repeat["data"]["stats"]["copied_blobs"], 0);
+    }
+    for (version, digest) in versions.iter().zip(digests) {
+        let result = harness.json(&["image", "digest", &format!("{dst}:{version}")], 0);
+        assert_eq!(result["data"]["digest"], digest);
+    }
+}
+
+#[test]
 fn latest_copy_preserves_exact_version_prefixes_and_variant_suffixes_in_dry_runs() {
     for (variant, expected) in [(None, "v2.10.0"), (Some("alpine"), "v2.10.1-alpine")] {
         let root = tempfile::tempdir().unwrap();

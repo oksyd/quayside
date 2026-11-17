@@ -311,26 +311,83 @@ fn stale_and_corrupt_local_blobs_fall_back_without_changing_remote_content() {
     }
 }
 
+fn docker_cache_miss(behavior: &str) {
+    let mut fixture = Fixture::new(false);
+    fixture.harness.config.transfer.connect_timeout = "500ms".into();
+    fixture.harness.config.transfer.idle_timeout = "500ms".into();
+    let bin = fixture.docker(&fixture.local);
+    let result = fixture.run(&bin, behavior, &[]);
+    assert_eq!(result["data"]["stats"]["reused_blobs"], 0, "{behavior}");
+    assert_eq!(fixture.reads.lock().unwrap().values().sum::<usize>(), 4);
+    if matches!(behavior, "missing" | "legacy" | "inspect_timeout") {
+        assert_eq!(
+            fs::read_to_string(fixture.harness.root.path().join("calls")).unwrap(),
+            "inspect\n"
+        );
+    }
+}
+
 #[test]
-fn unavailable_or_failing_docker_is_an_optional_cache_miss() {
-    for behavior in [
-        "missing",
-        "legacy",
-        "export_failure",
-        "inspect_timeout",
-        "export_timeout",
-    ] {
-        let mut fixture = Fixture::new(false);
-        fixture.harness.config.transfer.connect_timeout = "500ms".into();
-        fixture.harness.config.transfer.idle_timeout = "500ms".into();
-        let bin = fixture.docker(&fixture.local);
-        let result = fixture.run(&bin, behavior, &[]);
-        assert_eq!(result["data"]["stats"]["reused_blobs"], 0, "{behavior}");
-        assert_eq!(fixture.reads.lock().unwrap().values().sum::<usize>(), 4);
-        if matches!(behavior, "missing" | "legacy" | "inspect_timeout") {
-            assert_eq!(
-                fs::read_to_string(fixture.harness.root.path().join("calls")).unwrap(),
-                "inspect\n"
+fn missing_docker_image_uses_registry_downloads() {
+    docker_cache_miss("missing");
+}
+
+#[test]
+fn legacy_docker_store_uses_registry_downloads() {
+    docker_cache_miss("legacy");
+}
+
+#[test]
+fn failed_docker_export_uses_registry_downloads() {
+    docker_cache_miss("export_failure");
+}
+
+#[test]
+fn stalled_docker_inspection_uses_registry_downloads() {
+    docker_cache_miss("inspect_timeout");
+}
+
+#[test]
+fn stalled_docker_export_uses_registry_downloads() {
+    docker_cache_miss("export_timeout");
+}
+
+#[test]
+fn unavailable_docker_leaves_no_persistent_payloads_between_transfers() {
+    let mut fixture = Fixture::new(false);
+    let bin = fixture.docker(&fixture.local);
+    for attempt in 1..=2 {
+        if attempt == 2 {
+            fixture.target = destination(|_| true);
+            fixture.harness.config.registries.insert(
+                fixture.target.host.clone(),
+                quayside::config::RegistryConfig {
+                    plain_http: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let result = fixture.run(&bin, "missing", &[]);
+        assert_eq!(result["data"]["stats"]["reused_blobs"], 0);
+        assert_eq!(
+            fixture.reads.lock().unwrap().values().sum::<usize>(),
+            attempt * 4
+        );
+        assert_eq!(
+            fs::read_dir(fixture.harness.root.path().join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
+        for cache in ["cache", "Library/Caches"] {
+            assert!(
+                !fixture
+                    .harness
+                    .root
+                    .path()
+                    .join(cache)
+                    .join("quayside")
+                    .exists()
             );
         }
     }

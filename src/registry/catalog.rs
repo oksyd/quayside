@@ -33,29 +33,45 @@ impl Registry {
                 Error::input("variant must be a nonempty tag suffix, such as alpine")
             })?;
         }
+        let pattern = variant.map_or_else(|| "*.*.*".to_owned(), |v| format!("*.*.*-{v}"));
+        self.latest_matching_tag(repo, &pattern).await
+    }
+    /// Find the highest complete release version matching a full tag pattern.
+    ///
+    /// Each `*` matches one nonempty numeric component, without leading zeros.
+    /// All other characters are literal. An unprefixed pattern also accepts `v`-prefixed
+    /// releases. The image's x.y.z version is compared first, then wildcard components
+    /// in pattern order; a plain version wins ties with a v-prefixed one.
+    /// The original tag is returned unchanged. Floating image aliases never match;
+    /// any suffix, including a prerelease suffix, must match the pattern explicitly.
+    pub async fn latest_matching_tag(&self, repo: &str, pattern: &str) -> Result<String> {
+        if pattern.contains("**") || validate_tag(&pattern.replace('*', "0")).is_err() {
+            return Err(Error::input(
+                "--match expects a tag pattern with separated numeric wildcards, such as *.*.*-alpine*.*-slim",
+            ));
+        }
+        let prefix = if pattern.starts_with('v') { "" } else { "v?" };
+        let expression = regex::escape(pattern).replace(r"\*", "([0-9]+)");
+        let matcher = regex::Regex::new(&format!(r"\A{prefix}{expression}\z"))
+            .map_err(|_| Error::input("invalid version tag pattern"))?;
         self.list_tags(repo)
             .await?
             .into_iter()
             .filter_map(|tag| {
-                let (version, suffix) = tag
-                    .split_once('-')
-                    .map_or((tag.as_str(), None), |(v, suffix)| (v, Some(suffix)));
-                if suffix != variant {
-                    return None;
-                }
-                release_version(version).map(|version| (version, tag))
+                let version = release_version(tag.split('-').next()?)?;
+                let captures = matcher.captures(&tag)?;
+                let numbers = captures.iter().skip(1)
+                    .map(|part| version_number(part?.as_str()))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(((version, numbers, !tag.starts_with('v')), tag))
             })
-            .max_by_key(|(version, tag)| (*version, !tag.starts_with('v')))
+            .max_by(|(left, _), (right, _)| left.cmp(right))
             .map(|(_, tag)| tag)
             .ok_or_else(|| {
-                let pattern = match variant {
-                    Some(variant) => format!("x.y.z-{variant}"),
-                    None => "x.y.z".into(),
-                };
                 Error::new(
                     Code::NotFound,
                     format!(
-                        "no {pattern} version tag found in {}/{repo}; use `tag ls` to list available tags",
+                        "no version tag matching {pattern} found in {}/{repo}; use `tag ls` to list available tags",
                         self.name(),
                     ),
                 )
@@ -165,16 +181,19 @@ fn release_version(tag: &str) -> Option<[u64; 3]> {
     let mut parts = tag.strip_prefix('v').unwrap_or(tag).split('.');
     let mut version = [0; 3];
     for component in &mut version {
-        let part = parts.next()?;
-        if part.is_empty()
-            || !part.bytes().all(|b| b.is_ascii_digit())
-            || (part.len() > 1 && part.starts_with('0'))
-        {
-            return None;
-        }
-        *component = part.parse().ok()?;
+        *component = version_number(parts.next()?)?;
     }
     parts.next().is_none().then_some(version)
+}
+
+fn version_number(part: &str) -> Option<u64> {
+    if part.is_empty()
+        || !part.bytes().all(|b| b.is_ascii_digit())
+        || (part.len() > 1 && part.starts_with('0'))
+    {
+        return None;
+    }
+    part.parse().ok()
 }
 
 pub(super) fn next_link(header: &str) -> Option<String> {
