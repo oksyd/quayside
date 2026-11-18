@@ -25,17 +25,18 @@ quayside image copy nginx:latest \
 
 Source names default to Docker Hub: `nginx:latest` resolves to `docker.io/library/nginx:latest`, and `apache/skywalking-banyandb:0.11.0` to `docker.io/apache/skywalking-banyandb:0.11.0`.
 
-Copy the highest numeric `x.y.z` version, keeping its exact tag at the destination:
+Copy the highest matching version and keep its exact tag at the destination:
 
 ```bash
 quayside image copy nginx registry.example.com/team/nginx --latest
 quayside image copy nginx registry.example.com/team/nginx --latest --variant alpine
 quayside image copy nginx registry.example.com/team/nginx --latest --match '*.*.*-alpine*.*-slim'
+quayside image copy postgres registry.example.com/team/postgres --latest --match '*.*-trixie'
 ```
 
 With `--latest`, the source must have no tag or digest. Versions allow an optional `v` prefix; aliases and prereleases are excluded by default. `--variant` matches an exact suffix. An explicit destination tag is preserved. Selection and tag resolution use the source registry; the transfer retains the resolved digest even if the tag changes. No matching version is an error.
 
-Use `--match` instead of `--variant` to match a full version tag. Each `*` matches one numeric component; other characters are literal. Versions are compared numerically, starting with the image's `x.y.z`, then wildcard components in order. For example, `'*.*.*-alpine*.*-slim'` tracks both nginx and Alpine updates while preserving tags such as `1.31.8-alpine3.24-slim`; it excludes the floating `alpine-slim` alias. Quote patterns to prevent shell expansion. The number of components is explicit: `alpine*.*` matches `alpine3.24`, while `alpine*.*.*` matches `alpine3.24.1`.
+The default version pattern is `*.*.*`. Use `--match` to specify the full tag format. Each `*` matches one numeric component. For example, `'*.*-trixie'` selects two-part PostgreSQL releases, and `'18.*-trixie'` stays on PostgreSQL 18. For nginx, `'*.*.*-alpine*.*-slim'` compares the nginx version first, then the Alpine version. Quote patterns to prevent shell expansion.
 
 For daily updates, add one command per task to your crontab (use the same user that logged in):
 
@@ -43,7 +44,7 @@ For daily updates, add one command per task to your crontab (use the same user t
 0 3 * * * /usr/local/bin/quayside image copy nginx registry.example.com/team/nginx --latest --no-progress >> /var/log/quayside-nginx.log 2>&1
 ```
 
-Use your installed binary path and a writable log path. Repeated runs skip existing content. New versions get new destination tags; replacing different content under an existing tag still requires `--overwrite`.
+Use your installed binary path and a writable log path. A verified copy with no remote writes reports `Up to date`. To follow a known tag such as `18-trixie`, specify it on both ends and add `--overwrite` to update the destination when the source changes. This skips tag discovery.
 
 Copy and pull select the local container platform by default: `linux/amd64` on Linux x86_64, or `linux/arm64` on Linux ARM64 and macOS Apple Silicon. The selected platform is displayed before transfer; a missing match is an error. Optional flags:
 

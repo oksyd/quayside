@@ -7,6 +7,7 @@ use crate::{
     layout,
     model::{Manifest, ManifestKind, OCI_INDEX},
     observer::Phase,
+    progress::Status,
     reference::{Reference, authority_name, registry_name, validate_repository},
     registry::Registry,
     transfer::{self, TransferStats},
@@ -17,7 +18,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{IsTerminal, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// Configure diagnostic verbosity and coordinate log output with terminal progress.
@@ -648,6 +652,17 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                 .await
             }
             .await;
+            if let Ok(data) = &result
+                && data.already_present
+                && !data.dry_run
+                && !ctx.changed.load(Ordering::SeqCst)
+            {
+                observer.finish(Status::UpToDate);
+                return Ok(Output::new(
+                    serde_json::to_value(data)?,
+                    format!("Up to date: {}", data.target_digest),
+                ));
+            }
             observer.complete(&result);
             let data = result?;
             let text = transfer_summary(

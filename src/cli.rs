@@ -206,7 +206,7 @@ pub enum TagCommand {
         /// Repository reference, optionally including a registry, without a tag or digest.
         repository: String,
     },
-    /// Print the full image reference with the highest x.y.z version (optional v prefix).
+    /// Print the full image reference with the highest matching version (default: x.y.z).
     Latest {
         /// Repository reference, optionally including a registry, without a tag or digest.
         repository: String,
@@ -323,7 +323,7 @@ pub enum ImageCommand {
         source: String,
         /// Fully qualified destination with a tag or digest; --latest can inherit the tag.
         destination: String,
-        /// Select the highest x.y.z version (optional v prefix); source must be a repository.
+        /// Select the highest matching version (default: x.y.z) from a source repository.
         #[arg(long)]
         latest: bool,
         /// Match an exact version suffix, such as alpine or bookworm-slim.

@@ -180,13 +180,24 @@ fn copy_preserves_attestations_and_registers_native_or_legacy_referrers() {
         let dst = format!("{}/app:v1", target.host);
         harness.json(&["image", "copy", "--all", &src, &dst, "--dry-run"], 0);
         assert!(state.lock().unwrap().puts.is_empty());
-        for _ in 0..2 {
-            let result = harness.json(&["image", "copy", "--all", &src, &dst], 0);
-            assert_eq!(result["data"]["target_digest"], image.digest);
-            assert_eq!(
-                result["data"]["platforms"],
-                json!(["linux/amd64", "linux/arm64"])
-            );
+        let args = ["image", "copy", "--all", &src, &dst];
+        for repeat in [false, true] {
+            if repeat {
+                state.lock().unwrap().puts.clear();
+                let output = harness.output(&args, 0);
+                assert!(output.stdout.starts_with(b"Copied: 0 blobs, skipped:"));
+                assert!(
+                    !state.lock().unwrap().puts.is_empty(),
+                    "attestations must be registered again"
+                );
+            } else {
+                let result = harness.json(&args, 0);
+                assert_eq!(result["data"]["target_digest"], image.digest);
+                assert_eq!(
+                    result["data"]["platforms"],
+                    json!(["linux/amd64", "linux/arm64"])
+                );
+            }
             let state = state.lock().unwrap();
             assert_eq!(state.manifests["v1"], image.manifest);
             for proof in &proofs {

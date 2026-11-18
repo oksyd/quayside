@@ -609,13 +609,30 @@ fn rejected_bearer_token_is_refreshed_and_retry_after_is_bounded() {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let server = Server::new(move |_| {
-        seen.fetch_add(1, Ordering::SeqCst);
-        Response::new(429, vec![]).header("Retry-After", "0")
+        let status = match seen.fetch_add(1, Ordering::SeqCst) {
+            0 => 429,
+            1 => 503,
+            _ => 408,
+        };
+        Response::new(status, vec![]).header("Retry-After", "0")
     });
     let mut harness = Harness::new(&[(&server.host, true)]);
-    harness.config.transfer.max_retries = 2;
-    harness.json(&["registry", "ping", &server.host], 6);
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    harness.config.transfer.max_retries = 3;
+    let output = harness.output(&["registry", "ping", &server.host, "--json"], 6);
+    let logs = String::from_utf8(output.stderr).unwrap();
+    for status in [
+        "429 Too Many Requests",
+        "503 Service Unavailable",
+        "408 Request Timeout",
+    ] {
+        assert!(
+            logs.contains(&format!(
+                "returned {status} (check registry), retrying in 0ms"
+            )),
+            "{logs}"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
 }
 
 #[test]

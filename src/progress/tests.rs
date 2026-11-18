@@ -349,6 +349,7 @@ fn colors_preserve_layout_and_reset_before_padding_at_every_terminal_size() {
         for status in [
             Status::Running,
             Status::Complete,
+            Status::UpToDate,
             Status::Failed,
             Status::Interrupted,
         ] {

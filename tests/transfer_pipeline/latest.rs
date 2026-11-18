@@ -136,14 +136,21 @@ fn latest_copy_tracks_image_and_base_versions_without_replacing_old_version_tags
 
 #[test]
 fn latest_copy_preserves_exact_version_prefixes_and_variant_suffixes_in_dry_runs() {
-    for (variant, expected) in [(None, "v2.10.0"), (Some("alpine"), "v2.10.1-alpine")] {
+    for (selector, expected) in [
+        (&[][..], "v2.10.0"),
+        (&["--variant", "alpine"], "v2.10.1-alpine"),
+        (&["--match", "*.*-trixie"], "18.10-trixie"),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let image = image_layout(root.path(), 1, 1024);
         let source = Server::new(move |request| {
             if request.path.contains("/tags/list") {
                 return Response::new(
                     200,
-                    br#"{"tags":["2.9.99","v2.10.0","2.10.0-alpine","v2.10.1-alpine","3.0.0-alpine3.22","3.0.0-rc.1"]}"#.to_vec(),
+                    br#"{"tags":[
+                        "2.9.99","v2.10.0","2.10.0-alpine","v2.10.1-alpine","3.0.0-alpine3.22","3.0.0-rc.1",
+                        "18.9-trixie","18.10-trixie","19-trixie","19.0.1-trixie","19.0-bookworm","19rc1-trixie"
+                    ]}"#.to_vec(),
                 );
             }
             if request.path.contains("/manifests/") {
@@ -159,9 +166,7 @@ fn latest_copy_preserves_exact_version_prefixes_and_variant_suffixes_in_dry_runs
         let src = format!("{}/app", source.host);
         let dst = format!("{}/app", target.host);
         let mut args = vec!["image", "copy", &src, &dst, "--latest", "--dry-run"];
-        if let Some(variant) = variant {
-            args.extend(["--variant", variant]);
-        }
+        args.extend_from_slice(selector);
         let result = harness.json(&args, 0);
         assert_eq!(result["data"]["source"], format!("{src}:{expected}"));
         assert_eq!(result["data"]["destination"], format!("{dst}:{expected}"));

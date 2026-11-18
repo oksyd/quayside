@@ -108,6 +108,9 @@ async fn latest_tag_patterns_compare_every_numeric_component_across_pages() {
                 "2.0.0-ubuntu24.4",
                 "2.0.0-ubuntu24.10",
                 "2.0.0-ubuntu22.99",
+                "v9-trixie",
+                "18-trixie",
+                "18",
             ]
         } else {
             assert!(request.path.ends_with("?page=2"));
@@ -134,6 +137,8 @@ async fn latest_tag_patterns_compare_every_numeric_component_across_pages() {
         ("v*.*.*-alpine*.*-slim", "v1.31.8-alpine3.24-slim"),
         ("1.31.8-alpine3.9-slim", "1.31.8-alpine3.9-slim"),
         ("*.*.*-ubuntu*.*", "2.0.0-ubuntu24.10"),
+        ("*", "18"),
+        ("*-trixie", "18-trixie"),
     ] {
         assert_eq!(
             registry.latest_matching_tag("app", pattern).await.unwrap(),

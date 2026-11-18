@@ -40,18 +40,32 @@ impl Registry {
         let pattern = variant.map_or_else(|| "*.*.*".to_owned(), |v| format!("*.*.*-{v}"));
         self.latest_matching_tag(repo, &pattern).await
     }
-    /// Find the highest complete release version matching a full tag pattern.
+    /// Find the highest numeric release version matching a full tag pattern.
     ///
     /// Each `*` matches one nonempty numeric component, without leading zeros.
     /// All other characters are literal. An unprefixed pattern also accepts `v`-prefixed
-    /// releases. The image's x.y.z version is compared first, then wildcard components
-    /// in pattern order; a plain version wins ties with a v-prefixed one.
-    /// The original tag is returned unchanged. Floating image aliases never match;
-    /// any suffix, including a prerelease suffix, must match the pattern explicitly.
+    /// releases. The pattern determines the number of release components, so
+    /// `*.*-trixie` accepts versions such as `18.7-trixie`. The numeric release
+    /// comes first, followed by wildcard components in pattern order. A plain
+    /// version wins ties with a v-prefixed one. The original tag is returned.
     pub async fn latest_matching_tag(&self, repo: &str, pattern: &str) -> Result<String> {
         if pattern.contains("**") || validate_tag(&pattern.replace('*', "0")).is_err() {
             return Err(Error::input(
                 "--match expects a tag pattern with separated numeric wildcards, such as *.*.*-alpine*.*-slim",
+            ));
+        }
+        let release = pattern.split('-').next().unwrap_or_default();
+        let release = release.strip_prefix('v').unwrap_or(release);
+        if !release.split('.').all(|part| {
+            // Use the smallest wildcard digits that permit a multi-digit component.
+            let mut sample = part.replace('*', "0");
+            if part.starts_with('*') && part.len() > 1 {
+                sample.replace_range(..1, "1");
+            }
+            version_number(&sample).is_some()
+        }) {
+            return Err(Error::input(
+                "--match requires a numeric release before the suffix (for example, 18.*-trixie or v*.*.*). To copy a named tag, specify it directly without --latest.",
             ));
         }
         let prefix = if pattern.starts_with('v') { "" } else { "v?" };
@@ -62,8 +76,8 @@ impl Registry {
             .await?
             .into_iter()
             .filter_map(|tag| {
-                let version = release_version(tag.split('-').next()?)?;
                 let captures = matcher.captures(&tag)?;
+                let version = release_version(tag.split('-').next()?)?;
                 let numbers = captures.iter().skip(1)
                     .map(|part| version_number(part?.as_str()))
                     .collect::<Option<Vec<_>>>()?;
@@ -200,13 +214,12 @@ impl Registry {
     }
 }
 
-fn release_version(tag: &str) -> Option<[u64; 3]> {
-    let mut parts = tag.strip_prefix('v').unwrap_or(tag).split('.');
-    let mut version = [0; 3];
-    for component in &mut version {
-        *component = version_number(parts.next()?)?;
-    }
-    parts.next().is_none().then_some(version)
+fn release_version(tag: &str) -> Option<Vec<u64>> {
+    tag.strip_prefix('v')
+        .unwrap_or(tag)
+        .split('.')
+        .map(version_number)
+        .collect()
 }
 
 fn version_number(part: &str) -> Option<u64> {

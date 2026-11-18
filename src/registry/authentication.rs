@@ -1,6 +1,7 @@
 use super::Registry;
 use super::transport::{
-    authority, client, limited_body, retry_delay, retryable_transport, same_origin, valid_url,
+    authority, client, limited_body, retry_delay, retryable_status, retryable_transport,
+    same_origin, valid_url, wait_for_http_retry,
 };
 use crate::auth::Credential;
 use crate::config::duration;
@@ -166,15 +167,9 @@ impl Registry {
                 );
             }
             match result {
-                Ok(r)
-                    if (r.status() == StatusCode::REQUEST_TIMEOUT
-                        || r.status() == StatusCode::TOO_MANY_REQUESTS
-                        || r.status().is_server_error())
-                        && attempt < max_retries =>
-                {
-                    let delay = retry_delay(Some(&r), attempt);
-                    drop(r);
-                    tokio::time::sleep(delay).await;
+                Ok(r) if attempt < max_retries && retryable_status(r.status()) => {
+                    wait_for_http_retry(r, attempt, &Method::GET, &url, "request registry token")
+                        .await;
                     attempt += 1;
                 }
                 Err(e) if retryable_transport(&e) && attempt < max_retries => {

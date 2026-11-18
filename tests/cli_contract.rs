@@ -302,6 +302,11 @@ fn latest_tag_patterns_reject_invalid_options_without_network_requests() {
             "*.*.*-alpine[0-9]",
             "*.*.*\n",
             "**.*.*",
+            "lts-jdk*",
+            "latest",
+            "v*..*",
+            "01.*-trixie",
+            "18446744073709551616.*",
         ] {
             let result = harness.json(&[&args[..], &[pattern]].concat(), 2);
             assert_eq!(result["error"]["code"], "INVALID_INPUT");

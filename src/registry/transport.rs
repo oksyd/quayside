@@ -200,6 +200,34 @@ pub(super) fn retry_delay(response: Option<&Response>, attempt: usize) -> Durati
     Duration::from_millis((250u64 << attempt.min(6)) + jitter)
 }
 
+pub(super) fn retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+    ) || status.is_server_error()
+}
+
+pub(super) async fn wait_for_http_retry(
+    response: Response,
+    attempt: usize,
+    method: &Method,
+    url: &Url,
+    operation: &str,
+) {
+    let delay = retry_delay(Some(&response), attempt);
+    diagnostics::log(
+        Level::Warn,
+        format_args!(
+            "HTTP {method} to {} returned {} ({operation}), retrying in {}ms",
+            authority(url),
+            response.status(),
+            delay.as_millis()
+        ),
+    );
+    drop(response);
+    tokio::time::sleep(delay).await;
+}
+
 impl Registry {
     pub(super) fn validate_content_url(&self, url: &Url) -> Result<()> {
         valid_url(url)?;
@@ -478,21 +506,9 @@ impl Registry {
             }
             if retry_safe
                 && retries < self.inner.config.transfer.max_retries
-                && (response.status() == StatusCode::TOO_MANY_REQUESTS
-                    || response.status() == StatusCode::REQUEST_TIMEOUT
-                    || response.status().is_server_error())
+                && retryable_status(response.status())
             {
-                let delay = retry_delay(Some(&response), retries);
-                drop(response);
-                diagnostics::log(
-                    Level::Warn,
-                    format_args!(
-                        "retrying HTTP {method} to {} after {}ms",
-                        authority(&url),
-                        delay.as_millis()
-                    ),
-                );
-                tokio::time::sleep(delay).await;
+                wait_for_http_retry(response, retries, &method, &url, operation).await;
                 retries += 1;
                 continue;
             }

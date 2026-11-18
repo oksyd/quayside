@@ -284,6 +284,7 @@ pub(super) fn frame(
     let spinner =
         SPINNERS[(now.saturating_duration_since(state.started).as_millis() / 100 % 10) as usize];
     let status = match state.status {
+        Status::UpToDate => "Up to date",
         Status::Complete if state.planning => "Planned",
         Status::Complete => match state.action {
             Phase::Pulling => "Pulled",
@@ -297,7 +298,7 @@ pub(super) fn frame(
     let (icon_style, status_style) = match state.status {
         Status::Running => (Style::new().cyan(), Style::new()),
         Status::Complete if state.planning => (Style::new().dim(), Style::new()),
-        Status::Complete => (Style::new().green(), Style::new()),
+        Status::Complete | Status::UpToDate => (Style::new().green(), Style::new()),
         Status::Failed => (Style::new().red(), Style::new().red()),
         Status::Interrupted => (Style::new().yellow(), Style::new().yellow()),
     };
@@ -313,7 +314,7 @@ pub(super) fn frame(
     let mut lines = vec![line(&heading, "", columns, false, &[])];
     let icon = match state.status {
         Status::Running => spinner,
-        Status::Complete => "✔",
+        Status::Complete | Status::UpToDate => "✔",
         Status::Failed => "✘",
         Status::Interrupted => "-",
     };

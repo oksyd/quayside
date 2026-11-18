@@ -91,15 +91,20 @@ fn source(image: support::Image) -> Server {
 fn copy_pull_and_push_color_terminal_icons_but_keep_stdout_plain() {
     let root = tempfile::tempdir().unwrap();
     let image = image_layout(root.path(), 1, 1024);
+    let digest = image.digest.clone();
     let local = image.directory.clone();
     let source = source(image);
     let target = destination(|_| true);
     let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
     let src = format!("{}/app:v1", source.host);
     let dst = format!("{}/app:v1", target.host);
+    let other_tag = format!("{}/app:v2", target.host);
     let export = harness.root.path().join("image");
     for (args, status) in [
         (vec!["image", "copy", &src, &dst], "Copied"),
+        (vec!["image", "copy", &src, &dst], "Up to date"),
+        (vec!["image", "copy", &src, &other_tag], "Copied"),
+        (vec!["image", "copy", &src, &dst, "--dry-run"], "Planned"),
         (
             vec![
                 "image",
@@ -119,8 +124,22 @@ fn copy_pull_and_push_color_terminal_icons_but_keep_stdout_plain() {
     ] {
         let (output, terminal) = tty(&harness, &args, &[]);
         assert!(output.status.success(), "{terminal}");
-        assert!(terminal.contains("\x1b[32m✔\x1b[0m"), "{terminal}");
+        let checkmark = if status == "Planned" {
+            "\x1b[2m✔\x1b[0m"
+        } else {
+            "\x1b[32m✔\x1b[0m"
+        };
+        assert!(terminal.contains(checkmark), "{terminal}");
         assert!(terminal.contains(status), "{terminal}");
+        let stdout = std::str::from_utf8(&output.stdout).unwrap();
+        if status == "Up to date" {
+            assert_eq!(stdout.trim_end(), format!("Up to date: {digest}"));
+        } else if args.contains(&other_tag.as_str()) {
+            assert_eq!(
+                stdout.trim_end(),
+                format!("Copied: 0 blobs, skipped: 2\nCompleted: {digest}")
+            );
+        }
         assert!(terminal.contains("\x1b[33mWarn\x1b[0m:"), "{terminal}");
         assert!(!output.stdout.contains(&b'\x1b'));
     }

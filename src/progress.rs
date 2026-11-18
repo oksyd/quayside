@@ -28,9 +28,10 @@ pub(crate) fn suspend(write: impl FnOnce()) {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Status {
+pub(crate) enum Status {
     Running,
     Complete,
+    UpToDate,
     Failed,
     Interrupted,
 }
@@ -239,12 +240,15 @@ impl TerminalObserver {
         self
     }
     pub(crate) fn complete<T>(&self, result: &Result<T>) {
+        self.finish(match result {
+            Ok(_) => Status::Complete,
+            Err(error) if error.code == Code::Interrupted => Status::Interrupted,
+            Err(_) => Status::Failed,
+        });
+    }
+    pub(crate) fn finish(&self, status: Status) {
         if let Some(display) = &self.display {
-            display.finish(match result {
-                Ok(_) => Status::Complete,
-                Err(error) if error.code == Code::Interrupted => Status::Interrupted,
-                Err(_) => Status::Failed,
-            });
+            display.finish(status);
             self.detach();
         }
     }
