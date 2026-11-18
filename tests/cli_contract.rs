@@ -187,15 +187,15 @@ fn latest_tag_prints_a_copyable_reference_and_reports_missing_versions() {
     let server = Server::new(|request| {
         assert_eq!(request.method, "GET");
         let tags = match request.path.as_str() {
-            "/v2/app/tags/list?n=100" => vec![
+            "/v2/app/tags/list?n=1000" => vec![
                 "1.9.0",
                 "1.10.0",
                 "1.10.0-alpine",
                 "1.10.0-alpine3.9-slim",
                 "1.10.0-alpine3.24-slim",
             ],
-            "/v2/aliases/tags/list?n=100" => vec!["latest", "stable", "2", "2.1", "3.0.0-rc.1"],
-            "/v2/empty/tags/list?n=100" => vec![],
+            "/v2/aliases/tags/list?n=1000" => vec!["latest", "stable", "2", "2.1", "3.0.0-rc.1"],
+            "/v2/empty/tags/list?n=1000" => vec![],
             _ => panic!("unexpected request: {}", request.path),
         };
         Response::new(

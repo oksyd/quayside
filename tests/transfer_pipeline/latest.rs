@@ -20,7 +20,7 @@ fn latest_copy_inherits_versions_and_repeated_runs_skip_existing_content() {
     let version = Arc::new(AtomicUsize::new(9));
     let current = version.clone();
     let source = Server::new(move |request| {
-        if request.path == "/v2/app/tags/list?n=100" {
+        if request.path == "/v2/app/tags/list?n=1000" {
             Response::new(
                 200,
                 serde_json::to_vec(&json!({"tags": [
@@ -320,7 +320,7 @@ fn latest_copy_resolves_once_at_the_origin_and_downloads_pinned_content_from_mir
             .strip_prefix("http://registry-1.docker.io/v2/library/nginx/")
             .unwrap();
         match path {
-            "tags/list?n=100" => Response::new(200, br#"{"tags":["2.9.0"]}"#.to_vec()).header(
+            "tags/list?n=1000" => Response::new(200, br#"{"tags":["2.9.0"]}"#.to_vec()).header(
                 "Link",
                 "</v2/library/nginx/tags/list?last=2.9.0>; rel=\"next\"",
             ),

@@ -45,7 +45,7 @@ async fn latest_tags_compare_complete_versions_across_all_pages_and_exact_varian
     let server = Server::new(|request| {
         assert_eq!(request.method, "GET");
         match request.path.as_str() {
-            "/v2/team/image/tags/list?n=100" => Response::new(
+            "/v2/team/image/tags/list?n=1000" => Response::new(
                 200,
                 serde_json::to_vec(&serde_json::json!({"tags": [
                     "latest", "stable", "9.99.99", "10.0.99", "10.1.9", "v10.1.10",
@@ -90,7 +90,7 @@ async fn latest_tags_compare_complete_versions_across_all_pages_and_exact_varian
 async fn latest_tag_patterns_compare_every_numeric_component_across_pages() {
     let server = Server::new(|request| {
         assert_eq!(request.method, "GET");
-        let tags = if request.path.ends_with("?n=100") {
+        let tags = if request.path.ends_with("?n=1000") {
             vec![
                 "1.31.8-alpine3.9-slim",
                 "1.31.8-alpine3.23-slim",
@@ -121,7 +121,7 @@ async fn latest_tag_patterns_compare_every_numeric_component_across_pages() {
             200,
             serde_json::to_vec(&serde_json::json!({"tags":tags})).unwrap(),
         );
-        if request.path.ends_with("?n=100") {
+        if request.path.ends_with("?n=1000") {
             response.header("Link", "</v2/app/tags/list?page=2>; rel=\"next\"")
         } else {
             response
@@ -151,6 +151,65 @@ async fn latest_tag_patterns_compare_every_numeric_component_across_pages() {
         );
     }
     assert!(!changed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn tag_listing_uses_the_negotiated_size_for_pages_without_links() {
+    for rejection in [None, Some(400), Some(422)] {
+        let size = if rejection.is_some() { 100 } else { 1000 };
+        let server = Server::new(move |request| {
+            if let Some(status) = rejection
+                && request.path == "/v2/app/tags/list?n=1000"
+            {
+                return Response::new(status, vec![]);
+            }
+            let tags = if request.path == format!("/v2/app/tags/list?n={size}") {
+                (0..size).map(|i| format!("1.0.{i:03}")).collect::<Vec<_>>()
+            } else {
+                assert_eq!(
+                    request.path,
+                    format!("/v2/app/tags/list?n={size}&last=1.0.{:03}", size - 1)
+                );
+                vec!["2.0.0".into()]
+            };
+            Response::new(
+                200,
+                serde_json::to_vec(&serde_json::json!({"tags": tags})).unwrap(),
+            )
+        });
+        let (registry, _) = client(&server);
+        let tags = registry.list_tags("app").await.unwrap();
+        assert_eq!(tags.len(), size + 1);
+        assert_eq!(tags.last().unwrap(), "2.0.0");
+        assert_eq!(
+            server.connections.load(Ordering::SeqCst),
+            2 + usize::from(rejection.is_some())
+        );
+    }
+}
+
+#[tokio::test]
+async fn tag_listing_does_not_change_page_size_on_throttling_or_restart_a_cursor() {
+    for (status, cursor, expected_code) in
+        [(429, false, Code::Network), (400, true, Code::Execution)]
+    {
+        let server = Server::new(move |request| match request.path.as_str() {
+            "/v2/app/tags/list?n=1000" if cursor => {
+                Response::new(200, br#"{"tags":["one"]}"#.to_vec())
+                    .header("Link", "</v2/app/tags/list?cursor=opaque>; rel=\"next\"")
+            }
+            "/v2/app/tags/list?n=1000" | "/v2/app/tags/list?cursor=opaque" => {
+                Response::new(status, vec![])
+            }
+            _ => panic!("unexpected request: {}", request.path),
+        });
+        let (registry, _) = client(&server);
+        rejected(registry.list_tags("app").await, expected_code);
+        assert_eq!(
+            server.connections.load(Ordering::SeqCst),
+            1 + usize::from(cursor)
+        );
+    }
 }
 
 #[tokio::test]

@@ -9,6 +9,9 @@ use http::{Method, StatusCode};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+const TAG_PAGE_SIZE: usize = 1000;
+const SMALL_PAGE_SIZE: usize = 100;
+
 impl Registry {
     /// Fetch the repository's tag pages under the configured metadata and object limits.
     pub async fn list_tags(&self, repo: &str) -> Result<Vec<String>> {
@@ -17,6 +20,7 @@ impl Registry {
             &format!("v2/{repo}/tags/list"),
             "tags",
             &Self::scope(repo, "pull"),
+            TAG_PAGE_SIZE,
             validate_tag,
         )
         .await
@@ -83,6 +87,7 @@ impl Registry {
             "v2/_catalog",
             "repositories",
             "registry:catalog:*",
+            SMALL_PAGE_SIZE,
             validate_repository,
         )
         .await
@@ -92,17 +97,25 @@ impl Registry {
         path: &str,
         field: &str,
         scope: &str,
+        mut page_size: usize,
         validate: fn(&str) -> Result<()>,
     ) -> Result<Vec<String>> {
         let base = self.url(path)?;
-        let mut next = base.clone();
-        next.query_pairs_mut().append_pair("n", "100");
+        let page_url = |size: usize, last: Option<&str>| {
+            let mut url = base.clone();
+            url.query_pairs_mut().append_pair("n", &size.to_string());
+            if let Some(last) = last {
+                url.query_pairs_mut().append_pair("last", last);
+            }
+            url
+        };
+        let mut next = page_url(page_size, None);
         let mut visited = BTreeSet::new();
         let mut values = BTreeSet::new();
         let page_limit = parse_size(&self.config().transfer.max_manifest_size)?;
         let metadata_limit = parse_size(&self.config().transfer.max_metadata_size)?;
         let mut bytes = 0;
-        for _ in 0..1000 {
+        for page in 0..1000 {
             if bytes == metadata_limit {
                 return Err(Error::input("registry listing exceeds metadata limit"));
             }
@@ -120,6 +133,19 @@ impl Registry {
                     true,
                 )
                 .await?;
+            // The initial request has only one query parameter. Some registries reject a
+            // large n instead of returning a smaller page with a continuation link.
+            if page == 0
+                && page_size > SMALL_PAGE_SIZE
+                && matches!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+                )
+            {
+                page_size = SMALL_PAGE_SIZE;
+                next = page_url(page_size, None);
+                continue;
+            }
             if response.status() != StatusCode::OK {
                 return Err(http_error(&response));
             }
@@ -161,14 +187,11 @@ impl Registry {
                     return Err(Error::input("unsafe registry pagination URL"));
                 }
                 next = url;
-            } else if count >= 100 {
+            } else if count >= page_size {
                 if values.len() == previous {
                     return Err(Error::input("registry ignored pagination parameters"));
                 }
-                next = base.clone();
-                next.query_pairs_mut()
-                    .append_pair("n", "100")
-                    .append_pair("last", last.as_deref().unwrap_or(""));
+                next = page_url(page_size, last.as_deref());
             } else {
                 return Ok(values.into_iter().collect());
             }
