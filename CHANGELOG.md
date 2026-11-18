@@ -1,4 +1,13 @@
+## [0.1.19] - 2026-11-18
+
+### 🐛 Bug Fixes
+
+- Honor numeric tag patterns and report unchanged copies and retries
 ## [0.1.18] - 2026-11-18
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.18
 
 ### 💼 Other
 
