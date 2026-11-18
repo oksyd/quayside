@@ -1,8 +1,17 @@
+## [0.1.18] - 2026-11-18
+
+### 💼 Other
+
+- Fetch up to 1000 registry tags per page
 ## [0.1.17] - 2026-11-17
 
 ### 🚀 Features
 
 - Support numeric tag patterns for latest image selection
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.17
 ## [0.1.16] - 2026-11-16
 
 ### 🚀 Features
