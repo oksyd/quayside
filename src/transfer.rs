@@ -727,9 +727,33 @@ pub async fn copy_with_options(
 ) -> Result<CopyResult> {
     let resolving = observer.begin(crate::observer::Phase::Resolving, 0);
     let resolved = associated::selected(source, source_ref, selection, options).await?;
+    drop(resolving);
+    copy_resolved(
+        source,
+        source_ref,
+        target,
+        destination,
+        resolved,
+        write,
+        options,
+        observer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn copy_resolved(
+    source: &Registry,
+    source_ref: &Reference,
+    target: &Registry,
+    destination: &Reference,
+    resolved: Resolved,
+    write: &WriteOptions,
+    options: &crate::options::TransferOptions,
+    observer: &dyn crate::observer::Observer,
+) -> Result<CopyResult> {
     observer.selected_platforms(&resolved.platforms);
     resolved.manifest.check_transfer_supported()?;
-    drop(resolving);
     let checking = observer.begin(crate::observer::Phase::CheckingDestination, 0);
     let already_present =
         check_destination(target, destination, &resolved.manifest, write.overwrite).await?;

@@ -1,7 +1,7 @@
 use clap::Parser;
 use quayside::{
     Error,
-    app::{self, Context, Output},
+    app::{self, Context, Outcome, Output},
     cli::Cli,
     error::Code,
 };
@@ -11,13 +11,18 @@ use std::{
     sync::atomic::Ordering,
 };
 
-fn emit(output: Output, command: &str, json_mode: bool, warnings: &[String]) -> io::Result<()> {
+fn emit(output: Output, command: &str, json_mode: bool, warnings: &[String]) -> io::Result<i32> {
+    let (status, error, exit) = match &output.outcome {
+        Outcome::Success => ("success", None, 0),
+        Outcome::Failed(error) => ("error", Some(error), error.exit_code()),
+        Outcome::Partial(error) => ("partial", Some(error), 9),
+    };
     let mut stdout = io::stdout().lock();
     if json_mode {
         serde_json::to_writer(
             &mut stdout,
-            &json!({"schema_version":1,"command":command,"status":"success",
-            "data":output.data,"warnings":warnings,"error":null}),
+            &json!({"schema_version":1,"command":command,"status":status,
+            "data":output.data,"warnings":warnings,"error":error}),
         )
         .map_err(io::Error::other)?;
         writeln!(stdout)?;
@@ -35,7 +40,7 @@ fn emit(output: Output, command: &str, json_mode: bool, warnings: &[String]) -> 
             );
         }
     }
-    Ok(())
+    Ok(exit)
 }
 fn emit_error(
     error: &Error,
@@ -145,7 +150,7 @@ async fn main() {
     let warnings = ctx.warnings();
     let exit = match result {
         Ok(output) => match emit(output, label, cli.json, &warnings) {
-            Ok(()) => 0,
+            Ok(code) => code,
             Err(e) if e.kind() == io::ErrorKind::BrokenPipe => 0,
             Err(e) => emit_error(
                 &e.into(),

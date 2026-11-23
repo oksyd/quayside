@@ -78,6 +78,14 @@ pub enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Copy the images in a TOML sync file, in order.
+    Sync {
+        /// TOML file with one sync table per source and destination.
+        file: PathBuf,
+        /// Select os/architecture[/variant], overriding the file's platform.
+        #[arg(long)]
+        platform: Option<String>,
+    },
     /// Retrieve raw or structured manifest content.
     Manifest {
         /// Operation to execute within this command group.
@@ -318,19 +326,22 @@ pub enum ImageCommand {
         platform: Option<String>,
     },
     /// Copy the selected dependency graph between registry references.
+    #[command(
+        after_help = "Example\n  quayside image copy postgres registry.example.com/team/postgres --match '18.*-trixie'\n\nIf 18.7-trixie is selected, the destination is registry.example.com/team/postgres:18.7-trixie."
+    )]
     Copy {
         /// Source image reference; unqualified names default to Docker Hub.
         source: String,
-        /// Fully qualified destination with a tag or digest; --latest can inherit the tag.
+        /// Fully qualified destination. Omit the tag to inherit it with --latest, --variant or --match.
         destination: String,
         /// Select the highest matching version (default: x.y.z) from a source repository.
         #[arg(long)]
         latest: bool,
-        /// Match an exact version suffix, such as alpine or bookworm-slim.
-        #[arg(long, requires = "latest")]
+        /// Select the highest x.y.z version with this exact suffix, such as alpine.
+        #[arg(long)]
         variant: Option<String>,
-        /// Match a full tag pattern; each * matches one numeric component (quote the pattern).
-        #[arg(long = "match", requires = "latest", conflicts_with = "variant")]
+        /// Select the highest matching version. Quote the pattern. Each * matches one numeric component.
+        #[arg(long = "match", conflicts_with = "variant")]
         pattern: Option<String>,
         /// Platform selection options.
         #[command(flatten)]
@@ -443,6 +454,7 @@ impl Command {
                 ImageCommand::Push { .. } => "image push",
                 ImageCommand::Tag { .. } => "image tag",
             },
+            Self::Sync { .. } => "sync",
             Self::Manifest { .. } => "manifest get",
             Self::Index { .. } => "index create",
             Self::Version => "version",

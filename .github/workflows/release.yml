@@ -115,7 +115,7 @@ jobs:
           name="quayside-$VERSION-$ASSET"
           mkdir -p "dist/$name"
           install -m 755 "target/$TARGET/release/quayside" "dist/$name/quayside"
-          install -m 644 LICENSE README.md config.example.toml "dist/$name/"
+          install -m 644 LICENSE README.md config.example.toml sync.example.toml "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -169,7 +169,7 @@ jobs:
 
           Linux binaries use static musl; macOS binaries use system libraries.
           Each archive contains quayside, LICENSE (Apache-2.0), README.md,
-          and config.example.toml inside a directory matching its archive name.
+          config.example.toml, and sync.example.toml inside a directory matching its archive name.
           Verify downloaded archives with: sha256sum --check --ignore-missing SHA256SUMS
           EOF_NOTES
           flags=()

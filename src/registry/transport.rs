@@ -10,19 +10,19 @@ use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, StatusCode};
 use reqx::prelude::{RedirectPolicy, RetryPolicy, StatusPolicy, TlsRootStore};
 use reqx::{Client, ResponseStream as Response, TransportErrorKind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-struct PendingWrite<'a>(Option<&'a AtomicBool>);
+struct PendingWrite<'a>(Option<&'a Registry>);
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 impl Drop for PendingWrite<'_> {
     fn drop(&mut self) {
-        if let Some(changed) = self.0 {
-            changed.store(true, Ordering::SeqCst);
+        if let Some(registry) = self.0 {
+            registry.record_write();
         }
     }
 }
@@ -359,7 +359,7 @@ impl Registry {
             let mutation = method != Method::GET && method != Method::HEAD;
             // Cancellation before the response arrives leaves a write's outcome uncertain.
             // Completed requests retain the precise status/connect-error handling below.
-            let mut pending = PendingWrite(mutation.then_some(self.inner.changed.as_ref()));
+            let mut pending = PendingWrite(mutation.then_some(self));
             let response = request.send_stream().await;
             pending.0 = None;
             let response = match response {
@@ -370,7 +370,7 @@ impl Registry {
                         && retryable_transport(&e) =>
                 {
                     if mutation && !is_connect(&e) {
-                        self.inner.changed.store(true, Ordering::SeqCst);
+                        self.record_write();
                     }
                     tokio::time::sleep(retry_delay(None, retries)).await;
                     retries += 1;
@@ -378,7 +378,7 @@ impl Registry {
                 }
                 Err(e) => {
                     if mutation && !is_connect(&e) {
-                        self.inner.changed.store(true, Ordering::SeqCst);
+                        self.record_write();
                     }
                     return Err(http.failure(e, &url));
                 }
@@ -395,7 +395,7 @@ impl Registry {
             // 401/403 rejection alone is not a partial write. Success, a server error or
             // a lost write response can mean remote state was already changed.
             if mutation && (response.status().is_success() || response.status().is_server_error()) {
-                self.inner.changed.store(true, Ordering::SeqCst);
+                self.record_write();
             }
             if response.status() == StatusCode::UNAUTHORIZED && local && refreshes < 2 {
                 let refresh_lock = self.auth_refresh_lock(scope).await;

@@ -137,9 +137,10 @@ fn latest_copy_tracks_image_and_base_versions_without_replacing_old_version_tags
 #[test]
 fn latest_copy_preserves_exact_version_prefixes_and_variant_suffixes_in_dry_runs() {
     for (selector, expected) in [
-        (&[][..], "v2.10.0"),
+        (&["--latest"][..], "v2.10.0"),
         (&["--variant", "alpine"], "v2.10.1-alpine"),
-        (&["--match", "*.*-trixie"], "18.10-trixie"),
+        (&["--latest", "--variant", "alpine"], "v2.10.1-alpine"),
+        (&["--match", "18.*-trixie"], "18.10-trixie"),
     ] {
         let root = tempfile::tempdir().unwrap();
         let image = image_layout(root.path(), 1, 1024);
@@ -165,7 +166,7 @@ fn latest_copy_preserves_exact_version_prefixes_and_variant_suffixes_in_dry_runs
         let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
         let src = format!("{}/app", source.host);
         let dst = format!("{}/app", target.host);
-        let mut args = vec!["image", "copy", &src, &dst, "--latest", "--dry-run"];
+        let mut args = vec!["image", "copy", &src, &dst, "--dry-run"];
         args.extend_from_slice(selector);
         let result = harness.json(&args, 0);
         assert_eq!(result["data"]["source"], format!("{src}:{expected}"));
@@ -238,9 +239,23 @@ fn latest_copy_rejects_invalid_inputs_before_network_requests() {
     let tagged = format!("{repo}:latest");
     let pinned = format!("{repo}@{}", Digest::sha256(b"manifest"));
     for source in [&tagged, &pinned] {
-        let result = harness.json(&["image", "copy", source, &repo, "--latest"], 2);
-        assert_eq!(result["error"]["code"], "INVALID_INPUT");
-        assert_eq!(result["data"]["remote_writes_may_have_occurred"], false);
+        for selector in [
+            &["--latest"][..],
+            &["--variant", "alpine"],
+            &["--match", "*.*"],
+        ] {
+            let mut args = vec!["image", "copy", source.as_str(), &repo];
+            args.extend_from_slice(selector);
+            let result = harness.json(&args, 2);
+            assert_eq!(result["error"]["code"], "INVALID_INPUT");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("without tag or digest")
+            );
+            assert_eq!(result["data"]["remote_writes_may_have_occurred"], false);
+        }
     }
     for variant in ["", "bad/suffix", "bad suffix"] {
         let result = harness.json(
@@ -264,12 +279,6 @@ fn latest_copy_rejects_invalid_inputs_before_network_requests() {
     }
     harness.json(&["image", "copy", &tagged, &repo], 2);
     harness.json(&["image", "copy", &repo, "nginx", "--latest"], 2);
-    let output = harness.output(&["image", "copy", &repo, &tagged, "--variant", "alpine"], 2);
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("--latest")
-    );
     assert_eq!(server.connections.load(Ordering::SeqCst), 0);
 }
 
@@ -369,7 +378,8 @@ fn latest_copy_resolves_once_at_the_origin_and_downloads_pinned_content_from_mir
             "copy",
             "nginx",
             &format!("{}/app", target.host),
-            "--latest",
+            "--match",
+            "*.*.*",
             "--all",
         ],
         0,

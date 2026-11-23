@@ -1,3 +1,5 @@
+mod sync;
+
 use crate::{
     Error, Result,
     auth::{AuthFile, Credential},
@@ -53,6 +55,7 @@ pub struct Context {
     pub key_path: PathBuf,
     /// Tracks whether remote writes may have occurred, including uncertain responses.
     pub changed: Arc<AtomicBool>,
+    json: bool,
     registries: Mutex<BTreeMap<String, Registry>>,
     warnings: Mutex<BTreeSet<String>>,
     /// Whether this invocation may display interactive terminal progress.
@@ -82,6 +85,7 @@ impl Context {
             config_path,
             auth_path,
             key_path,
+            json: cli.json,
             registries: Mutex::new(BTreeMap::new()),
             changed: Arc::new(AtomicBool::new(false)),
             warnings: Mutex::new(BTreeSet::new()),
@@ -199,8 +203,20 @@ impl Context {
     }
 }
 
+/// Completion state of a command that returns structured results.
+pub enum Outcome {
+    /// Every requested operation completed.
+    Success,
+    /// Every operation failed before writing remote content.
+    Failed(Error),
+    /// Some operations completed or a failed operation may have written remote content.
+    Partial(Error),
+}
+
 /// Presentation payload consumed by the CLI's final output writer.
 pub struct Output {
+    /// Overall completion state for the exit code and JSON envelope.
+    pub outcome: Outcome,
     /// Structured command data used in the JSON result envelope.
     pub data: Value,
     /// Human-readable result text for non-JSON output.
@@ -215,6 +231,7 @@ impl Output {
             data,
             text: text.into(),
             raw: None,
+            outcome: Outcome::Success,
         }
     }
     /// Create output whose text form is a pretty-printed version of its JSON data.
@@ -446,12 +463,14 @@ pub async fn run(ctx: &Context, command: &Command) -> Result<Output> {
                     data: Value::Null,
                     text: String::new(),
                     raw: Some(m.raw.to_vec()),
+                    outcome: Outcome::Success,
                 })
             } else {
                 Output::structured(m.value)
             }
         }
         Command::Image { command } => image(ctx, command).await,
+        Command::Sync { file, platform } => sync::run(ctx, file, platform.as_deref()).await,
         Command::Index {
             command:
                 IndexCommand::Create {
@@ -584,18 +603,16 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
         } => {
             let mut src = Reference::parse_source(source)?;
             let mut dst: Reference = destination.parse()?;
-            if *latest {
+            let select_version = *latest || variant.is_some() || pattern.is_some();
+            if select_version {
                 src.require_repository()?;
             } else {
                 dst.require_destination()?;
-                if variant.is_some() || pattern.is_some() {
-                    return Err(Error::input("--variant and --match require --latest"));
-                }
             }
             let selection = selection.try_into()?;
             let mirrors = if transfer.no_mirrors {
                 MirrorPolicy::Disabled
-            } else if *latest {
+            } else if select_version {
                 MirrorPolicy::ContentOnly
             } else {
                 MirrorPolicy::TagsAndContent
@@ -604,7 +621,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             let target = ctx.registry(&dst.registry)?;
             let observer = crate::progress::TerminalObserver::new(
                 ctx.progress,
-                if *latest {
+                if select_version {
                     src.repository_ref()
                 } else {
                     src.to_string()
@@ -613,7 +630,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
             )
             .with_platform_notice(ctx.notices);
             let result = async {
-                if *latest {
+                if select_version {
                     src.selector = latest_tag(
                         &source,
                         &src.repository,

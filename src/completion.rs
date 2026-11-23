@@ -71,6 +71,7 @@ pub fn run(options: &Completion) -> Result<Output> {
             data: json!({"shell":shell.to_string(),"script":text}),
             text: String::new(),
             raw: Some(bytes),
+            outcome: crate::app::Outcome::Success,
         });
     };
     let (CompletionCommand::Install(target)

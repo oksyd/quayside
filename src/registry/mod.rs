@@ -9,6 +9,7 @@ use crate::reference::{Reference, registry_name, validate_repository, validate_t
 use crate::{Error, Result};
 #[cfg(test)]
 use blobs::range_offset;
+pub(crate) use catalog::TagPattern;
 #[cfg(test)]
 use catalog::next_link;
 use http::header::HeaderMap;
@@ -25,6 +26,7 @@ use url::Url;
 pub struct Registry {
     inner: Arc<Inner>,
     mirrors: Option<Arc<mirrors::Mirrors>>,
+    job_writes: Option<Arc<AtomicBool>>,
 }
 struct Inner {
     name: String,
@@ -86,6 +88,7 @@ impl Registry {
         ))?;
         Ok(Self {
             mirrors: None,
+            job_writes: None,
             inner: Arc::new(Inner {
                 client: client(&base, &config, &policy)?,
                 content_clients: Mutex::new(BTreeMap::new()),
@@ -102,6 +105,17 @@ impl Registry {
                 changed,
             }),
         })
+    }
+    pub(crate) fn track_job_writes(mut self, changed: Arc<AtomicBool>) -> Self {
+        self.job_writes = Some(changed);
+        self
+    }
+    fn record_write(&self) {
+        use std::sync::atomic::Ordering;
+        self.inner.changed.store(true, Ordering::SeqCst);
+        if let Some(changed) = &self.job_writes {
+            changed.store(true, Ordering::SeqCst);
+        }
     }
     /// Return the logical registry name used for configuration and credential lookup.
     pub fn name(&self) -> &str {

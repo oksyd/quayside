@@ -40,7 +40,7 @@ pub enum Code {
 }
 
 /// A sanitized error category and user-facing message.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Error {
     /// Stable error classification for programmatic handling.
     pub code: Code,

@@ -48,6 +48,7 @@ jobs:
           cargo doc --locked --no-deps --all-features
           cargo package --locked --list > "$RUNNER_TEMP/package-files.txt"
           grep -Fx config.example.toml "$RUNNER_TEMP/package-files.txt"
+          grep -Fx sync.example.toml "$RUNNER_TEMP/package-files.txt"
       - name: Test
         run: cargo test --locked --all-features
 

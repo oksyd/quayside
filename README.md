@@ -29,22 +29,14 @@ Copy the highest matching version and keep its exact tag at the destination:
 
 ```bash
 quayside image copy nginx registry.example.com/team/nginx --latest
-quayside image copy nginx registry.example.com/team/nginx --latest --variant alpine
-quayside image copy nginx registry.example.com/team/nginx --latest --match '*.*.*-alpine*.*-slim'
-quayside image copy postgres registry.example.com/team/postgres --latest --match '*.*-trixie'
+quayside image copy nginx registry.example.com/team/nginx --variant alpine
+quayside image copy nginx registry.example.com/team/nginx --match '*.*.*-alpine*.*-slim'
+quayside image copy postgres registry.example.com/team/postgres --match '18.*-trixie'
 ```
 
-With `--latest`, the source must have no tag or digest. Versions allow an optional `v` prefix; aliases and prereleases are excluded by default. `--variant` matches an exact suffix. An explicit destination tag is preserved. Selection and tag resolution use the source registry; the transfer retains the resolved digest even if the tag changes. No matching version is an error.
+Use a source repository without a tag or digest when selecting a version. `--variant` and `--match` each imply `--latest`. Versions allow an optional `v` prefix. Aliases and prereleases are excluded by default. `--variant` matches an exact suffix. An explicit destination tag is preserved. Selection and tag resolution use the source registry, and the transfer retains the resolved digest even if the tag changes. No matching version is an error.
 
 The default version pattern is `*.*.*`. Use `--match` to specify the full tag format. Each `*` matches one numeric component. For example, `'*.*-trixie'` selects two-part PostgreSQL releases, and `'18.*-trixie'` stays on PostgreSQL 18. For nginx, `'*.*.*-alpine*.*-slim'` compares the nginx version first, then the Alpine version. Quote patterns to prevent shell expansion.
-
-For daily updates, add one command per task to your crontab (use the same user that logged in):
-
-```cron
-0 3 * * * /usr/local/bin/quayside image copy nginx registry.example.com/team/nginx --latest --no-progress >> /var/log/quayside-nginx.log 2>&1
-```
-
-Use your installed binary path and a writable log path. A verified copy with no remote writes reports `Up to date`. To follow a known tag such as `18-trixie`, specify it on both ends and add `--overwrite` to update the destination when the source changes. This skips tag discovery.
 
 Copy and pull select the local container platform by default: `linux/amd64` on Linux x86_64, or `linux/arm64` on Linux ARM64 and macOS Apple Silicon. The selected platform is displayed before transfer; a missing match is an error. Optional flags:
 
@@ -65,6 +57,26 @@ If the destination rejects build attestations, use the default platform or `--pl
 `image copy` automatically reuses matching blobs from Docker's current context when available.
 Quayside does not maintain a persistent image cache. Destination blobs are checked first and skipped when already present. Docker reuse requires blobs matching the source's original digest and size; unavailable or incompatible content is downloaded from the registry. Temporary transfer files are removed afterward; digests and platform selection are preserved.
 Cache preparation has a two-second budget before falling back to downloads. Set `transfer.docker_cache_timeout` to adjust it, or `"0s"` to disable reuse.
+
+## Sync multiple images
+
+Copy the example to `sync.toml` and edit each destination for your registry. [sync.example.toml](sync.example.toml)
+
+```bash
+quayside sync sync.toml
+```
+
+Each `[[sync]]` block has a `from` source and a `to` destination. A numeric tag pattern selects the highest matching version. A literal tag such as `lts-jdk25` skips tag discovery. A destination without a tag inherits the source tag. Set `overwrite = true` on a job to update that tag when its content changes.
+
+The optional top-level `platform` defaults to the local container platform. Override it with `--platform linux/amd64`.
+
+Jobs run in file order. Each prints `Copied`, `Up to date`, or `Failed` with its source and destination. If a job fails, the remaining jobs still run and the command exits nonzero. Use `--json` for structured results.
+
+To run daily, add one entry to the crontab of the user who logged in to the registries. Use the installed binary path and a writable log path.
+
+```cron
+0 3 * * * /usr/local/bin/quayside sync /etc/quayside/sync.toml >> /var/log/quayside-sync.log 2>&1
+```
 
 ## Inspect images
 
@@ -150,7 +162,7 @@ Docker `daemon.json` proxy settings are used as defaults when environment variab
 
 For Docker Hub sources, `image copy` and `image pull` also use that file's `registry-mirrors` in order, then Docker Hub. Each mirror is announced once on stderr with its configuration source. Missing content, denied access and network failures try the next source; certificate, content-integrity and configuration errors stop the operation. Quiet and JSON modes suppress these notices.
 
-Configured mirrors are trusted to resolve tags and may serve older content. `image copy --latest` resolves tags at the origin and uses mirrors only for content identified by digest; use `--no-mirrors` to bypass mirrors entirely. Tag queries, inspection, referrer discovery and destination writes always use their original registries. Downloads retain digest verification and resume support; mirror credentials are isolated from Docker Hub credentials. Mirror URLs must be HTTP(S) origins without paths or embedded credentials; an explicit HTTP URL uses unencrypted transport. Other Docker settings, including `insecure-registries`, remain ignored.
+Configured mirrors are trusted to resolve tags and may serve older content. When selecting a version with `--latest`, `--variant` or `--match`, `image copy` resolves tags at the origin and uses mirrors only for content identified by digest. Use `--no-mirrors` to bypass mirrors entirely. Tag queries, inspection, referrer discovery and destination writes always use their original registries. Downloads retain digest verification and resume support; mirror credentials are isolated from Docker Hub credentials. Mirror URLs must be HTTP(S) origins without paths or embedded credentials; an explicit HTTP URL uses unencrypted transport. Other Docker settings, including `insecure-registries`, remain ignored.
 
 Delegated uploads and missing blobs advertised through descriptor URLs support HTTPS content hosts. Registry credentials stay on the registry origin. Private content hosts can use their own `ca_file`; HTTP delegation requires both the registry and the content host to be explicitly configured with `plain_http`. HTTPS transfers never downgrade to HTTP.
 

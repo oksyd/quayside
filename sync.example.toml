@@ -1,0 +1,16 @@
+# Replace registry.example.com/team with your destination registry and namespace.
+platform = "linux/amd64"
+
+[[sync]]
+from = "public.ecr.aws/docker/library/nginx:*.*.*-alpine*.*-slim"
+to = "registry.example.com/team/nginx"
+
+[[sync]]
+from = "public.ecr.aws/docker/library/postgres:18.*-trixie"
+to = "registry.example.com/team/postgres"
+
+[[sync]]
+from = "jenkins/jenkins:lts-jdk25"
+to = "registry.example.com/team/jenkins"
+# Update the destination tag when Jenkins publishes a new build under the same tag.
+overwrite = true

@@ -9,6 +9,8 @@ mod progress;
 #[path = "transfer_pipeline/resume.rs"]
 mod resume;
 mod support;
+#[path = "transfer_pipeline/sync.rs"]
+mod sync;
 #[path = "transfer_pipeline/terminal.rs"]
 mod terminal;
 

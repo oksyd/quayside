@@ -11,6 +11,7 @@ use futures_util::{StreamExt, stream};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A selected source manifest together with its original digest and platform information.
+#[derive(Clone)]
 pub struct Resolved {
     /// Digest of the original source manifest before platform selection.
     pub source_digest: Digest,

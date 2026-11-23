@@ -12,6 +12,71 @@ use std::collections::BTreeSet;
 const TAG_PAGE_SIZE: usize = 1000;
 const SMALL_PAGE_SIZE: usize = 100;
 
+pub(crate) struct TagPattern {
+    pattern: String,
+    regex: regex::Regex,
+}
+
+impl std::fmt::Display for TagPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.pattern)
+    }
+}
+
+impl TagPattern {
+    pub(crate) fn new(pattern: &str) -> Result<Self> {
+        if pattern.contains("**") || validate_tag(&pattern.replace('*', "0")).is_err() {
+            return Err(Error::input(
+                "expected a tag pattern with separated numeric wildcards, such as *.*.*-alpine*.*-slim",
+            ));
+        }
+        let release = pattern.split('-').next().unwrap_or_default();
+        let release = release.strip_prefix('v').unwrap_or(release);
+        if !release.split('.').all(|part| {
+            // Use the smallest wildcard digits that permit a multi-digit component.
+            let mut sample = part.replace('*', "0");
+            if part.starts_with('*') && part.len() > 1 {
+                sample.replace_range(..1, "1");
+            }
+            version_number(&sample).is_some()
+        }) {
+            return Err(Error::input(
+                "expected a numeric release before the suffix (for example, 18.*-trixie or v*.*.*). To copy a named tag, specify it directly as the source tag.",
+            ));
+        }
+        let prefix = if pattern.starts_with('v') { "" } else { "v?" };
+        let expression = regex::escape(pattern).replace(r"\*", "([0-9]+)");
+        let regex = regex::Regex::new(&format!(r"\A{prefix}{expression}\z"))
+            .map_err(|_| Error::input("invalid version tag pattern"))?;
+        Ok(Self {
+            pattern: pattern.to_owned(),
+            regex,
+        })
+    }
+
+    pub(crate) fn latest(&self, tags: &[String], repository: &str) -> Result<String> {
+        tags.iter()
+            .filter_map(|tag| {
+                let captures = self.regex.captures(tag)?;
+                let version = release_version(tag.split('-').next()?)?;
+                let numbers = captures.iter().skip(1)
+                    .map(|part| version_number(part?.as_str()))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(((version, numbers, !tag.starts_with('v')), tag))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, tag)| tag.clone())
+            .ok_or_else(|| {
+                Error::new(
+                    Code::NotFound,
+                    format!(
+                        "no version tag matching {self} found in {repository}; use `tag ls` to list available tags",
+                    ),
+                )
+            })
+    }
+}
+
 impl Registry {
     /// Fetch the repository's tag pages under the configured metadata and object limits.
     pub async fn list_tags(&self, repo: &str) -> Result<Vec<String>> {
@@ -49,51 +114,12 @@ impl Registry {
     /// comes first, followed by wildcard components in pattern order. A plain
     /// version wins ties with a v-prefixed one. The original tag is returned.
     pub async fn latest_matching_tag(&self, repo: &str, pattern: &str) -> Result<String> {
-        if pattern.contains("**") || validate_tag(&pattern.replace('*', "0")).is_err() {
-            return Err(Error::input(
-                "--match expects a tag pattern with separated numeric wildcards, such as *.*.*-alpine*.*-slim",
-            ));
-        }
-        let release = pattern.split('-').next().unwrap_or_default();
-        let release = release.strip_prefix('v').unwrap_or(release);
-        if !release.split('.').all(|part| {
-            // Use the smallest wildcard digits that permit a multi-digit component.
-            let mut sample = part.replace('*', "0");
-            if part.starts_with('*') && part.len() > 1 {
-                sample.replace_range(..1, "1");
-            }
-            version_number(&sample).is_some()
-        }) {
-            return Err(Error::input(
-                "--match requires a numeric release before the suffix (for example, 18.*-trixie or v*.*.*). To copy a named tag, specify it directly without --latest.",
-            ));
-        }
-        let prefix = if pattern.starts_with('v') { "" } else { "v?" };
-        let expression = regex::escape(pattern).replace(r"\*", "([0-9]+)");
-        let matcher = regex::Regex::new(&format!(r"\A{prefix}{expression}\z"))
-            .map_err(|_| Error::input("invalid version tag pattern"))?;
-        self.list_tags(repo)
-            .await?
-            .into_iter()
-            .filter_map(|tag| {
-                let captures = matcher.captures(&tag)?;
-                let version = release_version(tag.split('-').next()?)?;
-                let numbers = captures.iter().skip(1)
-                    .map(|part| version_number(part?.as_str()))
-                    .collect::<Option<Vec<_>>>()?;
-                Some(((version, numbers, !tag.starts_with('v')), tag))
-            })
-            .max_by(|(left, _), (right, _)| left.cmp(right))
-            .map(|(_, tag)| tag)
-            .ok_or_else(|| {
-                Error::new(
-                    Code::NotFound,
-                    format!(
-                        "no version tag matching {pattern} found in {}/{repo}; use `tag ls` to list available tags",
-                        self.name(),
-                    ),
-                )
-            })
+        let pattern =
+            TagPattern::new(pattern).map_err(|error| Error::input(format!("--match: {error}")))?;
+        pattern.latest(
+            &self.list_tags(repo).await?,
+            &format!("{}/{repo}", self.name()),
+        )
     }
     /// Fetch registry catalog pages when the server exposes that optional API.
     pub async fn list_repositories(&self) -> Result<Vec<String>> {

@@ -53,6 +53,12 @@ impl Registry {
         self
     }
 
+    pub(crate) fn resolves_tags_at_mirrors(&self) -> bool {
+        self.mirrors
+            .as_ref()
+            .is_some_and(|mirrors| mirrors.resolve_tags)
+    }
+
     // Each attempt includes body reading and verification, so interrupted streams can fail over.
     // Operations call direct methods; authentication and redirects stay with their actual origin.
     pub(super) async fn read<'a, T, F>(&'a self, operation: impl Fn(&'a Registry) -> F) -> Result<T>

@@ -292,7 +292,7 @@ fn latest_tag_patterns_reject_invalid_options_without_network_requests() {
     let destination = format!("{}/target:v1", server.host);
     for mut args in [
         vec!["tag", "latest", &repository],
-        vec!["image", "copy", &repository, &destination, "--latest"],
+        vec!["image", "copy", &repository, &destination],
     ] {
         args.push("--match");
         for pattern in [
@@ -324,17 +324,6 @@ fn latest_tag_patterns_reject_invalid_options_without_network_requests() {
                 .contains("cannot be used")
         );
     }
-    harness.output(
-        &[
-            "image",
-            "copy",
-            &repository,
-            &destination,
-            "--match",
-            "*.*.*",
-        ],
-        2,
-    );
     assert_eq!(server.connections.load(Ordering::SeqCst), 0);
 }
 

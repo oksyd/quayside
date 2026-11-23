@@ -60,8 +60,8 @@ impl Registry {
                 };
                 // Discovery must use the origin: a mirror's cached fallback tag may be incomplete.
                 let origin = Registry {
-                    inner: self.inner.clone(),
                     mirrors: None,
+                    ..self.clone()
                 };
                 return match origin.manifest_optional(&fallback).await? {
                     None => Ok(vec![]),
