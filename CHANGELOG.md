@@ -1,8 +1,21 @@
+## [0.1.20] - 2026-11-23
+
+### 🚀 Features
+
+- Sync multiple images from a TOML file
+
+### 🐛 Bug Fixes
+
+- Redraw transfer progress in place to prevent terminal flicker
 ## [0.1.19] - 2026-11-18
 
 ### 🐛 Bug Fixes
 
 - Honor numeric tag patterns and report unchanged copies and retries
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.19
 ## [0.1.18] - 2026-11-18
 
 ### ⚙️ Miscellaneous Tasks
