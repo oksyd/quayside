@@ -390,7 +390,7 @@ struct Terminal {
     width: Arc<AtomicU16>,
     writes: Arc<Mutex<String>>,
 }
-impl indicatif::TermLike for Terminal {
+impl TermLike for Terminal {
     fn width(&self) -> u16 {
         self.width.load(Ordering::Relaxed)
     }
@@ -445,9 +445,7 @@ fn terminal_diagnostics_resize_and_final_frame_survive_rendering() {
     let display = observer.display.as_ref().unwrap();
     display.draw();
     display.bar.force_draw();
-    display
-        .bar
-        .suspend(|| terminal.write_str("Diagnostic preserved\n").unwrap());
+    display.region.println("Diagnostic preserved").unwrap();
     terminal.width.store(40, Ordering::Relaxed);
     display.draw();
     display.bar.force_draw();

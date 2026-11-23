@@ -16,7 +16,7 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{IsTerminal, Write},
+    io::IsTerminal,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -28,19 +28,16 @@ use std::{
 pub fn init_diagnostics(level: crate::diagnostics::Level, quiet: bool) {
     crate::diagnostics::init(level, quiet);
     crate::diagnostics::set_writer(|level, message| {
-        crate::progress::suspend(|| {
-            let style = console::Style::new().for_stderr();
-            let style = match level {
-                crate::diagnostics::Level::Warn => style.yellow(),
-                crate::diagnostics::Level::Error => style.red(),
-                _ => style,
-            };
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "{}: {message}",
-                style.apply_to(format!("{level:?}"))
-            );
-        });
+        let style = console::Style::new().for_stderr();
+        let style = match level {
+            crate::diagnostics::Level::Warn => style.yellow(),
+            crate::diagnostics::Level::Error => style.red(),
+            _ => style,
+        };
+        crate::progress::println(format_args!(
+            "{}: {message}",
+            style.apply_to(format!("{level:?}"))
+        ));
     });
 }
 
@@ -186,9 +183,7 @@ impl Context {
                 .map(|c| if c.is_control() { '?' } else { c })
                 .collect();
             if notices {
-                crate::progress::suspend(|| {
-                    let _ = writeln!(std::io::stderr().lock(), "Info: {text}");
-                });
+                crate::progress::println(format_args!("Info: {text}"));
             } else {
                 crate::diagnostics::log(crate::diagnostics::Level::Debug, format_args!("{text}"));
             }
@@ -633,10 +628,7 @@ async fn image(ctx: &Context, command: &ImageCommand) -> Result<Output> {
                     }
                     observer.set_image(src.to_string());
                     if ctx.notices {
-                        crate::progress::suspend(|| {
-                            let _ =
-                                writeln!(std::io::stderr().lock(), "Info: Selected {src} -> {dst}");
-                        });
+                        crate::progress::println(format_args!("Info: Selected {src} -> {dst}"));
                     }
                 }
                 transfer::copy_with_options(

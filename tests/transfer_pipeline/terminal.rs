@@ -88,6 +88,28 @@ fn source(image: support::Image) -> Server {
 }
 
 #[test]
+fn copy_refreshes_in_place_without_sweeping_the_cursor_down_the_screen() {
+    let root = tempfile::tempdir().unwrap();
+    let source = source(image_layout(root.path(), 4, 1024));
+    let target = destination(|_| {
+        std::thread::sleep(Duration::from_millis(200));
+        true
+    });
+    let harness = Harness::new(&[(&source.host, true), (&target.host, true)]);
+    let src = format!("{}/app:v1", source.host);
+    let dst = format!("{}/app:v1", target.host);
+    let (output, terminal) = tty(&harness, &["image", "copy", &src, &dst], &[]);
+    assert!(output.status.success(), "{terminal}");
+    assert!(terminal.matches("[+] Copying").count() >= 3, "{terminal}");
+    assert!(terminal.contains("5/5 blobs"), "{terminal}");
+    let sweeps = terminal.matches("\x1b[1B").count();
+    assert_eq!(
+        sweeps, 0,
+        "cursor-down operations during ordinary refreshes"
+    );
+}
+
+#[test]
 fn copy_pull_and_push_color_terminal_icons_but_keep_stdout_plain() {
     let root = tempfile::tempdir().unwrap();
     let image = image_layout(root.path(), 1, 1024);

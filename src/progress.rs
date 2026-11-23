@@ -4,9 +4,10 @@ use crate::{
     error::Code,
     observer::{BlobOutcome, BlobPhase, Observer, Operation, Phase},
 };
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::{
     collections::BTreeMap,
+    fmt,
     io::{IsTerminal, Write},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
@@ -18,13 +19,16 @@ mod tests;
 
 static ACTIVE: Mutex<Weak<Display>> = Mutex::new(Weak::new());
 
-pub(crate) fn suspend(write: impl FnOnce()) {
+pub(crate) fn println(message: fmt::Arguments<'_>) {
     let display = ACTIVE.lock().ok().and_then(|active| active.upgrade());
     if let Some(display) = display {
-        display.bar.suspend(write);
-    } else {
-        write();
+        let state = display.state.lock().expect("progress state lock");
+        if state.status == Status::Running && !display.region.is_hidden() {
+            let _ = display.region.println(message.to_string());
+            return;
+        }
     }
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +83,7 @@ struct State {
     stopped: Option<Instant>,
     status: Status,
     planning: bool,
+    terminal_size: Option<(u16, u16)>,
 }
 impl State {
     fn new(image: String, action: Phase) -> Self {
@@ -97,6 +102,7 @@ impl State {
             stopped: None,
             status: Status::Running,
             planning: false,
+            terminal_size: None,
         }
     }
     fn register(&mut self, digest: String, size: u64) -> usize {
@@ -122,25 +128,36 @@ impl State {
 }
 
 struct Display {
+    region: MultiProgress,
     bar: ProgressBar,
     state: Mutex<State>,
     dimensions: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
     color: bool,
 }
 impl Display {
-    fn draw(&self) {
-        let state = self.state.lock().expect("progress state lock");
-        if state.status != Status::Running {
-            return;
+    fn frame(&self, state: &mut State) -> String {
+        let size @ (height, width) = (self.dimensions)();
+        // Rows only grow during a transfer, but resizing can shrink the displayed frame.
+        if state
+            .terminal_size
+            .replace(size)
+            .is_some_and(|old| old != size)
+        {
+            let _ = self.region.clear();
         }
-        let (height, width) = (self.dimensions)();
-        self.bar.set_message(render::frame(
-            &state,
-            width as usize,
-            height as usize,
+        render::frame(
+            state,
+            width.into(),
+            height.into(),
             Instant::now(),
             self.color,
-        ));
+        )
+    }
+    fn draw(&self) {
+        let mut state = self.state.lock().expect("progress state lock");
+        if state.status == Status::Running {
+            self.bar.set_message(self.frame(&mut state));
+        }
     }
     fn finish(&self, status: Status) {
         let mut state = self.state.lock().expect("progress state lock");
@@ -149,16 +166,8 @@ impl Display {
         }
         state.status = status;
         state.stopped = Some(Instant::now());
-        let (height, width) = (self.dimensions)();
-        let frame = render::frame(
-            &state,
-            width as usize,
-            height as usize,
-            Instant::now(),
-            self.color,
-        );
         // Finish once with the final frame; stage guards never clear the screen.
-        self.bar.finish_with_message(frame);
+        self.bar.finish_with_message(self.frame(&mut state));
     }
 }
 
@@ -199,10 +208,13 @@ impl TerminalObserver {
             console::colors_enabled_stderr(),
         );
         let display = observer.display.as_ref().expect("initialized display");
+        display.draw();
         *ACTIVE.lock().expect("active progress lock") = Arc::downgrade(display);
         let weak = Arc::downgrade(display);
         observer.task = Some(tokio::spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(100));
+            let period = Duration::from_millis(100);
+            let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 timer.tick().await;
                 let Some(display) = weak.upgrade() else {
@@ -220,12 +232,15 @@ impl TerminalObserver {
         dimensions: Box<dyn Fn() -> (u16, u16) + Send + Sync>,
         color: bool,
     ) -> Self {
-        let bar = ProgressBar::with_draw_target(None, target);
+        let region = MultiProgress::with_draw_target(target);
+        region.set_move_cursor(true);
+        let bar = region.add(ProgressBar::hidden());
         bar.set_style(
             ProgressStyle::with_template("{msg}").expect("valid static progress template"),
         );
         Self {
             display: Some(Arc::new(Display {
+                region,
                 bar,
                 state: Mutex::new(State::new(image, action)),
                 dimensions,
@@ -290,9 +305,7 @@ impl Observer for TerminalObserver {
         if let Some(display) = &self.display {
             display.state.lock().expect("progress state lock").platforms = Some(text);
         } else if self.platform_notice {
-            suspend(|| {
-                let _ = writeln!(std::io::stderr().lock(), "{text}");
-            });
+            println(format_args!("{text}"));
         }
     }
     fn begin(&self, phase: Phase, total: usize) -> Box<dyn Operation> {
