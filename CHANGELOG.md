@@ -7,6 +7,10 @@
 ### 🐛 Bug Fixes
 
 - Redraw transfer progress in place to prevent terminal flicker
+
+### ⚙️ Miscellaneous Tasks
+
+- Release quayside version 0.1.20
 ## [0.1.19] - 2026-11-18
 
 ### 🐛 Bug Fixes
