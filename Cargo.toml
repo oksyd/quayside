@@ -2,7 +2,7 @@
 name = "quayside"
 version = "0.1.20"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 description = "Daemonless OCI registry operations, written in Rust"
 license = "Apache-2.0"
 readme = "README.md"
@@ -20,30 +20,29 @@ keywords = ["oci", "registry", "container", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
-clap_complete = { version = "4.6.11", default-features = false }
+clap = { version = "4.6.10", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive", "env"] }
+clap_complete = { version = "4.6.12", default-features = false }
 shellcomp = { version = "0.1.15", default-features = false }
 indicatif = { version = "0.18.6", default-features = false }
 console = { version = "0.16.6", default-features = false, features = ["std", "unicode-width"] }
-humantime = { version = "2.4.0", default-features = false }
-regex = { version = "1.13.1", default-features = false, features = ["std"] }
+jiff = { version = "1.0.3", default-features = false }
+regex = { version = "1.13.2", default-features = false, features = ["std"] }
 
 tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "sync", "time", "signal", "process"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
-reqx = { version = "0.2.14", default-features = false, features = ["async-tls-rustls-ring"] }
+reqx = { version = "0.2.16", default-features = false, features = ["async-tls-rustls-ring"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 httpdate = { version = "1.0.3", default-features = false }
-url = { version = "2.5.8", default-features = false, features = ["std"] }
-bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+url = { version = "2.5.9", default-features = false, features = ["std"] }
+bytes = { version = "1.12.2", default-features = false, features = ["std"] }
 
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std", "preserve_order"] }
-toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde"] }
+toml = { version = "1.2.3", default-features = false, features = ["parse", "display", "serde"] }
 
 dirs = { version = "7.0.0", default-features = false }
-fs2 = { version = "0.4.3", default-features = false }
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "termios"] }
 tar = { version = "0.4.46", default-features = false }
 tempfile = { version = "3.27.0", default-features = false, features = ["getrandom"] }
@@ -51,8 +50,8 @@ tempfile = { version = "3.27.0", default-features = false, features = ["getrando
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 ring = { version = "0.17.14", default-features = false, features = ["std"] }
-sha2 = { version = "0.11.1", default-features = false }
-zeroize = { version = "1.9.1", default-features = false, features = ["alloc", "derive"] }
+sha2 = { version = "0.11.2", default-features = false }
+zeroize = { version = "1.9.2", default-features = false, features = ["alloc", "derive"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }

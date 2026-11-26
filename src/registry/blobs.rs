@@ -392,8 +392,8 @@ impl Registry {
     }
 }
 pub(super) fn range_offset(value: &str) -> Result<u64> {
-    let range = value.strip_prefix("bytes=").unwrap_or(value);
-    let (start, end) = range
+    let (start, end) = value
+        .trim_prefix("bytes=")
         .split_once('-')
         .ok_or_else(|| Error::input("invalid upload Range"))?;
     if start != "0" {

@@ -302,6 +302,8 @@ mod tests {
     #[test]
     fn range_end_is_inclusive() {
         assert_eq!(range_offset("0-99").unwrap(), 100);
+        assert_eq!(range_offset("bytes=0-99").unwrap(), 100);
+        assert!(range_offset("bytes=bytes=0-99").is_err());
         assert!(range_offset("1-99").is_err());
     }
     #[test]

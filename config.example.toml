@@ -6,6 +6,7 @@ concurrency = 4
 # Initial upload chunk; grows on fast links within a 128MiB aggregate buffer budget.
 chunk_size = "8MiB"
 max_retries = 3
+# Use hours or smaller units in descending order, for example "24h", "1m30s" or "250ms".
 connect_timeout = "10s"
 metadata_timeout = "60s"
 idle_timeout = "60s"

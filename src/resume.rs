@@ -6,7 +6,6 @@ use crate::{
     model::Descriptor,
     storage,
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -136,8 +135,12 @@ impl Store {
             .mode(0o600)
             .open(&lock_path)?;
         storage::check_private_file(&lock_path)?;
-        lock.try_lock_exclusive()
-            .map_err(|_| Error::conflict("another process is using this resumable transfer"))?;
+        lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => {
+                Error::conflict("another process is using this resumable transfer")
+            }
+            fs::TryLockError::Error(error) => error.into(),
+        })?;
         let mut files = Files::default();
         for entry in fs::read_dir(&root)? {
             let path = entry?.path();

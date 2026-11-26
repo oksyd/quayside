@@ -187,9 +187,15 @@ impl Config {
         })
     }
 }
-/// Parse a human-readable duration such as 30s, returning a configuration error on failure.
+/// Parse a nonnegative timeout in Jiff's friendly duration format.
 pub fn duration(value: &str) -> Result<Duration> {
-    humantime::parse_duration(value).map_err(|_| Error::input(format!("invalid duration: {value}")))
+    jiff::fmt::friendly::SpanParser::new()
+        .parse_unsigned_duration(value)
+        .map_err(|_| {
+            Error::input(format!(
+                "invalid duration {value:?}. Use fixed units such as 24h, 1m30s or 250ms."
+            ))
+        })
 }
 /// Parse nonnegative byte counts with B, KiB, MiB, GiB or TiB units and check overflow.
 pub fn parse_size(value: &str) -> Result<u64> {
@@ -217,6 +223,23 @@ mod tests {
     #[test]
     fn valid_defaults() {
         Config::default().validate().unwrap();
+    }
+    #[test]
+    fn timeouts_use_fixed_duration_units() {
+        for (value, expected) in [
+            ("0s", Duration::ZERO),
+            ("250ms", Duration::from_millis(250)),
+            ("1.5s", Duration::from_millis(1500)),
+            ("1m30s", Duration::from_secs(90)),
+            ("24h", Duration::from_hours(24)),
+        ] {
+            assert_eq!(duration(value).unwrap(), expected, "{value}");
+        }
+        for value in [
+            "", "0", "-1s", "10", "1d", "1w", "1M", "1month", "1y", "30s1m",
+        ] {
+            assert!(duration(value).is_err(), "{value}");
+        }
     }
     #[test]
     fn docker_cache_deadline_is_optional_and_accepts_zero_to_disable() {

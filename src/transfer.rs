@@ -506,7 +506,8 @@ async fn transfer_inputs<'a>(
     }
     // An optional Docker export must not consume disk space needed by the transfer workers.
     let available = if cache.is_some() {
-        fs2::available_space(std::env::temp_dir())
+        rustix::fs::statvfs(std::env::temp_dir())
+            .map(|stats| stats.f_bavail.saturating_mul(stats.f_frsize))
             .unwrap_or(temp_limit)
             .min(temp_limit)
     } else {

@@ -1,6 +1,5 @@
 //! Private, locked, atomic configuration/credential writes.
 use crate::{Error, Result};
-use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -91,10 +90,8 @@ pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     }
     let lock = options.open(&lock_path)?;
     restrict(&lock_path, false)?;
-    FileExt::lock_exclusive(&lock)?;
-    let result = f();
-    let _ = FileExt::unlock(&lock);
-    result
+    lock.lock()?;
+    f()
 }
 
 /// Persist bytes through a private temporary file and atomic replacement under its parent directory.
@@ -151,7 +148,7 @@ mod tests {
                 .write(true)
                 .create_new(true)
                 .open(lock_path(&second)?)?;
-            FileExt::try_lock_exclusive(&other)?;
+            other.try_lock().map_err(std::io::Error::from)?;
             Ok(())
         })
         .unwrap();

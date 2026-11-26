@@ -257,13 +257,14 @@ pub fn local_command(cli: &Cli) -> Result<Option<Output>> {
                 },
             )))
         }
-        Command::Version => Ok(Some(Output::new(
-            json!({"version":env!("CARGO_PKG_VERSION"),"toolchain":"1.99.1"}),
-            format!(
-                "quayside {} (toolchain target: Rust 1.99.1)",
-                env!("CARGO_PKG_VERSION")
-            ),
-        ))),
+        Command::Version => {
+            let version = env!("CARGO_PKG_VERSION");
+            let rust_version = env!("CARGO_PKG_RUST_VERSION");
+            Ok(Some(Output::new(
+                json!({"version":version,"toolchain":rust_version}),
+                format!("quayside {version} (minimum Rust {rust_version})"),
+            )))
+        }
         Command::Completion(options) => crate::completion::run(options).map(Some),
         _ => Ok(None),
     }

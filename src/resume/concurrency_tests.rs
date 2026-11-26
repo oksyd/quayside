@@ -111,7 +111,7 @@ async fn cancelled_checkpoint_keeps_the_transfer_lock_until_disk_work_finishes()
     // Wait on the actual OS lock, without guessing when the detached disk job has returned.
     let released_lock = tokio::task::spawn_blocking(move || {
         let file = File::open(lock_path).unwrap();
-        FileExt::lock_exclusive(&file).unwrap();
+        file.lock().unwrap();
         file
     })
     .await

@@ -31,8 +31,7 @@ impl TagPattern {
             ));
         }
         let release = pattern.split('-').next().unwrap_or_default();
-        let release = release.strip_prefix('v').unwrap_or(release);
-        if !release.split('.').all(|part| {
+        if !release.trim_prefix('v').split('.').all(|part| {
             // Use the smallest wildcard digits that permit a multi-digit component.
             let mut sample = part.replace('*', "0");
             if part.starts_with('*') && part.len() > 1 {
@@ -241,8 +240,7 @@ impl Registry {
 }
 
 fn release_version(tag: &str) -> Option<Vec<u64>> {
-    tag.strip_prefix('v')
-        .unwrap_or(tag)
+    tag.trim_prefix('v')
         .split('.')
         .map(version_number)
         .collect()

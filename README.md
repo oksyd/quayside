@@ -145,6 +145,8 @@ Color-capable terminals use cyan activity icons and green completion marks, with
 
 No configuration file is required. See [config.example.toml](config.example.toml) for optional settings; use `--config <path>` to select a file.
 
+Transfer timeouts accept hours and smaller units in descending order, such as `1m30s`.
+
 Configure a private CA:
 
 ```bash
